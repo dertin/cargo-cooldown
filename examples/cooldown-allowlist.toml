@@ -1,0 +1,15 @@
+# Example allowlist demonstrating how to relax the cooldown guard for selected crates.
+#
+# Place this file next to your Cargo.lock while experimenting with cargo-cooldown.
+# Any crate/version listed here will either bypass or reduce the default cooldown window.
+
+[[allow.exact]]
+crate = "demo-fresh-crate"
+version = "0.1.0"
+
+[[allow.package]]
+crate = "tokio"
+minutes = 1440
+
+[allow.global]
+minutes = 131401

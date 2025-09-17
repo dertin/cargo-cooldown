@@ -1,0 +1,31 @@
+[package]
+name = "cargo-cooldown"
+version = "0.1.0"
+edition = "2024"
+description = "Cargo wrapper that enforces a cooldown window for freshly published crates"
+authors = ["cargo-cooldown maintainers"]
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+anyhow = "1"
+cargo_metadata = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6.0"
+reqwest = { version = "0.12", features = ["json", "gzip", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2"
+semver = "1"
+
+[dev-dependencies]
+assert_fs = "1"
+mockito = "1"
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = true
