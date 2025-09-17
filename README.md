@@ -1,70 +1,69 @@
 # cargo-cooldown
 
-`cargo-cooldown` is a thin wrapper around Cargo that shields local workspaces from freshly published crates—the releases most likely to carry malware before the community spots them or the registry can yank them. It enforces a configurable cooldown window before new releases can be resolved, buying time to review them and reducing a common supply-chain attack vector. This repository is a proof of concept that explores how a cooldown guard could integrate with Cargo to improve developer security on local machines. It intentionally targets day-to-day development workflows—CI and release automation should continue relying on committed `Cargo.lock` files instead of this guard.
+`cargo-cooldown` is a lightweight wrapper for Cargo that shields local workspaces from freshly published crates on crates.io. It enforces a configurable cooldown window before new releases can enter your dependency graph, buying time for review and reducing a common supply chain risk. **`cargo-cooldown` is a proof of concept aimed at developer machines.** It is meant as a local utility for workflows where you refresh dependencies and immediately rebuild or run the project, so it shields developers in their own environment. CI pipelines and release automation should continue to run plain Cargo against committed `Cargo.lock` files.
 
 ## Why it exists
 
-Attackers can publish brand-new crates or update existing ones so that they satisfy popular semver ranges. Maintainers who update dependencies immediately risk integrating malicious code before the community has inspected it. `cargo-cooldown` delays adoption of those releases by pinning the newest *already vetted* version that is older than your required cooldown window. The idea is explored in [Socket's report on crates.io phishing campaigns](https://socket.dev/blog/crates-io-users-targeted-by-phishing-emails).
+Attackers can push brand new crates or updates that satisfy permissive semver ranges. Installing them right away means your project might consume malicious code before the ecosystem can react. By delaying adoption, `cargo-cooldown` keeps you on the most recent release that is older than the cooldown window you configure. Socket covers this threat model in their report on [crates.io phishing campaigns](https://socket.dev/blog/crates-io-users-targeted-by-phishing-emails).
 
 ## Quick start
 
-1. Install the wrapper next to your local toolchain:
+1. Install the wrapper next to your toolchain:
    ```bash
    cargo install --locked --path .
    ```
-2. Run your usual Cargo command through the guard. For example, to build a workspace while requiring a 24 hour buffer:
+2. Run day-to-day commands like `build`, `check`, `test`, or `run` through `cargo-cooldown`, setting a cooldown in minutes:
    ```bash
    COOLDOWN_MINUTES=1440 cargo-cooldown build
    ```
-3. When a dependency version is too new, the wrapper resolves the latest eligible release and continues your command without modifying `Cargo.toml`.
+   Avoid pairing it with `cargo update`: that command is meant to refresh `Cargo.lock`, so running it through the wrapper would undo the cooled down graph.
+3. When a dependency is too young, `cargo-cooldown` looks for the newest eligible version, pins it with `cargo update --precise`, re-runs `cargo metadata`, and then retries your command. If no compatible version is old enough, it exits with guidance on how to proceed.
 
-## Behaviour notes
+## How it works
 
-- When a dependency is too fresh, the guard walks backward through the dependency graph looking for the most recent release that still satisfies the semver requirements declared in your manifests. If something is pinned with an exact (`=`) constraint, the parent and any siblings are downgraded together so the family stays consistent.
-- By default the guard watches both the crates.io git index (`registry+https://github.com/rust-lang/crates.io-index`) and its sparse mirror (`registry+sparse+https://index.crates.io/`). Alternate registries—such as those declared under `[registries]` in `.cargo/config.toml`—remain untouched unless you add them via `COOLDOWN_REGISTRY_INDEX`.
+1. `cargo-cooldown` ensures a `Cargo.lock` file exists, generating one with `cargo generate-lockfile` if needed.
+2. It calls `cargo metadata` to read the full dependency graph and records every `VersionReq` that parents impose on their children.
+3. For each crate sourced from a watched registry, it fetches publication metadata from the crates.io HTTP API through a small on-disk cache and computes the package age. Allowlist rules can lower the effective cooldown per crate or globally, but they never raise it above the baseline from `COOLDOWN_MINUTES`.
+4. Every crate younger than the effective cooldown enters a queue. The queue gives priority to nodes that might drag others with strict `=` constraints so related packages can be updated together.
+5. Candidate versions are filtered so they are not yanked, satisfy every observed semver requirement, are older than the current lockfile entry, and were published before the cutoff timestamp.
+6. Each candidate is attempted via `cargo update -p crate@<current_version> --precise <candidate_version>`. If Cargo rejects the change, the blocking crates are added back to the queue unless they are exempt through the allowlist.
+7. After a successful downgrade, the tool repeats the cycle until the graph contains only releases older than the cooldown window. When no acceptable candidate exists, the run aborts with a clear error so you can wait, loosen the requirement, or patch it manually.
 
-### How the resolver keeps the newest compatible versions
-
-1. The guard runs `cargo metadata` to inspect the fully resolved graph, recording the exact `VersionReq` constraints that parents impose on their children. For each `PackageId` it then queries the crates.io HTTP API (with a lightweight on-disk cache) to fetch the publication timestamp so it can compute how many minutes old the currently locked release really is.
-2. Any package whose current release is younger than the effective cooldown window (global default plus allowlist overrides) is marked as "fresh" and added to a queue. The queue is ordered so that packages with fresh dependents are handled first.
-3. For each fresh package, the guard lists **all** published versions and filters them down to candidates that:
-   - are not yanked;
-   - satisfy every semver constraint observed in step 1;
-   - are strictly older than the version currently in the graph;
-   - satisfy the cooldown requirement (published before the cutoff timestamp).
-4. If no candidates remain, the guard looks at the parents that imposed the blocking requirements, enqueues those parents, and retries. Only when **every** parent still fails to yield a compatible, sufficiently old version does the run abort with an actionable error.
-5. When a candidate is available, the guard pins it via `cargo update -p crate@current --precise <candidate>`. Using the `crate@current` syntax ensures the precise instance is updated, even if multiple versions of the crate appear in the graph.
-6. After each successful pin the guard re-runs `cargo metadata` and repeats the process until the entire graph contains only releases older than the cooldown window. The result is a `Cargo.lock` file that matches what you would have obtained by running `cargo update` at an earlier point in time, without ever touching your `Cargo.toml`.
-
-> _Note:_ Today the guard relies on crates.io’s API to retrieve `created_at` timestamps. When the registry metadata shipped with Cargo exposes this information directly, the HTTP round-trip can be replaced with a local lookup for even faster runs.
+> Note: today the publication timestamp comes from the crates.io API. Once that data is shipped with the index metadata, those network calls can be replaced with local lookups.
 
 ## Configuration
 
-`cargo-cooldown` is controlled through environment variables so you can adjust behaviour per command or via shells scripts.
+All behavior is driven by environment variables so you can tune it per invocation or in scripts:
 
-- `COOLDOWN_MINUTES` (default: `0`): Minimum age for a crate release before it is considered safe.
-- `COOLDOWN_MODE` (default: `enforce`): Set to `warn` to log violations without blocking, or `off` to bypass the guard temporarily.
-- `COOLDOWN_ALLOWLIST_PATH`: Path to a TOML file that relaxes the cooldown for specific crates or versions. See `examples/cooldown-allowlist.toml` for the schema.
-- `COOLDOWN_TTL_SECONDS` (default: `86400`): Cache lifetime for registry metadata.
-- `COOLDOWN_CACHE_DIR`: Directory used to persist metadata across runs (falls back to the OS cache directory).
-- `COOLDOWN_OFFLINE_OK` (default: `false`): Allow the guard to run using only cached data.
-- `COOLDOWN_HTTP_RETRIES` (default: `2`, max: `8`): Retry budget for registry API calls.
-- `COOLDOWN_VERBOSE` (default: `false`): Emit additional tracing to understand resolution decisions.
-- `COOLDOWN_REGISTRY_API` (default: `https://crates.io/api/v1/`): Override the API endpoint if you mirror crates.io.
-- `COOLDOWN_REGISTRY_INDEX` (default: both `registry+https://github.com/rust-lang/crates.io-index` and `registry+sparse+https://index.crates.io/`): Change which registries are guarded. Provide a comma-separated list to allow multiple entries. Values without the `registry+` prefix are normalised automatically.
+- `COOLDOWN_MINUTES` (default `0`): minimum age, in minutes, for a release to be considered safe. The cooldown logic only runs when the value is greater than zero.
+- `COOLDOWN_MODE` (default `enforce`): switch to `warn` to log violations without failing, or `off` to skip cooldown logic temporarily.
+- `COOLDOWN_ALLOWLIST_PATH`: path to a TOML allowlist that relaxes cooldowns for specific crates or pins exact versions. If unset, the tool looks for `cooldown-allowlist.toml` in the workspace root.
+- `COOLDOWN_TTL_SECONDS` (default `86400`): lifetime of cached registry responses.
+- `COOLDOWN_CACHE_DIR`: directory used to store cache files. By default the OS cache directory is used with a `cargo-cooldown/` suffix.
+- `COOLDOWN_OFFLINE_OK` (default `false`): when true, missing network calls are tolerated and only cached data is used.
+- `COOLDOWN_HTTP_RETRIES` (default `2`, max `8`): retry budget for API requests.
+- `COOLDOWN_VERBOSE` (default `false`): enable extra tracing output to see resolution decisions.
+- `COOLDOWN_REGISTRY_API` (default `https://crates.io/api/v1/`): override the API base if you mirror crates.io.
+- `COOLDOWN_REGISTRY_INDEX` (default `registry+https://github.com/rust-lang/crates.io-index, registry+sparse+https://index.crates.io/`): comma separated list of registry sources to guard. Values without the `registry+` prefix are normalized automatically. Dependencies from other registries are left untouched.
 
-## Examples and experimentation
+## Examples
 
-The `examples/` directory contains helper material while you experiment locally:
+The `examples/` directory contains material to explore the tool:
 
-- `demo/`: Small Rust project with crates.io dependencies that you can compile with `cargo-cooldown build` to watch the guard in action.
-- `cooldown-allowlist.toml`: Demonstrates how to whitelist crates or versions when you cannot wait for the full cooldown.
-- `run.sh`: Convenience script with sample invocations covering the most relevant environment variables.
+- `demo/`: a small workspace with crates.io dependencies you can build with `cargo-cooldown build` to watch downgrades in action.
+- `cooldown-allowlist.toml`: sample allowlist showing global and per crate overrides as well as exact exceptions.
+- `run.sh`: convenience script with ready made invocations that toggle the most relevant environment variables.
 
-Try the guard inside the bundled workspace:
+You can try the full flow by running:
 
 1. `cd examples/demo`
-2. `COOLDOWN_MINUTES=60 cargo-cooldown build`
-3. Inspect the output and tweak environment variables or the sample allowlist to explore different behaviours.
+2. `COOLDOWN_MINUTES=1440 cargo-cooldown build`
+3. Inspect the output, tweak the allowlist or environment variables, and run again to see how the graph changes.
 
-To integrate the allowlist into another project, copy `examples/cooldown-allowlist.toml` next to that workspace's `Cargo.lock` and edit as needed.
+## Good practices
+
+- Start with `COOLDOWN_MODE=warn` so you can review which crates would be downgraded before modifying `Cargo.lock` in a sensitive repository.
+- Use an allowlist entry when you must adopt a critical update sooner, and document the reason so it can be revisited later.
+- If you depend on alternate registries, make sure `COOLDOWN_REGISTRY_INDEX` explicitly lists each source you want to protect.
+
+`cargo-cooldown` remains a prototype exploring how cooldown periods could fit into Cargo workflows. Feedback and real-world reports are welcome.

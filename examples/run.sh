@@ -42,6 +42,11 @@ if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
   exit 0
 fi
 
+if [[ ${CARGO_SUBCOMMAND} == "update" ]]; then
+  echo "This demo is intended for build/check/run style commands. Running cargo-cooldown with 'cargo update' would overwrite the cooled-down Cargo.lock." >&2
+  exit 1
+fi
+
 if [[ ! -d "${WORKSPACE_DIR}" ]]; then
   echo "Expected workspace at ${WORKSPACE_DIR}" >&2
   exit 1

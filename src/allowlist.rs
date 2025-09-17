@@ -90,10 +90,10 @@ impl Allowlist {
         if let Some(global) = self.global_minutes() {
             effective = effective.min(global);
         }
-        if let Some(rule) = self.allow.package.iter().find(|pkg| pkg.crate_name == name) {
-            if let Some(minutes) = rule.effective_minutes() {
-                effective = effective.min(minutes);
-            }
+        if let Some(rule) = self.allow.package.iter().find(|pkg| pkg.crate_name == name)
+            && let Some(minutes) = rule.effective_minutes()
+        {
+            effective = effective.min(minutes);
         }
         effective
     }

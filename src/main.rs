@@ -14,6 +14,18 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::{Config, Mode};
 
+fn sanitize_args(mut args: Vec<String>) -> Vec<String> {
+    if matches!(args.first(), Some(first) if first == "cooldown") {
+        args.remove(0);
+    }
+    args
+}
+
+fn collect_cargo_args() -> Vec<String> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    sanitize_args(raw)
+}
+
 fn init_logging(verbose: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if verbose {
@@ -30,9 +42,18 @@ async fn main() -> Result<()> {
     let config = Config::from_env();
     init_logging(config.verbose);
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args = collect_cargo_args();
     if args.is_empty() {
-        eprintln!("Usage: cargo-cooldown <cargo-command> [args...]");
+        eprintln!("Usage: cargo cooldown <cargo-command> [args...]");
+        std::process::exit(2);
+    }
+
+    if matches!(args.first().map(String::as_str), Some("update")) {
+        eprintln!(
+            "cargo-cooldown is designed for commands like build, check, test, or run.\n\
+             Running it with `cargo update` would replace the lockfile you just cooled down.\n\
+             Invoke `cargo update` directly instead if you truly intend to refresh dependency versions."
+        );
         std::process::exit(2);
     }
 
@@ -53,4 +74,23 @@ async fn main() -> Result<()> {
 
     let status = Command::new("cargo").args(&args).status()?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_args;
+
+    #[test]
+    fn strips_leading_cooldown_subcommand() {
+        let args = vec!["cooldown".to_string(), "update".to_string()];
+        let sanitized = sanitize_args(args);
+        assert_eq!(sanitized, vec!["update".to_string()]);
+    }
+
+    #[test]
+    fn keeps_regular_arguments() {
+        let args = vec!["build".to_string(), "--release".to_string()];
+        let sanitized = sanitize_args(args.clone());
+        assert_eq!(sanitized, args);
+    }
 }

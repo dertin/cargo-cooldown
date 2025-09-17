@@ -292,18 +292,19 @@ pub async fn run_pinning_flow(config: &Config) -> Result<()> {
                                 });
 
                             if let Some(id) = blocker_id
-                                && let Some(state) = crate_states.get(&id) {
-                                    if state.exact_allowed || state.minimum_minutes == 0 {
-                                        debug!(crate = %state.name, "blocking crate is exempt from cooldown; skipping downgrade");
-                                        continue;
-                                    }
-                                    queue.push_front(FreshCrate {
-                                        package_id: id,
-                                        name: state.name.clone(),
-                                        current_version: state.current_version.clone(),
-                                        minimum_minutes: state.minimum_minutes,
-                                    });
+                                && let Some(state) = crate_states.get(&id)
+                            {
+                                if state.exact_allowed || state.minimum_minutes == 0 {
+                                    debug!(crate = %state.name, "blocking crate is exempt from cooldown; skipping downgrade");
+                                    continue;
                                 }
+                                queue.push_front(FreshCrate {
+                                    package_id: id,
+                                    name: state.name.clone(),
+                                    current_version: state.current_version.clone(),
+                                    minimum_minutes: state.minimum_minutes,
+                                });
+                            }
                         }
                         queue.push_back(fresh.clone());
                         continue 'queue_loop;
@@ -426,28 +427,29 @@ fn parse_blockers(stdout: &str, stderr: &str) -> Vec<Blocker> {
     for line in stdout.lines().chain(stderr.lines()) {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("required by package `")
-            && let Some(end) = rest.find('`') {
-                let inner = &rest[..end];
-                if let Some((name, version)) = inner.rsplit_once(' ') {
-                    let version = version.trim_start_matches('v').to_string();
-                    if !blockers.iter().any(|existing: &Blocker| {
-                        existing.name == name && existing.version.as_deref() == Some(&version)
-                    }) {
-                        blockers.push(Blocker {
-                            name: name.to_string(),
-                            version: Some(version),
-                        });
-                    }
-                } else if !blockers
-                    .iter()
-                    .any(|existing: &Blocker| existing.name == inner)
-                {
+            && let Some(end) = rest.find('`')
+        {
+            let inner = &rest[..end];
+            if let Some((name, version)) = inner.rsplit_once(' ') {
+                let version = version.trim_start_matches('v').to_string();
+                if !blockers.iter().any(|existing: &Blocker| {
+                    existing.name == name && existing.version.as_deref() == Some(&version)
+                }) {
                     blockers.push(Blocker {
-                        name: inner.to_string(),
-                        version: None,
+                        name: name.to_string(),
+                        version: Some(version),
                     });
                 }
+            } else if !blockers
+                .iter()
+                .any(|existing: &Blocker| existing.name == inner)
+            {
+                blockers.push(Blocker {
+                    name: inner.to_string(),
+                    version: None,
+                });
             }
+        }
     }
     blockers
 }

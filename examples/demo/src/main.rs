@@ -6,24 +6,21 @@ use serde_json::json;
 #[derive(Debug, Deserialize)]
 struct ReleasePreview {
     name: String,
-    published_at: DateTime<Utc>,
+    released: DateTime<Utc>,
 }
 
 fn main() {
     // Treat require dependencies as if they were discovered via an API response.
     let payload = json!({
-        "name": "cooldown-demo",
-        "published_at": "2024-10-01T12:00:00Z"
+        "name": "cargo-cooldown",
+        "released": Utc::now(),
     });
-
     let preview: ReleasePreview = serde_json::from_value(payload).expect("valid preview payload");
     let docs = Url::parse("https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html")
         .expect("valid URL");
 
     println!(
-        "crate `{}` was published at {}. Read more about dependency specs at {}",
-        preview.name,
-        preview.published_at,
-        docs
+        "Example: `{}` was released at {}, see {} for details.",
+        preview.name, preview.released, docs
     );
 }
