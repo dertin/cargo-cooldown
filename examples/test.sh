@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORKSPACE_DIR="${ROOT_DIR}/demo"
+CONFIG_FILE="${WORKSPACE_DIR}/cooldown.toml"
 CMD=${CMD:-cargo-cooldown}
 CARGO_SUBCOMMAND=${CARGO_SUBCOMMAND:-build}
 CACHE_BASE="${ROOT_DIR}/.cooldown-cache"
@@ -10,19 +11,22 @@ mkdir -p "${CACHE_BASE}"
 
 run_case() {
   local name=$1
+  local reset_lock=$2
   shift 2
   echo
   echo "=== ${name} ==="
   (
     cd "${WORKSPACE_DIR}" >&2
-    rm -f Cargo.lock
+    if [[ ${reset_lock} == yes ]]; then
+      rm -f Cargo.lock
+    fi
     env "$@" "${CMD}" "${CARGO_SUBCOMMAND}"
   )
 }
 
 usage() {
   cat <<'USAGE'
-Usage: ./run.sh [CASE ...]
+Usage: ./test.sh [CASE ...]
 
 Run demo scenarios for cargo-cooldown. When no case is specified,
 all scenarios are executed sequentially. Override CMD or
@@ -52,6 +56,11 @@ if [[ ! -d "${WORKSPACE_DIR}" ]]; then
   exit 1
 fi
 
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+  echo "Expected demo configuration at ${CONFIG_FILE}" >&2
+  exit 1
+fi
+
 SELECTED=("allowlist" "warn-mode" "offline-cache" "aggressive-ttl" "custom-registry")
 if [[ $# -gt 0 ]]; then
   SELECTED=("$@")
@@ -66,7 +75,6 @@ for case_name in "${SELECTED[@]}"; do
       ;;
     warn-mode)
       run_case "warn-mode" yes \
-        COOLDOWN_MINUTES=720 \
         COOLDOWN_MODE=warn
       ;;
     offline-cache)
@@ -88,9 +96,8 @@ for case_name in "${SELECTED[@]}"; do
       ;;
     custom-registry)
       run_case "custom-registry" yes \
-        COOLDOWN_MINUTES=1440 \
-        COOLDOWN_REGISTRY_API="https://crates.io/api/v1/" \
-        COOLDOWN_REGISTRY_INDEX="registry+https://github.com/rust-lang/crates.io-index,registry+sparse+https://index.crates.io/"
+        COOLDOWN_REGISTRY_API="https://mirror.example/api/v1/" \
+        COOLDOWN_REGISTRY_INDEX="registry+https://mirror.example/index"
       ;;
     *)
       echo "Unknown case: ${case_name}" >&2

@@ -15,8 +15,13 @@ use crate::config::Config;
 use crate::metadata::read_metadata;
 use crate::registry::{RegistryClient, VersionMeta};
 use crate::resolver::{PinOutcome, filter_candidates, try_pin_precise};
+use clap_cargo::{Features, Manifest};
 
-pub async fn run_pinning_flow(config: &Config) -> Result<()> {
+pub async fn run_pinning_flow(
+    config: &Config,
+    manifest: &Manifest,
+    features: &Features,
+) -> Result<()> {
     ensure_lockfile()?;
 
     let allowlist = Allowlist::load(config.allowlist_path.clone())?;
@@ -32,7 +37,7 @@ pub async fn run_pinning_flow(config: &Config) -> Result<()> {
     let mut visited_failures: HashSet<String> = HashSet::new();
 
     'outer: loop {
-        let metadata = read_metadata()?;
+        let metadata = read_metadata(manifest, features)?;
         let resolve = metadata
             .resolve
             .clone()

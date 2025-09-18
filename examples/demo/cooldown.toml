@@ -1,0 +1,8 @@
+# Baseline demo settings; individual runs override values via environment variables.
+cooldown_minutes = 720
+mode = "enforce"
+ttl_seconds = 86400
+http_retries = 2
+verbose = false
+registry_api = "https://crates.io/api/v1/"
+registry_index = "registry+https://github.com/rust-lang/crates.io-index, registry+sparse+https://index.crates.io/"

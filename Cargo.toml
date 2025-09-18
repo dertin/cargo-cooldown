@@ -1,6 +1,6 @@
 [package]
 name = "cargo-cooldown"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Cargo wrapper that enforces a cooldown window for freshly published crates on crates.io for improved supply chain security."
 keywords =["cargo", "cooldown"]
@@ -23,6 +23,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 thiserror = "2"
 semver = "1"
+clap = { version = "4.5", features = ["derive"] }
+clap-cargo = { version = "0.17", features = ["cargo_metadata"] }
 
 [dev-dependencies]
 assert_fs = "1"

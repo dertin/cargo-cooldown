@@ -1,6 +1,6 @@
 # cargo-cooldown
 
-`cargo-cooldown` is a lightweight wrapper for Cargo that shields local workspaces from freshly published crates on crates.io. It enforces a configurable cooldown window before new releases can enter your dependency graph, buying time for review and reducing a common supply chain risk. **`cargo-cooldown` is a proof of concept aimed at developer machines.** It is meant as a local utility for workflows where you refresh dependencies and immediately rebuild or run the project, so it shields developers in their own environment. CI pipelines and release automation should continue to run plain Cargo against committed `Cargo.lock` files.
+`cargo-cooldown` is a lightweight wrapper for Cargo that shields local workspaces from freshly published crates on crates.io. It enforces a configurable cooldown window before new releases can enter your dependency graph, buying time for review and reducing a common supply chain risk. **`cargo-cooldown` is a proof of concept for local development.** Use it in day-to-day workflows where you refresh dependencies and immediately rebuild or run the project. CI pipelines and release automation should continue to run plain Cargo against committed `Cargo.lock` files.
 
 ## Why it exists
 
@@ -8,16 +8,15 @@ Attackers can push brand new crates or updates that satisfy permissive semver ra
 
 ## Quick start
 
-1. Install the wrapper next to your toolchain:
+1. Install:
    ```bash
-   cargo install --locked --path .
+   cargo install --locked cargo-cooldown
    ```
-2. Run day-to-day commands like `build`, `check`, `test`, or `run` through `cargo-cooldown`, setting a cooldown in minutes:
+2. Explore the CLI and the flags that mirror Cargo’s selectors:
    ```bash
-   COOLDOWN_MINUTES=1440 cargo-cooldown build
+   cargo cooldown --help
    ```
-   Avoid pairing it with `cargo update`: that command is meant to refresh `Cargo.lock`, so running it through the wrapper would undo the cooled down graph.
-3. When a dependency is too young, `cargo-cooldown` looks for the newest eligible version, pins it with `cargo update --precise`, re-runs `cargo metadata`, and then retries your command. If no compatible version is old enough, it exits with guidance on how to proceed.
+3. Expect the tool to pin your graph if a dependency is too fresh. It will search for the newest compliant version, run `cargo update --precise`, refresh metadata, and then re-invoke your command. Tune the behaviour via environment variables like `COOLDOWN_MINUTES` or with a `cooldown.toml` file; see the configuration section for the full reference.
 
 ## How it works
 
@@ -44,26 +43,42 @@ All behavior is driven by environment variables so you can tune it per invocatio
 - `COOLDOWN_HTTP_RETRIES` (default `2`, max `8`): retry budget for API requests.
 - `COOLDOWN_VERBOSE` (default `false`): enable extra tracing output to see resolution decisions.
 - `COOLDOWN_REGISTRY_API` (default `https://crates.io/api/v1/`): override the API base if you mirror crates.io.
-- `COOLDOWN_REGISTRY_INDEX` (default `registry+https://github.com/rust-lang/crates.io-index, registry+sparse+https://index.crates.io/`): comma separated list of registry sources to guard. Values without the `registry+` prefix are normalized automatically. Dependencies from other registries are left untouched.
+- `COOLDOWN_REGISTRY_INDEX` (default `registry+https://github.com/rust-lang/crates.io-index, registry+sparse+https://index.crates.io/`): comma separated list of registry sources. Values without the `registry+` prefix are normalized automatically. Dependencies from other registries are left untouched.
+
+For repeatable settings you can also create a `cooldown.toml` file. Place it in the workspace root to scope it to a project, or in `~/.cargo/cooldown.toml` to apply it globally. Following the convention used by Cargo configuration, keys should be written in `snake_case`; uppercase keys mirroring the environment variables remain supported for compatibility. Environment variables always win over file values, so scripts can override temporary tweaks without editing the config. Paths such as `allowlist_path` or `cache_dir` can be expressed relative to the file location.
+
+```toml
+cooldown_minutes = 1440
+mode = "warn"
+offline_ok = true
+registry_index = "https://mirror.example/index"
+```
+
+The demo workspace under `examples/demo/` ships with a baseline `cooldown.toml`; the helper script `examples/test.sh` layers environment variables on top for each scenario, illustrating the precedence in practice.
+
+## CLI flags
+
+`cargo-cooldown` uses [`clap`](https://docs.rs/clap/latest/clap/) together with [`clap-cargo`](https://docs.rs/clap-cargo/latest/clap_cargo/) so you can reuse familiar Cargo selectors before passing control to the underlying command. Flags such as `--manifest-path`, `--package`, `--workspace`, `--exclude`, `--features`, `--all-features`, and `--no-default-features` are parsed locally and then forwarded to the Cargo invocation. Everything after the first positional argument is treated as the command to execute.
+
+```bash
+cargo cooldown --manifest-path examples/demo/Cargo.toml --package demo build
+cargo cooldown --features "demo,extra" test -- --nocapture
+```
 
 ## Examples
 
 The `examples/` directory contains material to explore the tool:
 
-- `demo/`: a small workspace with crates.io dependencies you can build with `cargo-cooldown build` to watch downgrades in action.
+- `demo/`: a small workspace with crates.io dependencies you can build with `cargo cooldown build` to watch downgrades in action.
 - `cooldown-allowlist.toml`: sample allowlist showing global and per crate overrides as well as exact exceptions.
-- `run.sh`: convenience script with ready made invocations that toggle the most relevant environment variables.
+- `test.sh`: convenience script with ready made invocations that toggle the most relevant environment variables.
 
 You can try the full flow by running:
 
 1. `cd examples/demo`
-2. `COOLDOWN_MINUTES=1440 cargo-cooldown build`
+2. `COOLDOWN_MINUTES=1440 cargo cooldown build`
 3. Inspect the output, tweak the allowlist or environment variables, and run again to see how the graph changes.
 
-## Good practices
+## Feedback
 
-- Start with `COOLDOWN_MODE=warn` so you can review which crates would be downgraded before modifying `Cargo.lock` in a sensitive repository.
-- Use an allowlist entry when you must adopt a critical update sooner, and document the reason so it can be revisited later.
-- If you depend on alternate registries, make sure `COOLDOWN_REGISTRY_INDEX` explicitly lists each source you want to protect.
-
-`cargo-cooldown` remains a prototype exploring how cooldown periods could fit into Cargo workflows. Feedback and real-world reports are welcome.
+`cargo-cooldown` is still an experiment, and we’re learning alongside you. Tried it out? Let us know what feels helpful, what gets in the way. Real-world stories and issue reports make the project better.
