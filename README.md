@@ -45,7 +45,7 @@ All behavior is driven by environment variables so you can tune it per invocatio
 - `COOLDOWN_REGISTRY_API` (default `https://crates.io/api/v1/`): override the API base if you mirror crates.io.
 - `COOLDOWN_REGISTRY_INDEX` (default `registry+https://github.com/rust-lang/crates.io-index, registry+sparse+https://index.crates.io/`): comma separated list of registry sources. Values without the `registry+` prefix are normalized automatically. Dependencies from other registries are left untouched.
 
-For repeatable settings you can also create a `cooldown.toml` file. Place it in the workspace root to scope it to a project, or in `~/.cargo/cooldown.toml` to apply it globally. Following the convention used by Cargo configuration, keys should be written in `snake_case`; uppercase keys mirroring the environment variables remain supported for compatibility. Environment variables always win over file values, so scripts can override temporary tweaks without editing the config. Paths such as `allowlist_path` or `cache_dir` can be expressed relative to the file location.
+For repeatable settings you can also create a `cooldown.toml` file. Place it in the workspace root to scope it to a project, or in `$CARGO_HOME/cooldown.toml` to apply it globally. When `CARGO_HOME` is not set, the fallback remains `~/.cargo/cooldown.toml`. Following the convention used by Cargo configuration, keys should be written in `snake_case`; uppercase keys mirroring the environment variables remain supported for compatibility. Environment variables always win over file values, so scripts can override temporary tweaks without editing the config. Paths such as `allowlist_path` or `cache_dir` can be expressed relative to the file location.
 
 ```toml
 cooldown_minutes = 1440

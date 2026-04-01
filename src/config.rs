@@ -257,9 +257,16 @@ fn workspace_config_path() -> Option<PathBuf> {
 }
 
 fn user_config_path() -> Option<PathBuf> {
-    let home = home_dir()?;
-    let path = home.join(".cargo").join("cooldown.toml");
+    let cargo_home = cargo_home_dir()?;
+    let path = cargo_home.join("cooldown.toml");
     if path.exists() { Some(path) } else { None }
+}
+
+fn cargo_home_dir() -> Option<PathBuf> {
+    env::var_os("CARGO_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".cargo")))
 }
 
 fn read_file_config(path: &Path) -> Option<FileConfig> {
@@ -372,9 +379,11 @@ mod tests {
         let workspace = TempDir::new().unwrap();
         let fake_home = TempDir::new().unwrap();
         let original_dir = env::current_dir().unwrap();
+        let original_cargo_home = env::var_os("CARGO_HOME");
         let original_home = env::var("HOME").ok();
         let original_user = env::var("USERPROFILE").ok();
 
+        unsafe { env::remove_var("CARGO_HOME") };
         unsafe { env::set_var("HOME", fake_home.path()) };
         unsafe { env::set_var("USERPROFILE", fake_home.path()) };
         env::set_current_dir(workspace.path()).unwrap();
@@ -406,6 +415,10 @@ registry_index = "https://mirror.example/index"
         );
 
         env::set_current_dir(original_dir).unwrap();
+        match original_cargo_home {
+            Some(val) => unsafe { env::set_var("CARGO_HOME", val) },
+            None => unsafe { env::remove_var("CARGO_HOME") },
+        }
         match original_home {
             Some(val) => unsafe { env::set_var("HOME", val) },
             None => unsafe { env::remove_var("HOME") },
@@ -429,9 +442,11 @@ registry_index = "https://mirror.example/index"
         cargo_dir.create_dir_all().unwrap();
 
         let original_dir = env::current_dir().unwrap();
+        let original_cargo_home = env::var_os("CARGO_HOME");
         let original_home = env::var("HOME").ok();
         let original_user = env::var("USERPROFILE").ok();
 
+        unsafe { env::remove_var("CARGO_HOME") };
         unsafe { env::set_var("HOME", fake_home.path()) };
         unsafe { env::set_var("USERPROFILE", fake_home.path()) };
         env::set_current_dir(workspace.path()).unwrap();
@@ -453,6 +468,10 @@ http_retries = 3
         assert_eq!(config.http_retries, 3);
 
         env::set_current_dir(original_dir).unwrap();
+        match original_cargo_home {
+            Some(val) => unsafe { env::set_var("CARGO_HOME", val) },
+            None => unsafe { env::remove_var("CARGO_HOME") },
+        }
         match original_home {
             Some(val) => unsafe { env::set_var("HOME", val) },
             None => unsafe { env::remove_var("HOME") },
@@ -464,6 +483,56 @@ http_retries = 3
 
         workspace.close().unwrap();
         fake_home.close().unwrap();
+    }
+
+    #[test]
+    fn loads_user_cargo_home_cooldown_file_when_set() {
+        let _guard = env_lock().lock().unwrap();
+
+        let workspace = TempDir::new().unwrap();
+        let fake_home = TempDir::new().unwrap();
+        let custom_cargo_home = TempDir::new().unwrap();
+        let original_dir = env::current_dir().unwrap();
+        let original_cargo_home = env::var_os("CARGO_HOME");
+        let original_home = env::var("HOME").ok();
+        let original_user = env::var("USERPROFILE").ok();
+
+        unsafe { env::set_var("CARGO_HOME", custom_cargo_home.path()) };
+        unsafe { env::set_var("HOME", fake_home.path()) };
+        unsafe { env::set_var("USERPROFILE", fake_home.path()) };
+        env::set_current_dir(workspace.path()).unwrap();
+
+        custom_cargo_home
+            .child("cooldown.toml")
+            .write_str(
+                r#"cooldown_minutes = 7
+mode = "warn"
+"#,
+            )
+            .unwrap();
+
+        let config = Config::from_env();
+
+        assert_eq!(config.cooldown_minutes, 7);
+        assert_eq!(config.mode, Mode::Warn);
+
+        env::set_current_dir(original_dir).unwrap();
+        match original_cargo_home {
+            Some(val) => unsafe { env::set_var("CARGO_HOME", val) },
+            None => unsafe { env::remove_var("CARGO_HOME") },
+        }
+        match original_home {
+            Some(val) => unsafe { env::set_var("HOME", val) },
+            None => unsafe { env::remove_var("HOME") },
+        }
+        match original_user {
+            Some(val) => unsafe { env::set_var("USERPROFILE", val) },
+            None => unsafe { env::remove_var("USERPROFILE") },
+        }
+
+        workspace.close().unwrap();
+        fake_home.close().unwrap();
+        custom_cargo_home.close().unwrap();
     }
 
     #[test]
