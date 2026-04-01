@@ -68,33 +68,6 @@ pub async fn run_pinning_flow(
             let Some(pkg) = packages.get(&node.id) else {
                 continue;
             };
-            let Some(source) = pkg.source.as_ref() else {
-                continue;
-            };
-            if !config.is_registry_allowed(&source.repr) {
-                debug!(crate = %pkg.name, source = %source.repr, "skipping non-crates.io registry dependency");
-                continue;
-            }
-
-            let current_version = pkg.version.to_string();
-            let mut minimum_minutes = config.cooldown_minutes;
-            if let Some(global) = global_minutes {
-                minimum_minutes = minimum_minutes.min(global);
-            }
-            if let Some(&minutes) = per_crate_minutes.get(pkg.name.as_str()) {
-                minimum_minutes = minimum_minutes.min(minutes);
-            }
-
-            let exact_allowed = allowlist.is_exact_allowed(pkg.name.as_str(), &current_version);
-            crate_states.insert(
-                node.id.clone(),
-                CrateState {
-                    name: pkg.name.to_string(),
-                    current_version: current_version.clone(),
-                    minimum_minutes,
-                    exact_allowed,
-                },
-            );
 
             for dep in &node.deps {
                 let Some(dep_pkg) = packages.get(&dep.pkg) else {
@@ -136,6 +109,34 @@ pub async fn run_pinning_flow(
                     }
                 }
             }
+
+            let Some(source) = pkg.source.as_ref() else {
+                continue;
+            };
+            if !config.is_registry_allowed(&source.repr) {
+                debug!(crate = %pkg.name, source = %source.repr, "skipping non-crates.io registry dependency");
+                continue;
+            }
+
+            let current_version = pkg.version.to_string();
+            let mut minimum_minutes = config.cooldown_minutes;
+            if let Some(global) = global_minutes {
+                minimum_minutes = minimum_minutes.min(global);
+            }
+            if let Some(&minutes) = per_crate_minutes.get(pkg.name.as_str()) {
+                minimum_minutes = minimum_minutes.min(minutes);
+            }
+
+            let exact_allowed = allowlist.is_exact_allowed(pkg.name.as_str(), &current_version);
+            crate_states.insert(
+                node.id.clone(),
+                CrateState {
+                    name: pkg.name.to_string(),
+                    current_version: current_version.clone(),
+                    minimum_minutes,
+                    exact_allowed,
+                },
+            );
 
             if exact_allowed || minimum_minutes == 0 {
                 continue;
