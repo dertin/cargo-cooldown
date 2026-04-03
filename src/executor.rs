@@ -69,46 +69,15 @@ pub async fn run_pinning_flow(
                 continue;
             };
 
-            for dep in &node.deps {
-                let Some(dep_pkg) = packages.get(&dep.pkg) else {
-                    continue;
-                };
-                if !dep_pkg
-                    .source
-                    .as_ref()
-                    .map(|src| config.is_registry_allowed(&src.repr))
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-
-                if let Some(manifest_dep) =
-                    find_manifest_dependency(&pkg.dependencies, &dep.name, &dep_pkg.name)
-                {
-                    let requirements = version_requirements.entry(dep.pkg.clone()).or_default();
-                    if !requirements.iter().any(|req| req == &manifest_dep.req) {
-                        requirements.push(manifest_dep.req.clone());
-                    }
-
-                    let origins = requirement_origins.entry(dep.pkg.clone()).or_default();
-                    if !origins.iter().any(|origin| {
-                        origin.parent_id == node.id && origin.requirement == manifest_dep.req
-                    }) {
-                        origins.push(RequirementOrigin {
-                            parent_id: node.id.clone(),
-                            parent_name: pkg.name.to_string(),
-                            requirement: manifest_dep.req.clone(),
-                        });
-                    }
-
-                    if is_exact_requirement(&manifest_dep.req) {
-                        equality_dependents
-                            .entry(dep.pkg.clone())
-                            .or_default()
-                            .push(node.id.clone());
-                    }
-                }
-            }
+            record_dependency_requirements(
+                node,
+                pkg,
+                &packages,
+                config,
+                &mut version_requirements,
+                &mut requirement_origins,
+                &mut equality_dependents,
+            );
 
             let Some(source) = pkg.source.as_ref() else {
                 continue;
@@ -428,6 +397,58 @@ fn find_manifest_dependency<'a>(
     })
 }
 
+fn record_dependency_requirements(
+    node: &cargo_metadata::Node,
+    pkg: &cargo_metadata::Package,
+    packages: &HashMap<PackageId, cargo_metadata::Package>,
+    config: &Config,
+    version_requirements: &mut HashMap<PackageId, Vec<VersionReq>>,
+    requirement_origins: &mut HashMap<PackageId, Vec<RequirementOrigin>>,
+    equality_dependents: &mut HashMap<PackageId, Vec<PackageId>>,
+) {
+    for dep in &node.deps {
+        let Some(dep_pkg) = packages.get(&dep.pkg) else {
+            continue;
+        };
+        if !dep_pkg
+            .source
+            .as_ref()
+            .map(|src| config.is_registry_allowed(&src.repr))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        if let Some(manifest_dep) =
+            find_manifest_dependency(&pkg.dependencies, &dep.name, &dep_pkg.name)
+        {
+            let requirements = version_requirements.entry(dep.pkg.clone()).or_default();
+            if !requirements.iter().any(|req| req == &manifest_dep.req) {
+                requirements.push(manifest_dep.req.clone());
+            }
+
+            let origins = requirement_origins.entry(dep.pkg.clone()).or_default();
+            if !origins
+                .iter()
+                .any(|origin| origin.parent_id == node.id && origin.requirement == manifest_dep.req)
+            {
+                origins.push(RequirementOrigin {
+                    parent_id: node.id.clone(),
+                    parent_name: pkg.name.to_string(),
+                    requirement: manifest_dep.req.clone(),
+                });
+            }
+
+            if is_exact_requirement(&manifest_dep.req) {
+                equality_dependents
+                    .entry(dep.pkg.clone())
+                    .or_default()
+                    .push(node.id.clone());
+            }
+        }
+    }
+}
+
 fn parse_blockers(stdout: &str, stderr: &str) -> Vec<Blocker> {
     let mut blockers = Vec::new();
     for line in stdout.lines().chain(stderr.lines()) {
@@ -473,5 +494,183 @@ fn satisfies_requirements(version: &str, requirements: &[VersionReq]) -> bool {
     match Version::parse(version) {
         Ok(parsed) => requirements.iter().all(|req| req.matches(&parsed)),
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Mode;
+    use serde_json::json;
+
+    #[test]
+    fn local_workspace_members_constrain_registry_candidates() {
+        let config = test_config();
+        let local_pkg: cargo_metadata::Package = serde_json::from_value(json!({
+            "name": "workspace-member-app",
+            "version": "0.1.0",
+            "id": "path+file:///tmp/workspace-member/app#workspace-member-app@0.1.0",
+            "license": null,
+            "license_file": null,
+            "description": null,
+            "source": null,
+            "dependencies": [
+                {
+                    "name": "sha2",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "req": "^0.11",
+                    "kind": null,
+                    "rename": null,
+                    "optional": false,
+                    "uses_default_features": true,
+                    "features": [],
+                    "target": null,
+                    "registry": null
+                }
+            ],
+            "targets": [
+                {
+                    "kind": ["bin"],
+                    "crate_types": ["bin"],
+                    "name": "workspace-member-app",
+                    "src_path": "/tmp/workspace-member/app/src/main.rs",
+                    "edition": "2021",
+                    "doc": true,
+                    "doctest": false,
+                    "test": true
+                }
+            ],
+            "features": {},
+            "manifest_path": "/tmp/workspace-member/app/Cargo.toml",
+            "metadata": null,
+            "publish": null,
+            "authors": [],
+            "categories": [],
+            "keywords": [],
+            "readme": null,
+            "repository": null,
+            "homepage": null,
+            "documentation": null,
+            "edition": "2021",
+            "links": null,
+            "default_run": null,
+            "rust_version": null
+        }))
+        .expect("local package should deserialize");
+        let registry_pkg: cargo_metadata::Package = serde_json::from_value(json!({
+            "name": "sha2",
+            "version": "0.11.0",
+            "id": "registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.0",
+            "license": "MIT OR Apache-2.0",
+            "license_file": null,
+            "description": "sha2 test package",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "dependencies": [],
+            "targets": [
+                {
+                    "kind": ["lib"],
+                    "crate_types": ["lib"],
+                    "name": "sha2",
+                    "src_path": "/tmp/cargo-home/sha2/src/lib.rs",
+                    "edition": "2024",
+                    "doc": true,
+                    "doctest": true,
+                    "test": true
+                }
+            ],
+            "features": {},
+            "manifest_path": "/tmp/cargo-home/sha2/Cargo.toml",
+            "metadata": null,
+            "publish": null,
+            "authors": [],
+            "categories": [],
+            "keywords": [],
+            "readme": null,
+            "repository": null,
+            "homepage": null,
+            "documentation": null,
+            "edition": "2024",
+            "links": null,
+            "default_run": null,
+            "rust_version": null
+        }))
+        .expect("registry package should deserialize");
+        let local_node: cargo_metadata::Node = serde_json::from_value(json!({
+            "id": "path+file:///tmp/workspace-member/app#workspace-member-app@0.1.0",
+            "dependencies": [
+                "registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.0"
+            ],
+            "deps": [
+                {
+                    "name": "sha2",
+                    "pkg": "registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.0",
+                    "dep_kinds": [
+                        {
+                            "kind": null,
+                            "target": null
+                        }
+                    ]
+                }
+            ],
+            "features": []
+        }))
+        .expect("local node should deserialize");
+
+        let local_id = local_pkg.id.clone();
+        let registry_id = registry_pkg.id.clone();
+        let packages = HashMap::from([
+            (local_id.clone(), local_pkg),
+            (registry_id.clone(), registry_pkg),
+        ]);
+        let mut version_requirements = HashMap::new();
+        let mut requirement_origins = HashMap::new();
+        let mut equality_dependents = HashMap::new();
+
+        record_dependency_requirements(
+            &local_node,
+            packages.get(&local_id).expect("local package exists"),
+            &packages,
+            &config,
+            &mut version_requirements,
+            &mut requirement_origins,
+            &mut equality_dependents,
+        );
+
+        let requirements = version_requirements
+            .get(&registry_id)
+            .expect("local workspace member should constrain registry dependency");
+        assert_eq!(requirements.len(), 1);
+        assert_eq!(requirements[0], VersionReq::parse("^0.11").unwrap());
+        assert!(satisfies_requirements("0.11.0", requirements));
+        assert!(!satisfies_requirements("0.11.0-rc.5", requirements));
+
+        let origins = requirement_origins
+            .get(&registry_id)
+            .expect("requirement origin should be tracked");
+        assert_eq!(origins.len(), 1);
+        assert_eq!(origins[0].parent_id, local_id);
+        assert_eq!(origins[0].parent_name, "workspace-member-app");
+
+        assert!(
+            !equality_dependents.contains_key(&registry_id),
+            "caret requirements must not be treated as exact blockers"
+        );
+    }
+
+    fn test_config() -> Config {
+        Config {
+            cooldown_minutes: 60,
+            mode: Mode::Enforce,
+            ttl_seconds: 60,
+            allowlist_path: None,
+            cache_dir: None,
+            offline_ok: false,
+            http_retries: 0,
+            verbose: false,
+            registry_api: "https://crates.io/api/v1/".to_string(),
+            allowed_registries: vec![
+                "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+            ],
+        }
     }
 }
