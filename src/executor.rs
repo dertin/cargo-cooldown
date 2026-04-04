@@ -10,7 +10,7 @@ use tracing::{debug, info};
 
 use crate::allowlist::Allowlist;
 use crate::config::Config;
-use crate::lockfile::LockfileBaseline;
+use crate::lockfile::LockfileSnapshot;
 use crate::metadata::read_metadata;
 use crate::registry::{
     RegistryContext, RegistryStore, ReleaseSource, assert_has_timestamp, ensure_timeline_available,
@@ -32,339 +32,356 @@ pub fn run_pinning_flow(
     let global_minutes = allowlist.global_minutes();
     let mut registry_store = RegistryStore::new(config)?;
     let lockfile_path = workspace_lockfile_path(manifest)?;
-    let initial_lockfile = LockfileBaseline::capture(&lockfile_path, &mut registry_store)?;
-    ensure_lockfile(manifest, &lockfile_path)?;
-    let now = config.now_override.unwrap_or_else(Utc::now);
-    let mut visited_failures: HashSet<String> = HashSet::new();
-    let mut inspection_cache: HashMap<ReleaseInspectionKey, ReleaseInspection> = HashMap::new();
+    // Capture the user-visible starting lockfile before any Cargo command is allowed
+    // to generate or rewrite it during this cooldown run.
+    let initial_lockfile = LockfileSnapshot::capture(&lockfile_path, &mut registry_store)?;
 
-    'outer: loop {
-        // After each successful pin we rebuild cargo metadata from scratch so every
-        // decision in this pass reflects the current lockfile and resolved graph.
-        let metadata = read_metadata(manifest, features)?;
-        let resolve = metadata
-            .resolve
-            .clone()
-            .context("cargo metadata output did not include a resolved dependency graph")?;
-        // When the user targets a package/workspace subset, only enforce cooldown on
-        // the dependency closure reachable from those selected roots.
-        let selected_root_ids = selected_package_ids(&metadata, workspace);
-        let reachable_ids = reachable_package_ids(&resolve, &selected_root_ids);
-        let packages: HashMap<PackageId, cargo_metadata::Package> = metadata
-            .packages
-            .into_iter()
-            .map(|pkg| (pkg.id.clone(), pkg))
-            .collect();
+    let result = (|| {
+        // Missing lockfiles are created only after the initial snapshot exists, so the
+        // default policy always compares against the pre-run lockfile state.
+        ensure_lockfile(manifest, &lockfile_path)?;
+        let now = config.now_override.unwrap_or_else(Utc::now);
+        let mut visited_failures: HashSet<String> = HashSet::new();
+        let mut inspection_cache: HashMap<ReleaseInspectionKey, ReleaseInspection> = HashMap::new();
 
-        let mut name_version_to_ids: HashMap<(String, String), Vec<PackageId>> = HashMap::new();
-        for (id, pkg) in &packages {
-            if !reachable_ids.contains(id) {
-                continue;
-            }
-            name_version_to_ids
-                .entry((pkg.name.to_string(), pkg.version.to_string()))
-                .or_default()
-                .push(id.clone());
-        }
+        'outer: loop {
+            // After each successful pin we rebuild cargo metadata from scratch so every
+            // decision in this pass reflects the current lockfile and resolved graph.
+            let metadata = read_metadata(manifest, features)?;
+            let resolve = metadata
+                .resolve
+                .clone()
+                .context("cargo metadata output did not include a resolved dependency graph")?;
+            // When the user targets a package/workspace subset, only enforce cooldown on
+            // the dependency closure reachable from those selected roots.
+            let selected_root_ids = selected_package_ids(&metadata, workspace);
+            let reachable_ids = reachable_package_ids(&resolve, &selected_root_ids);
+            let packages: HashMap<PackageId, cargo_metadata::Package> = metadata
+                .packages
+                .into_iter()
+                .map(|pkg| (pkg.id.clone(), pkg))
+                .collect();
 
-        // Build the per-package state we need to reason about cooldowns in one pass:
-        // current version, effective minimum age, semver requirements from parents,
-        // and which locked packages are currently too fresh.
-        let mut crate_states: HashMap<PackageId, CrateState> = HashMap::new();
-        let mut fresh_entries: Vec<FreshCrate> = Vec::new();
-        let mut equality_dependents: HashMap<PackageId, Vec<PackageId>> = HashMap::new();
-        let mut requirement_origins: HashMap<PackageId, Vec<RequirementOrigin>> = HashMap::new();
-        let mut version_requirements: HashMap<PackageId, Vec<VersionReq>> = HashMap::new();
-        let mut seen: HashSet<PackageId> = HashSet::new();
-
-        for node in &resolve.nodes {
-            if !reachable_ids.contains(&node.id) || !seen.insert(node.id.clone()) {
-                continue;
-            }
-            let Some(pkg) = packages.get(&node.id) else {
-                continue;
-            };
-
-            record_dependency_requirements(
-                node,
-                pkg,
-                &packages,
-                &mut version_requirements,
-                &mut requirement_origins,
-                &mut equality_dependents,
-            );
-
-            let Some(source) = pkg.source.as_ref() else {
-                continue;
-            };
-            if !is_registry_source(&source.repr) {
-                continue;
+            let mut name_version_to_ids: HashMap<(String, String), Vec<PackageId>> = HashMap::new();
+            for (id, pkg) in &packages {
+                if !reachable_ids.contains(id) {
+                    continue;
+                }
+                name_version_to_ids
+                    .entry((pkg.name.to_string(), pkg.version.to_string()))
+                    .or_default()
+                    .push(id.clone());
             }
 
-            let context = registry_store.context_for_source(&source.repr)?.clone();
-            let current_version = pkg.version.to_string();
-            let mut minimum_minutes = config.cooldown_minutes;
-            if let Some(global) = global_minutes {
-                minimum_minutes = minimum_minutes.min(global);
-            }
-            if let Some(&minutes) = per_crate_minutes.get(pkg.name.as_str()) {
-                minimum_minutes = minimum_minutes.min(minutes);
-            }
+            // Build the per-package state we need to reason about cooldowns in one pass:
+            // current version, effective minimum age, semver requirements from parents,
+            // and which locked packages are currently too fresh.
+            let mut crate_states: HashMap<PackageId, CrateState> = HashMap::new();
+            let mut fresh_entries: Vec<FreshCrate> = Vec::new();
+            let mut equality_dependents: HashMap<PackageId, Vec<PackageId>> = HashMap::new();
+            let mut requirement_origins: HashMap<PackageId, Vec<RequirementOrigin>> =
+                HashMap::new();
+            let mut version_requirements: HashMap<PackageId, Vec<VersionReq>> = HashMap::new();
+            let mut seen: HashSet<PackageId> = HashSet::new();
 
-            let exact_allowed = allowlist.is_exact_allowed(pkg.name.as_str(), &current_version);
-            let baseline_exempt = !config.lockfile_policy.applies_to_existing_lockfile()
-                && initial_lockfile.contains_registry_version(
-                    pkg.name.as_str(),
-                    &context.effective_index_url,
-                    &current_version,
+            for node in &resolve.nodes {
+                if !reachable_ids.contains(&node.id) || !seen.insert(node.id.clone()) {
+                    continue;
+                }
+                let Some(pkg) = packages.get(&node.id) else {
+                    continue;
+                };
+
+                record_dependency_requirements(
+                    node,
+                    pkg,
+                    &packages,
+                    &mut version_requirements,
+                    &mut requirement_origins,
+                    &mut equality_dependents,
                 );
-            let state = CrateState {
-                name: pkg.name.to_string(),
-                source_id: source.repr.clone(),
-                current_version: current_version.clone(),
-                minimum_minutes,
-                exact_allowed,
-                skipped: context.skipped,
-                baseline_exempt,
-            };
-            crate_states.insert(node.id.clone(), state.clone());
 
-            if state.is_cooldown_exempt() {
-                continue;
-            }
+                let Some(source) = pkg.source.as_ref() else {
+                    continue;
+                };
+                if !is_registry_source(&source.repr) {
+                    continue;
+                }
 
-            let (inspection, cache_hit) = inspect_current_release(
-                &mut registry_store,
-                &mut inspection_cache,
-                &context,
-                &state,
-                now,
-            )?;
-            let cutoff = cutoff_time(minimum_minutes, now);
-            debug!(
-                crate = %pkg.name,
-                version = %current_version,
-                published_at = %inspection.published_at,
-                release_time_source = inspection.release_time_source.log_label(),
-                cutoff = %cutoff,
-                cache = if cache_hit { "hit" } else { "miss" },
-                registry = %context.effective_index_url,
-                "evaluated release age for locked dependency"
-            );
-            if config.verbose {
-                eprintln!(
-                    "cooldown: {} crate={} version={} registry={} published_at={} cutoff={} release_time_source={} cache={}",
-                    if cache_hit { "reused" } else { "inspected" },
-                    pkg.name,
-                    current_version,
-                    context.effective_index_url,
-                    inspection.published_at,
-                    cutoff,
-                    inspection.release_time_source.log_label(),
-                    if cache_hit { "hit" } else { "miss" },
-                );
-            }
+                let context = registry_store.context_for_source(&source.repr)?.clone();
+                let current_version = pkg.version.to_string();
+                let mut minimum_minutes = config.cooldown_minutes;
+                if let Some(global) = global_minutes {
+                    minimum_minutes = minimum_minutes.min(global);
+                }
+                if let Some(&minutes) = per_crate_minutes.get(pkg.name.as_str()) {
+                    minimum_minutes = minimum_minutes.min(minutes);
+                }
 
-            if inspection.fresh {
-                fresh_entries.push(FreshCrate {
-                    package_id: node.id.clone(),
+                let exact_allowed = allowlist.is_exact_allowed(pkg.name.as_str(), &current_version);
+                let baseline_exempt = !config.lockfile_policy.applies_to_existing_lockfile()
+                    && initial_lockfile.baseline().contains_registry_version(
+                        pkg.name.as_str(),
+                        &context.effective_index_url,
+                        &current_version,
+                    );
+                let state = CrateState {
                     name: pkg.name.to_string(),
                     source_id: source.repr.clone(),
-                    current_version,
+                    current_version: current_version.clone(),
                     minimum_minutes,
-                });
-            }
-        }
+                    exact_allowed,
+                    skipped: context.skipped,
+                    baseline_exempt,
+                };
+                crate_states.insert(node.id.clone(), state.clone());
 
-        if fresh_entries.is_empty() {
-            info!("dependency graph cooled down; continuing with Cargo command");
-            break;
-        }
-
-        // Try the fresh crates that are most likely to unblock others first.
-        // Exact-version dependents are the hardest constraints, so they go earlier.
-        let fresh_ids: HashSet<PackageId> = fresh_entries
-            .iter()
-            .map(|entry| entry.package_id.clone())
-            .collect();
-        fresh_entries.sort_by_key(|entry| {
-            equality_dependents
-                .get(&entry.package_id)
-                .map_or(0, |dependents| {
-                    dependents
-                        .iter()
-                        .filter(|id| fresh_ids.contains(*id))
-                        .count()
-                })
-        });
-
-        let mut queue: VecDeque<FreshCrate> = fresh_entries.into();
-
-        'queue_loop: while let Some(fresh) = queue.pop_front() {
-            // Each queue entry represents one currently locked crate/version pair that
-            // still violates the cooldown window and needs an older acceptable version.
-            let key = format!(
-                "{}::{}@{}",
-                fresh.source_id, fresh.name, fresh.current_version
-            );
-            if visited_failures.contains(&key) {
-                bail!(
-                    "no acceptable version found for {} from registry {} (cooldown {} minutes). Consider waiting for the cooldown window, relaxing the requirement, or skipping that registry via COOLDOWN_SKIP_REGISTRIES.",
-                    fresh.name,
-                    fresh.source_id,
-                    fresh.minimum_minutes
-                );
-            }
-
-            let context = registry_store.context_for_source(&fresh.source_id)?.clone();
-            let timeline = registry_store.timeline_for(&fresh.source_id, &fresh.name)?;
-            ensure_timeline_available(&context, &fresh.name, &timeline)?;
-            let requirements = version_requirements
-                .get(&fresh.package_id)
-                .cloned()
-                .unwrap_or_default();
-
-            let Some(candidate) = select_candidate(
-                &timeline,
-                &fresh.current_version,
-                &requirements,
-                fresh.minimum_minutes,
-                now,
-            ) else {
-                // No older compatible version exists for this crate as-is. Requeue any
-                // parent that constrained it so we can try to cool down the parent first
-                // and potentially relax the version chosen for this dependency.
-                let mut queued_parent = false;
-                if let Some(origins) = requirement_origins.get(&fresh.package_id) {
-                    for origin in origins {
-                        if let Some(state) = crate_states.get(&origin.parent_id) {
-                            if state.is_cooldown_exempt() {
-                                continue;
-                            }
-                            queue.push_front(FreshCrate {
-                                package_id: origin.parent_id.clone(),
-                                name: origin.parent_name.clone(),
-                                source_id: state.source_id.clone(),
-                                current_version: state.current_version.clone(),
-                                minimum_minutes: state.minimum_minutes,
-                            });
-                            queued_parent = true;
-                        }
-                    }
-                }
-                if queued_parent {
-                    queue.push_back(fresh.clone());
-                    continue 'queue_loop;
+                if state.is_cooldown_exempt() {
+                    continue;
                 }
 
-                visited_failures.insert(key);
-                bail!(
-                    "crate {} from registry {} lacks versions older than {} minutes that satisfy the semver constraints",
-                    fresh.name,
-                    context.effective_index_url,
-                    fresh.minimum_minutes
+                let (inspection, cache_hit) = inspect_current_release(
+                    &mut registry_store,
+                    &mut inspection_cache,
+                    &context,
+                    &state,
+                    now,
+                )?;
+                let cutoff = cutoff_time(minimum_minutes, now);
+                debug!(
+                    crate = %pkg.name,
+                    version = %current_version,
+                    published_at = %inspection.published_at,
+                    release_time_source = inspection.release_time_source.log_label(),
+                    cutoff = %cutoff,
+                    cache = if cache_hit { "hit" } else { "miss" },
+                    registry = %context.effective_index_url,
+                    "evaluated release age for locked dependency"
                 );
-            };
-
-            info!(
-                crate = %fresh.name,
-                registry = %context.effective_index_url,
-                current = %fresh.current_version,
-                candidate = %candidate.version,
-                "attempting pin"
-            );
-
-            match try_pin_precise(
-                manifest,
-                &fresh.name,
-                &fresh.current_version,
-                &candidate.version,
-            )? {
-                PinOutcome::Applied => {
-                    // A successful pin changes the lockfile, so restart from the top and
-                    // recompute metadata instead of trying to patch our in-memory graph.
-                    info!(
-                        crate = %fresh.name,
-                        registry = %context.effective_index_url,
-                        pinned = %candidate.version,
-                        "pin applied"
+                if config.verbose {
+                    eprintln!(
+                        "cooldown: {} crate={} version={} registry={} published_at={} cutoff={} release_time_source={} cache={}",
+                        if cache_hit { "reused" } else { "inspected" },
+                        pkg.name,
+                        current_version,
+                        context.effective_index_url,
+                        inspection.published_at,
+                        cutoff,
+                        inspection.release_time_source.log_label(),
+                        if cache_hit { "hit" } else { "miss" },
                     );
-                    continue 'outer;
                 }
-                PinOutcome::Rejected { stdout, stderr } => {
-                    let blockers = parse_blockers(&stdout, &stderr);
-                    if blockers.is_empty() {
-                        visited_failures.insert(key);
-                        bail!(
-                            "cargo rejected pinning {} from registry {} to {} without exposing actionable blockers",
-                            fresh.name,
-                            context.effective_index_url,
-                            candidate.version
-                        );
-                    }
 
-                    // Cargo can reject a pin because some other locked package still
-                    // requires the fresher version. Requeue those blockers first, then
-                    // revisit this crate later in the same pass.
-                    let blocker_descriptions =
-                        blockers.iter().map(Blocker::label).collect::<Vec<_>>();
-                    let mut queued_blocker = false;
-                    for blocker in blockers {
-                        let matches = blocker
-                            .version
-                            .as_ref()
-                            .and_then(|version| {
-                                name_version_to_ids
-                                    .get(&(blocker.name.clone(), version.clone()))
-                                    .cloned()
-                            })
-                            .or_else(|| {
-                                Some(
-                                    crate_states
-                                        .iter()
-                                        .filter(|(_, state)| state.name == blocker.name)
-                                        .map(|(id, _)| id.clone())
-                                        .collect(),
-                                )
-                            })
-                            .unwrap_or_default();
+                if inspection.fresh {
+                    fresh_entries.push(FreshCrate {
+                        package_id: node.id.clone(),
+                        name: pkg.name.to_string(),
+                        source_id: source.repr.clone(),
+                        current_version,
+                        minimum_minutes,
+                    });
+                }
+            }
 
-                        for id in matches {
-                            if let Some(state) = crate_states.get(&id) {
+            if fresh_entries.is_empty() {
+                info!("dependency graph cooled down; continuing with Cargo command");
+                break;
+            }
+
+            // Try the fresh crates that are most likely to unblock others first.
+            // Exact-version dependents are the hardest constraints, so they go earlier.
+            let fresh_ids: HashSet<PackageId> = fresh_entries
+                .iter()
+                .map(|entry| entry.package_id.clone())
+                .collect();
+            fresh_entries.sort_by_key(|entry| {
+                equality_dependents
+                    .get(&entry.package_id)
+                    .map_or(0, |dependents| {
+                        dependents
+                            .iter()
+                            .filter(|id| fresh_ids.contains(*id))
+                            .count()
+                    })
+            });
+
+            let mut queue: VecDeque<FreshCrate> = fresh_entries.into();
+
+            'queue_loop: while let Some(fresh) = queue.pop_front() {
+                // Each queue entry represents one currently locked crate/version pair that
+                // still violates the cooldown window and needs an older acceptable version.
+                let key = format!(
+                    "{}::{}@{}",
+                    fresh.source_id, fresh.name, fresh.current_version
+                );
+                if visited_failures.contains(&key) {
+                    bail!(
+                        "no acceptable version found for {} from registry {} (cooldown {} minutes). Consider waiting for the cooldown window, relaxing the requirement, or skipping that registry via COOLDOWN_SKIP_REGISTRIES.",
+                        fresh.name,
+                        fresh.source_id,
+                        fresh.minimum_minutes
+                    );
+                }
+
+                let context = registry_store.context_for_source(&fresh.source_id)?.clone();
+                let timeline = registry_store.timeline_for(&fresh.source_id, &fresh.name)?;
+                ensure_timeline_available(&context, &fresh.name, &timeline)?;
+                let requirements = version_requirements
+                    .get(&fresh.package_id)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let Some(candidate) = select_candidate(
+                    &timeline,
+                    &fresh.current_version,
+                    &requirements,
+                    fresh.minimum_minutes,
+                    now,
+                ) else {
+                    // No older compatible version exists for this crate as-is. Requeue any
+                    // parent that constrained it so we can try to cool down the parent first
+                    // and potentially relax the version chosen for this dependency.
+                    let mut queued_parent = false;
+                    if let Some(origins) = requirement_origins.get(&fresh.package_id) {
+                        for origin in origins {
+                            if let Some(state) = crate_states.get(&origin.parent_id) {
                                 if state.is_cooldown_exempt() {
                                     continue;
                                 }
                                 queue.push_front(FreshCrate {
-                                    package_id: id,
-                                    name: state.name.clone(),
+                                    package_id: origin.parent_id.clone(),
+                                    name: origin.parent_name.clone(),
                                     source_id: state.source_id.clone(),
                                     current_version: state.current_version.clone(),
                                     minimum_minutes: state.minimum_minutes,
                                 });
-                                queued_blocker = true;
+                                queued_parent = true;
                             }
                         }
                     }
-
-                    if !queued_blocker {
-                        visited_failures.insert(key);
-                        bail!(
-                            "cargo rejected pinning {} from registry {} to {} due to blockers outside the selected cooldown scope or otherwise ineligible blockers: {}",
-                            fresh.name,
-                            context.effective_index_url,
-                            candidate.version,
-                            blocker_descriptions.join(", ")
-                        );
+                    if queued_parent {
+                        queue.push_back(fresh.clone());
+                        continue 'queue_loop;
                     }
 
-                    queue.push_back(fresh.clone());
+                    visited_failures.insert(key);
+                    bail!(
+                        "crate {} from registry {} lacks versions older than {} minutes that satisfy the semver constraints",
+                        fresh.name,
+                        context.effective_index_url,
+                        fresh.minimum_minutes
+                    );
+                };
+
+                info!(
+                    crate = %fresh.name,
+                    registry = %context.effective_index_url,
+                    current = %fresh.current_version,
+                    candidate = %candidate.version,
+                    "attempting pin"
+                );
+
+                match try_pin_precise(
+                    manifest,
+                    &fresh.name,
+                    &fresh.current_version,
+                    &candidate.version,
+                )? {
+                    PinOutcome::Applied => {
+                        // A successful pin changes the lockfile, so restart from the top and
+                        // recompute metadata instead of trying to patch our in-memory graph.
+                        info!(
+                            crate = %fresh.name,
+                            registry = %context.effective_index_url,
+                            pinned = %candidate.version,
+                            "pin applied"
+                        );
+                        continue 'outer;
+                    }
+                    PinOutcome::Rejected { stdout, stderr } => {
+                        let blockers = parse_blockers(&stdout, &stderr);
+                        if blockers.is_empty() {
+                            visited_failures.insert(key);
+                            bail!(
+                                "cargo rejected pinning {} from registry {} to {} without exposing actionable blockers",
+                                fresh.name,
+                                context.effective_index_url,
+                                candidate.version
+                            );
+                        }
+
+                        // Cargo can reject a pin because some other locked package still
+                        // requires the fresher version. Requeue those blockers first, then
+                        // revisit this crate later in the same pass.
+                        let blocker_descriptions =
+                            blockers.iter().map(Blocker::label).collect::<Vec<_>>();
+                        let mut queued_blocker = false;
+                        for blocker in blockers {
+                            let matches = blocker
+                                .version
+                                .as_ref()
+                                .and_then(|version| {
+                                    name_version_to_ids
+                                        .get(&(blocker.name.clone(), version.clone()))
+                                        .cloned()
+                                })
+                                .or_else(|| {
+                                    Some(
+                                        crate_states
+                                            .iter()
+                                            .filter(|(_, state)| state.name == blocker.name)
+                                            .map(|(id, _)| id.clone())
+                                            .collect(),
+                                    )
+                                })
+                                .unwrap_or_default();
+
+                            for id in matches {
+                                if let Some(state) = crate_states.get(&id) {
+                                    if state.is_cooldown_exempt() {
+                                        continue;
+                                    }
+                                    queue.push_front(FreshCrate {
+                                        package_id: id,
+                                        name: state.name.clone(),
+                                        source_id: state.source_id.clone(),
+                                        current_version: state.current_version.clone(),
+                                        minimum_minutes: state.minimum_minutes,
+                                    });
+                                    queued_blocker = true;
+                                }
+                            }
+                        }
+
+                        if !queued_blocker {
+                            visited_failures.insert(key);
+                            bail!(
+                                "cargo rejected pinning {} from registry {} to {} due to blockers outside the selected cooldown scope or otherwise ineligible blockers: {}",
+                                fresh.name,
+                                context.effective_index_url,
+                                candidate.version,
+                                blocker_descriptions.join(", ")
+                            );
+                        }
+
+                        queue.push_back(fresh.clone());
+                    }
                 }
             }
+
+            bail!(
+                "reached a fixed point without resolving all fresh dependencies; aborting to avoid endless loop"
+            );
         }
 
-        bail!(
-            "reached a fixed point without resolving all fresh dependencies; aborting to avoid endless loop"
-        );
+        Ok(())
+    })();
+
+    if let Err(err) = result {
+        if let Err(restore_err) = initial_lockfile.restore(&lockfile_path) {
+            return Err(restore_err.context(format!("original cooldown error: {err:#}")));
+        }
+        return Err(err);
     }
 
     Ok(())

@@ -26,6 +26,16 @@ const NOW: &str = "2026-04-03T00:00:00Z";
 const COOLDOWN_MINUTES: &str = "1440";
 const REGISTRY_NAME: &str = "cool-reg";
 const LOCKFILE_POLICY_ALL: (&str, &str) = ("COOLDOWN_LOCKFILE_POLICY", "all");
+const CHAIN_A_NAME: &str = "chaina";
+const CHAIN_A_OLD_VERSION: &str = "1.2.2";
+const CHAIN_A_FRESH_VERSION: &str = "1.2.3";
+const CHAIN_A_OLD_PUBTIME: &str = "2026-03-01T00:00:00Z";
+const CHAIN_A_FRESH_PUBTIME: &str = "2026-04-02T12:00:00Z";
+const CHAIN_B_NAME: &str = "chainb";
+const CHAIN_B_OLD_VERSION: &str = "2.3.3";
+const CHAIN_B_UPDATED_VERSION: &str = "2.3.4";
+const CHAIN_B_OLD_PUBTIME: &str = "2026-03-01T00:00:00Z";
+const CHAIN_B_UPDATED_PUBTIME: &str = "2026-03-15T00:00:00Z";
 
 #[test]
 fn existing_lockfile_fresh_dependency_is_ignored_by_default() {
@@ -68,8 +78,7 @@ fn uses_index_pubtime_without_hitting_api() {
     println!("{stderr}");
     assert!(
         stderr.contains("release_time_source=index_pubtime"),
-        "expected verbose logs to show local pubtime usage: {}",
-        stderr
+        "expected verbose logs to show local pubtime usage: {stderr}"
     );
 }
 
@@ -93,8 +102,7 @@ fn fills_missing_pubtime_via_fallback_api() {
     println!("{stderr}");
     assert!(
         stderr.contains("release_time_source=registry_api_fallback"),
-        "expected verbose logs to show HTTP fallback usage: {}",
-        stderr
+        "expected verbose logs to show HTTP fallback usage: {stderr}"
     );
 }
 
@@ -195,6 +203,26 @@ fn generates_lockfile_before_running_cooldown() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), OLD_VERSION);
+}
+
+#[test]
+fn failed_fresh_update_restores_initial_lockfile_and_transitive_versions() {
+    let mut harness = DependencyChainHarness::new().expect("chain harness should build");
+    harness.generate_lockfile();
+    let baseline_lockfile = harness.lockfile_contents();
+    assert_eq!(harness.locked_version(CHAIN_A_NAME), CHAIN_A_OLD_VERSION);
+    assert_eq!(harness.locked_version(CHAIN_B_NAME), CHAIN_B_OLD_VERSION);
+
+    harness.request_exact_version(CHAIN_A_FRESH_VERSION);
+    let output = harness.run_cooldown(&[]);
+    assert!(
+        !output.status.success(),
+        "fresh exact updates should fail and restore the baseline lockfile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.lockfile_contents(), baseline_lockfile);
+    assert_eq!(harness.locked_version(CHAIN_A_NAME), CHAIN_A_OLD_VERSION);
+    assert_eq!(harness.locked_version(CHAIN_B_NAME), CHAIN_B_OLD_VERSION);
 }
 
 #[test]
@@ -421,6 +449,121 @@ impl TestHarness {
     }
 }
 
+struct DependencyChainHarness {
+    _temp_dir: TempDir,
+    cargo_home: PathBuf,
+    workspace_dir: PathBuf,
+    _server: RegistryServer,
+}
+
+impl DependencyChainHarness {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_root = temp_dir.path().to_path_buf();
+        let cargo_home = temp_root.join("cargo-home");
+        let workspace_dir = temp_root.join("workspace");
+        let server = RegistryServer::with_crates(
+            vec![
+                PublishedCrate::new(
+                    CHAIN_A_NAME,
+                    vec![
+                        PackageVersion::new(CHAIN_A_OLD_VERSION, Some(CHAIN_A_OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                CHAIN_B_NAME,
+                                CHAIN_B_OLD_VERSION,
+                            )]),
+                        PackageVersion::new(
+                            CHAIN_A_FRESH_VERSION,
+                            Some(CHAIN_A_FRESH_PUBTIME),
+                            false,
+                        )
+                        .with_dependencies(vec![
+                            RegistryDependency::exact(CHAIN_B_NAME, CHAIN_B_UPDATED_VERSION),
+                        ]),
+                    ],
+                ),
+                PublishedCrate::new(
+                    CHAIN_B_NAME,
+                    vec![
+                        PackageVersion::new(CHAIN_B_OLD_VERSION, Some(CHAIN_B_OLD_PUBTIME), false),
+                        PackageVersion::new(
+                            CHAIN_B_UPDATED_VERSION,
+                            Some(CHAIN_B_UPDATED_PUBTIME),
+                            false,
+                        ),
+                    ],
+                ),
+            ],
+            false,
+        )?;
+
+        fs::create_dir_all(&cargo_home)?;
+        create_workspace_with_dependency(
+            &workspace_dir,
+            &server,
+            CHAIN_A_NAME,
+            &format!("={CHAIN_A_OLD_VERSION}"),
+        )?;
+        write_registry_config(&cargo_home, &server)?;
+
+        Ok(Self {
+            _temp_dir: temp_dir,
+            cargo_home,
+            workspace_dir,
+            _server: server,
+        })
+    }
+
+    fn generate_lockfile(&mut self) {
+        let output = Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .output()
+            .expect("cargo generate-lockfile should run");
+
+        assert!(
+            output.status.success(),
+            "lockfile generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn request_exact_version(&self, version: &str) {
+        write_root_manifest(&self.workspace_dir, CHAIN_A_NAME, &format!("={version}"))
+            .expect("root manifest should be rewritable");
+    }
+
+    fn run_cooldown(&self, extra_env: &[(&str, &str)]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command
+            .arg("check")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .env("COOLDOWN_NOW", NOW)
+            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("COOLDOWN_HTTP_RETRIES", "0");
+
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+
+        command.output().expect("cargo-cooldown should run")
+    }
+
+    fn lockfile_contents(&self) -> String {
+        fs::read_to_string(self.workspace_dir.join("Cargo.lock"))
+            .expect("lockfile should be readable")
+    }
+
+    fn locked_version(&self, crate_name: &str) -> String {
+        parse_lockfile_version(&self.lockfile_contents(), crate_name)
+            .expect("crate should exist in lockfile")
+    }
+}
+
 struct WorkspaceMemberHarness {
     _temp_dir: TempDir,
     workspace_dir: PathBuf,
@@ -540,8 +683,8 @@ impl RegistryServer {
         let published_crates = vec![PublishedCrate::new(
             CRATE_NAME,
             vec![
-                PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false)?,
-                PackageVersion::new(FRESH_VERSION, mode.pubtime_for_fresh(), false)?,
+                PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                PackageVersion::new(FRESH_VERSION, mode.pubtime_for_fresh(), false),
             ],
         )];
         Self::with_crates(published_crates, mode.has_api())
@@ -699,19 +842,37 @@ struct PackageVersion {
     version: String,
     pubtime: Option<String>,
     yanked: bool,
+    dependencies: Vec<RegistryDependency>,
 }
 
 impl PackageVersion {
-    fn new(
-        version: &str,
-        pubtime: Option<&str>,
-        yanked: bool,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        Ok(Self {
+    fn new(version: &str, pubtime: Option<&str>, yanked: bool) -> Self {
+        Self {
             version: version.to_string(),
             pubtime: pubtime.map(ToOwned::to_owned),
             yanked,
-        })
+            dependencies: Vec::new(),
+        }
+    }
+
+    fn with_dependencies(mut self, dependencies: Vec<RegistryDependency>) -> Self {
+        self.dependencies = dependencies;
+        self
+    }
+}
+
+#[derive(Clone)]
+struct RegistryDependency {
+    name: String,
+    requirement: String,
+}
+
+impl RegistryDependency {
+    fn exact(name: &str, version: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            requirement: format!("={version}"),
+        }
     }
 }
 
@@ -719,32 +880,25 @@ fn create_workspace(
     workspace_dir: &Path,
     server: &RegistryServer,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    create_workspace_with_dependency(workspace_dir, server, CRATE_NAME, "1")
+}
+
+fn create_workspace_with_dependency(
+    workspace_dir: &Path,
+    server: &RegistryServer,
+    crate_name: &str,
+    version_req: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(workspace_dir.join("src"))?;
     fs::create_dir_all(workspace_dir.join(".cargo"))?;
-
-    fs::write(
-        workspace_dir.join("Cargo.toml"),
-        format!(
-            r#"[package]
-name = "cooldown-workspace"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-{crate_name} = {{ version = "1", registry = "{registry_name}" }}
-"#,
-            crate_name = CRATE_NAME,
-            registry_name = REGISTRY_NAME,
-        ),
-    )?;
+    write_root_manifest(workspace_dir, crate_name, version_req)?;
     fs::write(
         workspace_dir.join("src/main.rs"),
         format!(
             r#"fn main() {{
     println!("{{}}", {crate_name}::value());
 }}
-"#,
-            crate_name = CRATE_NAME,
+"#
         ),
     )?;
     fs::write(
@@ -758,6 +912,27 @@ index = "sparse+{base_url}/index/"
         ),
     )?;
 
+    Ok(())
+}
+
+fn write_root_manifest(
+    workspace_dir: &Path,
+    crate_name: &str,
+    version_req: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::write(
+        workspace_dir.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "cooldown-workspace"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{crate_name} = {{ version = "{version_req}", registry = "{REGISTRY_NAME}" }}
+"#
+        ),
+    )?;
     Ok(())
 }
 
@@ -890,7 +1065,7 @@ fn build_tarballs(
     for version in versions {
         tarballs.insert(
             version.version.clone(),
-            create_crate_archive(crate_name, &version.version)?,
+            create_crate_archive(crate_name, version)?,
         );
     }
     Ok(tarballs)
@@ -898,12 +1073,31 @@ fn build_tarballs(
 
 fn create_crate_archive(
     crate_name: &str,
-    version: &str,
+    version: &PackageVersion,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let temp = tempdir()?;
-    let package_dir = temp.path().join(format!("{crate_name}-{version}"));
-    let root_dir = format!("{crate_name}-{version}");
+    let package_dir = temp
+        .path()
+        .join(format!("{crate_name}-{}", version.version));
+    let root_dir = format!("{crate_name}-{}", version.version);
     fs::create_dir_all(package_dir.join("src"))?;
+    let dependency_section = if version.dependencies.is_empty() {
+        String::new()
+    } else {
+        let entries = version
+            .dependencies
+            .iter()
+            .map(|dependency| {
+                format!(
+                    r#"{name} = {{ version = "{requirement}" }}"#,
+                    name = dependency.name,
+                    requirement = dependency.requirement,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("\n[dependencies]\n{entries}\n")
+    };
     fs::write(
         package_dir.join("Cargo.toml"),
         format!(
@@ -914,9 +1108,11 @@ edition = "2024"
 
 [lib]
 path = "src/lib.rs"
+{dependency_section}
 "#,
-            crate_name = CRATE_NAME,
-            version = version,
+            crate_name = crate_name,
+            version = version.version,
+            dependency_section = dependency_section,
         ),
     )?;
     fs::write(
@@ -926,7 +1122,7 @@ path = "src/lib.rs"
     "{version}"
 }}
 "#,
-            version = version,
+            version = version.version,
         ),
     )?;
 
@@ -1017,7 +1213,19 @@ fn build_index_body(
         let mut value = serde_json::json!({
             "name": crate_name,
             "vers": version.version,
-            "deps": [],
+            "deps": version
+                .dependencies
+                .iter()
+                .map(|dependency| serde_json::json!({
+                    "name": dependency.name,
+                    "req": dependency.requirement,
+                    "features": [],
+                    "optional": false,
+                    "default_features": true,
+                    "target": serde_json::Value::Null,
+                    "kind": serde_json::Value::Null,
+                }))
+                .collect::<Vec<_>>(),
             "cksum": checksum,
             "features": {},
             "yanked": version.yanked,

@@ -44,6 +44,8 @@ Migration guide:
   contains `pubtime`
 - clearer distinction between registries that are skipped and registries that
   fail because metadata is incomplete
+- cooldown now restores the original `Cargo.lock` if Cargo re-resolves during
+  inspection and the cooldown run ultimately fails
 - `--manifest-path` is now honored during both cooldown inspection and
   `cargo update --precise` pinning, including runs started from another cwd
 - Cargo-style selectors such as `--manifest-path`, `--package`, `--workspace`,

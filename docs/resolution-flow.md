@@ -59,6 +59,10 @@ need to rebuild the same registry timeline or re-evaluate the same locked
 version more than once inside the same process, and it does not recalculate the
 initial lockfile baseline after later pins.
 
+If any later cooldown step fails after Cargo has already rewritten `Cargo.lock`,
+the resolver restores the exact lockfile contents that were present at process
+start before returning the error.
+
 ## 2. Graph scan and release-age inspection
 
 On each outer pass, `cargo-cooldown` runs `cargo metadata` and rebuilds the

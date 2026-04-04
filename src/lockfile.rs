@@ -7,21 +7,46 @@ use serde::Deserialize;
 
 use crate::registry::{RegistryStore, is_registry_source};
 
+#[derive(Debug, Clone)]
+pub struct LockfileSnapshot {
+    baseline: LockfileBaseline,
+    contents: Option<String>,
+}
+
+impl LockfileSnapshot {
+    pub fn capture(path: &Path, registry_store: &mut RegistryStore) -> Result<Self> {
+        let contents = fs::read_to_string(path).ok();
+        let baseline = LockfileBaseline::from_contents(contents.as_deref(), registry_store)?;
+        Ok(Self { baseline, contents })
+    }
+
+    pub fn baseline(&self) -> &LockfileBaseline {
+        &self.baseline
+    }
+
+    pub fn restore(&self, path: &Path) -> Result<()> {
+        match &self.contents {
+            Some(contents) => fs::write(path, contents)
+                .with_context(|| format!("failed to restore lockfile {}", path.display())),
+            None if path.exists() => fs::remove_file(path)
+                .with_context(|| format!("failed to remove generated lockfile {}", path.display())),
+            None => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LockfileBaseline {
     packages: HashSet<LockfilePackageKey>,
 }
 
 impl LockfileBaseline {
-    pub fn capture(path: &Path, registry_store: &mut RegistryStore) -> Result<Self> {
-        if !path.exists() {
+    fn from_contents(contents: Option<&str>, registry_store: &mut RegistryStore) -> Result<Self> {
+        let Some(contents) = contents else {
             return Ok(Self::default());
-        }
-
-        let contents = fs::read_to_string(path)
-            .with_context(|| format!("failed to read lockfile baseline {}", path.display()))?;
-        let lockfile: RawLockfile = toml::from_str(&contents)
-            .with_context(|| format!("failed to parse lockfile baseline {}", path.display()))?;
+        };
+        let lockfile: RawLockfile =
+            toml::from_str(contents).context("failed to parse lockfile baseline")?;
         let mut packages = HashSet::new();
 
         for package in lockfile.package {
@@ -111,9 +136,13 @@ mod tests {
         let path = dir.path().join("Cargo.lock");
         let mut registry_store = RegistryStore::new(&config_fixture()).unwrap();
 
-        let baseline = LockfileBaseline::capture(&path, &mut registry_store).unwrap();
+        let snapshot = LockfileSnapshot::capture(&path, &mut registry_store).unwrap();
 
-        assert!(!baseline.contains_registry_version("demo", "https://example.com/index", "1.0.0"));
+        assert!(!snapshot.baseline().contains_registry_version(
+            "demo",
+            "https://example.com/index",
+            "1.0.0"
+        ));
     }
 
     #[test]
@@ -142,9 +171,55 @@ version = "0.1.0"
             .effective_index_url
             .clone();
 
-        let baseline = LockfileBaseline::capture(&path, &mut registry_store).unwrap();
+        let snapshot = LockfileSnapshot::capture(&path, &mut registry_store).unwrap();
 
-        assert!(baseline.contains_registry_version("demo", &registry, "1.2.3"));
-        assert!(!baseline.contains_registry_version("workspace-member", &registry, "0.1.0"));
+        assert!(
+            snapshot
+                .baseline()
+                .contains_registry_version("demo", &registry, "1.2.3")
+        );
+        assert!(!snapshot.baseline().contains_registry_version(
+            "workspace-member",
+            &registry,
+            "0.1.0"
+        ));
+    }
+
+    #[test]
+    fn snapshot_restore_removes_generated_lockfile() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Cargo.lock");
+        let mut registry_store = RegistryStore::new(&config_fixture()).unwrap();
+        let snapshot = LockfileSnapshot::capture(&path, &mut registry_store).unwrap();
+
+        fs::write(&path, "version = 4\n").unwrap();
+        snapshot.restore(&path).unwrap();
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn snapshot_restore_reinstates_existing_lockfile_contents() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Cargo.lock");
+        fs::write(
+            &path,
+            r#"version = 4
+
+[[package]]
+name = "demo"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+"#,
+        )
+        .unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        let mut registry_store = RegistryStore::new(&config_fixture()).unwrap();
+        let snapshot = LockfileSnapshot::capture(&path, &mut registry_store).unwrap();
+
+        fs::write(&path, "version = 4\n").unwrap();
+        snapshot.restore(&path).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 }
