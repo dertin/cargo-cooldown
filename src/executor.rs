@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -387,15 +387,8 @@ fn reachable_package_ids(
 }
 
 fn ensure_lockfile(manifest: &Manifest) -> Result<()> {
-    let lockfile_path = manifest
-        .manifest_path
-        .as_ref()
-        .and_then(|path| path.parent().map(|parent| parent.join("Cargo.lock")));
-    if lockfile_path
-        .as_ref()
-        .map(|path| path.exists())
-        .unwrap_or_else(|| Path::new("Cargo.lock").exists())
-    {
+    let lockfile_path = workspace_lockfile_path(manifest)?;
+    if lockfile_path.exists() {
         return Ok(());
     }
 
@@ -410,6 +403,38 @@ fn ensure_lockfile(manifest: &Manifest) -> Result<()> {
         bail!("failed to generate Cargo.lock via `cargo generate-lockfile`");
     }
     Ok(())
+}
+
+fn workspace_lockfile_path(manifest: &Manifest) -> Result<PathBuf> {
+    // Workspace members share the root Cargo.lock, so we ask Cargo for the
+    // effective workspace manifest instead of guessing from --manifest-path.
+    let mut command = Command::new("cargo");
+    command.args(["locate-project", "--workspace", "--message-format", "plain"]);
+    if let Some(path) = &manifest.manifest_path {
+        command.arg("--manifest-path").arg(path);
+    }
+
+    let output = command
+        .output()
+        .context("failed to run `cargo locate-project --workspace`")?;
+    if !output.status.success() {
+        bail!(
+            "failed to locate workspace manifest via `cargo locate-project --workspace`: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let manifest_path = String::from_utf8(output.stdout)
+        .context("`cargo locate-project --workspace` returned non-utf8 output")?;
+    let manifest_path = manifest_path.trim();
+    let workspace_manifest = PathBuf::from(manifest_path);
+    let workspace_root = workspace_manifest.parent().with_context(|| {
+        format!(
+            "`cargo locate-project --workspace` returned a manifest without a parent directory: {}",
+            workspace_manifest.display()
+        )
+    })?;
+    Ok(workspace_root.join("Cargo.lock"))
 }
 
 #[derive(Clone, Debug)]

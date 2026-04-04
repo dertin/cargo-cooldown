@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -210,6 +211,62 @@ fn honors_manifest_path_before_subcommand_from_external_cwd() {
 }
 
 #[test]
+fn workspace_member_manifest_reuses_workspace_root_lockfile() {
+    let harness = WorkspaceMemberHarness::new().expect("workspace member harness should build");
+    harness.generate_lockfile();
+    assert!(harness.workspace_lockfile().exists());
+    assert!(
+        !harness.member_lockfile().exists(),
+        "workspace members should not own a separate lockfile"
+    );
+
+    let output = harness.run_cooldown();
+    assert!(
+        output.status.success(),
+        "workspace member invocation should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let cargo_log = harness.cargo_log();
+    assert!(
+        !cargo_log
+            .iter()
+            .any(|line| line.contains("generate-lockfile")),
+        "existing workspace Cargo.lock should prevent redundant cargo generate-lockfile runs: {cargo_log:#?}"
+    );
+}
+
+#[test]
+fn workspace_member_manifest_generates_workspace_root_lockfile_when_missing() {
+    let harness = WorkspaceMemberHarness::new().expect("workspace member harness should build");
+    assert!(
+        !harness.workspace_lockfile().exists(),
+        "fixture should start without a workspace lockfile"
+    );
+
+    let output = harness.run_cooldown();
+    assert!(
+        output.status.success(),
+        "workspace member invocation should generate the shared lockfile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        harness.workspace_lockfile().exists(),
+        "cargo generate-lockfile should create Cargo.lock at the workspace root"
+    );
+
+    let cargo_log = harness.cargo_log();
+    let generate_count = cargo_log
+        .iter()
+        .filter(|line| line.contains("generate-lockfile"))
+        .count();
+    assert_eq!(
+        generate_count, 1,
+        "missing workspace Cargo.lock should trigger exactly one cargo generate-lockfile run: {cargo_log:#?}"
+    );
+}
+
+#[test]
 fn exact_allowlist_keeps_fresh_version_pinned() {
     let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
     harness.generate_lockfile();
@@ -329,6 +386,91 @@ impl TestHarness {
         let lockfile = fs::read_to_string(self.workspace_dir.join("Cargo.lock"))
             .expect("lockfile should be readable");
         parse_lockfile_version(&lockfile, CRATE_NAME).expect("crate should exist in lockfile")
+    }
+}
+
+struct WorkspaceMemberHarness {
+    _temp_dir: TempDir,
+    workspace_dir: PathBuf,
+    member_manifest: PathBuf,
+    runner_dir: PathBuf,
+    cargo_wrapper_log: PathBuf,
+    path_with_wrapper: OsString,
+}
+
+impl WorkspaceMemberHarness {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let root = temp_dir.path().to_path_buf();
+        let workspace_dir = root.join("workspace");
+        let runner_dir = root.join("runner");
+        let wrapper_dir = root.join("wrapper-bin");
+        let cargo_wrapper_log = root.join("cargo-invocations.log");
+        let wrapper_path = wrapper_dir.join(wrapper_binary_name());
+
+        fs::create_dir_all(&runner_dir)?;
+        fs::create_dir_all(&wrapper_dir)?;
+        let member_manifest = create_workspace_member_fixture(&workspace_dir)?;
+        write_cargo_wrapper(&wrapper_path, &cargo_wrapper_log)?;
+        let path_with_wrapper = prepend_to_path(&wrapper_dir)?;
+
+        Ok(Self {
+            _temp_dir: temp_dir,
+            workspace_dir,
+            member_manifest,
+            runner_dir,
+            cargo_wrapper_log,
+            path_with_wrapper,
+        })
+    }
+
+    fn generate_lockfile(&self) {
+        let output = Command::new(real_cargo_binary())
+            .arg("generate-lockfile")
+            .arg("--manifest-path")
+            .arg(&self.member_manifest)
+            .current_dir(&self.runner_dir)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .output()
+            .expect("cargo generate-lockfile should run");
+
+        assert!(
+            output.status.success(),
+            "workspace lockfile generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_cooldown(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .args([
+                "check",
+                "--manifest-path",
+                self.member_manifest.to_string_lossy().as_ref(),
+            ])
+            .current_dir(&self.runner_dir)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .env("COOLDOWN_MINUTES", "60")
+            .env("PATH", &self.path_with_wrapper)
+            .env("COOLDOWN_CARGO_LOG", &self.cargo_wrapper_log)
+            .output()
+            .expect("cargo-cooldown should run")
+    }
+
+    fn workspace_lockfile(&self) -> PathBuf {
+        self.workspace_dir.join("Cargo.lock")
+    }
+
+    fn member_lockfile(&self) -> PathBuf {
+        self.workspace_dir.join("member").join("Cargo.lock")
+    }
+
+    fn cargo_log(&self) -> Vec<String> {
+        fs::read_to_string(&self.cargo_wrapper_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 }
 
@@ -584,6 +726,110 @@ index = "sparse+{base_url}/index/"
         ),
     )?;
 
+    Ok(())
+}
+
+fn create_workspace_member_fixture(
+    workspace_dir: &Path,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let member_dir = workspace_dir.join("member");
+    fs::create_dir_all(member_dir.join("src"))?;
+
+    fs::write(
+        workspace_dir.join("Cargo.toml"),
+        r#"[workspace]
+members = ["member"]
+resolver = "3"
+"#,
+    )?;
+    fs::write(
+        member_dir.join("Cargo.toml"),
+        r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024"
+"#,
+    )?;
+    fs::write(
+        member_dir.join("src/main.rs"),
+        r#"fn main() {
+    println!("member");
+}
+"#,
+    )?;
+
+    Ok(member_dir.join("Cargo.toml"))
+}
+
+fn write_cargo_wrapper(
+    wrapper_path: &Path,
+    log_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_platform_cargo_wrapper(wrapper_path, log_path)?;
+    Ok(())
+}
+
+fn real_cargo_binary() -> String {
+    std::env::var("CARGO").expect("cargo test should expose the real cargo binary path")
+}
+
+fn prepend_to_path(prefix: &Path) -> Result<OsString, Box<dyn std::error::Error>> {
+    let mut paths = vec![prefix.to_path_buf()];
+    paths.extend(
+        std::env::var_os("PATH")
+            .map(|raw| std::env::split_paths(&raw).collect::<Vec<_>>())
+            .unwrap_or_default(),
+    );
+    Ok(std::env::join_paths(paths)?)
+}
+
+#[cfg(unix)]
+fn wrapper_binary_name() -> &'static str {
+    "cargo"
+}
+
+#[cfg(windows)]
+fn wrapper_binary_name() -> &'static str {
+    "cargo.bat"
+}
+
+#[cfg(unix)]
+fn write_platform_cargo_wrapper(
+    wrapper_path: &Path,
+    log_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        wrapper_path,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> "{log_path}"
+exec "{real_cargo}" "$@"
+"#,
+            log_path = log_path.display(),
+            real_cargo = real_cargo_binary(),
+        ),
+    )?;
+    let mut permissions = fs::metadata(wrapper_path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(wrapper_path, permissions)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn write_platform_cargo_wrapper(
+    wrapper_path: &Path,
+    log_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::write(
+        wrapper_path,
+        format!(
+            "@echo off\r\necho %*>>\"{log_path}\"\r\n\"{real_cargo}\" %*\r\n",
+            log_path = log_path.display(),
+            real_cargo = real_cargo_binary(),
+        ),
+    )?;
     Ok(())
 }
 
