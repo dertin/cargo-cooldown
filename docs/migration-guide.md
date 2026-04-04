@@ -25,6 +25,23 @@ or:
 COOLDOWN_SKIP_REGISTRIES=crates-io,sparse+https://example.com/index/
 ```
 
+### Lockfile baseline is now respected by default
+
+By default, versions that were already present in the initial `Cargo.lock` are
+not re-cooled.
+
+If you want the previous "cool every eligible locked package" behavior, use:
+
+```toml
+lockfile_policy = "all"
+```
+
+or:
+
+```bash
+COOLDOWN_LOCKFILE_POLICY=all
+```
+
 ### Registry API routing is discovered automatically
 
 The resolver reads the active registry configuration that Cargo is already using
@@ -84,6 +101,8 @@ For registries such as CodeArtifact, the practical migration path is:
 
 - package-scoped runs now cool only the selected workspace members and their
   dependency closure;
+- unchanged lockfile entries are skipped by default unless
+  `lockfile_policy = "all"` is enabled;
 - `--manifest-path` is honored during both cooldown inspection and
   `cargo update --precise` pinning;
 - Cargo-style selectors such as `--manifest-path`, `--package`, `--workspace`,

@@ -14,6 +14,8 @@ Migration guide:
 - per-crate HTTP fallback when `pubtime` is missing
 - multi-registry support for Cargo registries, mirrors, and source replacements
 - explicit `skip_registries` / `COOLDOWN_SKIP_REGISTRIES`
+- explicit `lockfile_policy` / `COOLDOWN_LOCKFILE_POLICY` to choose between
+  cooling only changed lockfile entries or cooling all eligible entries
 - new integration tests in `./tests`
 - new documentation under `./docs`
 
@@ -22,6 +24,8 @@ Migration guide:
 - resolver now works from a single release timeline per crate
 - cooldown now follows Cargo's effective registry configuration instead of a
   separate registry routing layer
+- cooldown now snapshots the initial `Cargo.lock` once per execution and, by
+  default, skips registry versions that were already present in that baseline
 - cooldown now respects Cargo workspace selectors so package-scoped runs only
   cool the selected workspace members and their dependency closure
 - repeated outer-loop scans now reuse in-memory registry timelines and locked

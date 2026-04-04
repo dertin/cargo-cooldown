@@ -8,12 +8,15 @@ re-reading the same registry metadata inside one cooldown execution.
 ```mermaid
 flowchart TD
     Start([Start cargo-cooldown]) --> Config[Load config and allowlist]
-    Config --> FixedNow[Fix one now for the whole run]
+    Config --> Baseline[Snapshot initial Cargo.lock]
+    Baseline --> FixedNow[Fix one now for the whole run]
     FixedNow --> Metadata[cargo metadata]
     Metadata --> Scan[Scan resolved registry packages]
     Scan --> Skip{Skipped or exempt?}
     Skip -->|Yes| NextPkg[Next package]
-    Skip -->|No| Inspect[Inspect locked version age]
+    Skip -->|No| BaselineCheck{Present in initial lockfile and policy=changed?}
+    BaselineCheck -->|Yes| NextPkg
+    BaselineCheck -->|No| Inspect[Inspect locked version age]
     Inspect --> TimelineCache{Timeline cached?}
     TimelineCache -->|No| Index[Index local registry cache]
     Index --> Missing{pubtime missing?}
@@ -41,8 +44,9 @@ flowchart TD
 At the beginning of one `cargo-cooldown` execution, the resolver:
 
 1. loads config and allowlist rules;
-2. fixes a single `now` timestamp for the whole run;
-3. creates one registry store that lives across every pin attempt in that run.
+2. snapshots the initial `Cargo.lock` once;
+3. fixes a single `now` timestamp for the whole run;
+4. creates one registry store that lives across every pin attempt in that run.
 
 That boundary matters because the current implementation already caches:
 
@@ -52,7 +56,8 @@ That boundary matters because the current implementation already caches:
 
 So even though Cargo is re-run after each successful pin, the resolver does not
 need to rebuild the same registry timeline or re-evaluate the same locked
-version more than once inside the same process.
+version more than once inside the same process, and it does not recalculate the
+initial lockfile baseline after later pins.
 
 ## 2. Graph scan and release-age inspection
 
@@ -64,7 +69,10 @@ For each registry package in that graph:
 1. resolve the effective registry location from Cargo's own configuration;
 2. skip the package immediately if its registry is in `skip_registries`;
 3. skip the package if it is exact-allowlisted or its effective cooldown is `0`;
-4. inspect the locked version age.
+4. if `lockfile_policy = "changed"`, skip the package when the exact locked
+   `(registry, crate, version)` was already present in the initial lockfile
+   baseline;
+5. inspect the locked version age.
 
 The age inspection itself works like this:
 
@@ -99,7 +107,9 @@ Fresh packages are queued and pinned one at a time with `cargo update --precise`
 If Cargo rejects a pin because another package blocks it, the blocker is queued
 and the resolver keeps working inside that same pass. If a pin succeeds, the
 resolver restarts from `cargo metadata` so Cargo can re-resolve the graph from
-the new lockfile state.
+the new lockfile state. The initial baseline does not change, so any package
+that moves to a version not present in that baseline becomes eligible for
+cooldown on the next pass.
 
 That is the main remaining cost today: the resolved graph is still rebuilt after
 each successful pin, even though the registry timelines and many locked-version

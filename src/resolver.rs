@@ -36,7 +36,7 @@ pub fn select_candidate<'a>(
         .iter()
         .rev()
         .filter(|release| !release.yanked)
-        .filter_map(|release| {
+        .find_map(|release| {
             let published_at = release.published_at?;
             if published_at > cutoff {
                 return None;
@@ -55,7 +55,6 @@ pub fn select_candidate<'a>(
                 None
             }
         })
-        .next()
 }
 
 #[derive(Debug)]

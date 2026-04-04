@@ -25,6 +25,29 @@ const FRESH_PUBTIME: &str = "2026-04-02T12:00:00Z";
 const NOW: &str = "2026-04-03T00:00:00Z";
 const COOLDOWN_MINUTES: &str = "1440";
 const REGISTRY_NAME: &str = "cool-reg";
+const LOCKFILE_POLICY_ALL: (&str, &str) = ("COOLDOWN_LOCKFILE_POLICY", "all");
+
+#[test]
+fn existing_lockfile_fresh_dependency_is_ignored_by_default() {
+    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+
+    harness.server.reset_counts();
+    let output = harness.run_cooldown(&[("COOLDOWN_VERBOSE", "true")]);
+    assert!(
+        output.status.success(),
+        "cooldown should leave unchanged baseline dependencies alone: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+    assert_eq!(harness.server.api_hits(), 0);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("cooldown: "),
+        "default lockfile policy should skip inspection for unchanged baseline versions: {stderr}"
+    );
+}
 
 #[test]
 fn uses_index_pubtime_without_hitting_api() {
@@ -33,7 +56,7 @@ fn uses_index_pubtime_without_hitting_api() {
     assert_eq!(harness.locked_version(), FRESH_VERSION);
 
     harness.server.reset_counts();
-    let output = harness.run_cooldown(&[("COOLDOWN_VERBOSE", "true")]);
+    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_VERBOSE", "true")]);
     assert!(
         output.status.success(),
         "cooldown should succeed: {}",
@@ -58,7 +81,7 @@ fn fills_missing_pubtime_via_fallback_api() {
     assert_eq!(harness.locked_version(), FRESH_VERSION);
 
     harness.server.reset_counts();
-    let output = harness.run_cooldown(&[("COOLDOWN_VERBOSE", "true")]);
+    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_VERBOSE", "true")]);
     assert!(
         output.status.success(),
         "cooldown should succeed: {}",
@@ -81,7 +104,7 @@ fn fails_closed_when_registry_lacks_release_time_metadata() {
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");
     harness.generate_lockfile();
 
-    let output = harness.run_cooldown(&[]);
+    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL]);
     assert!(!output.status.success(), "cooldown should fail closed");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("missing release timestamp"), "{stderr}");
@@ -94,7 +117,7 @@ fn warn_mode_continues_when_registry_lacks_release_time_metadata() {
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");
     harness.generate_lockfile();
 
-    let output = harness.run_cooldown(&[("COOLDOWN_MODE", "warn")]);
+    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_MODE", "warn")]);
     assert!(
         output.status.success(),
         "warn mode should continue: {}",
@@ -109,7 +132,10 @@ fn skips_registry_from_start_by_name() {
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");
     harness.generate_lockfile();
 
-    let output = harness.run_cooldown(&[("COOLDOWN_SKIP_REGISTRIES", REGISTRY_NAME)]);
+    let output = harness.run_cooldown(&[
+        LOCKFILE_POLICY_ALL,
+        ("COOLDOWN_SKIP_REGISTRIES", REGISTRY_NAME),
+    ]);
     assert!(
         output.status.success(),
         "skipped registry should be ignored: {}",
@@ -125,7 +151,10 @@ fn skips_registry_from_start_by_effective_url() {
     harness.generate_lockfile();
     let skip_value = format!("sparse+{}/index/", harness.server.base_url());
 
-    let output = harness.run_cooldown(&[("COOLDOWN_SKIP_REGISTRIES", &skip_value)]);
+    let output = harness.run_cooldown(&[
+        LOCKFILE_POLICY_ALL,
+        ("COOLDOWN_SKIP_REGISTRIES", &skip_value),
+    ]);
     assert!(
         output.status.success(),
         "skipped registry should be ignored: {}",
@@ -141,7 +170,7 @@ fn mode_off_skips_cooldown_checks_entirely() {
     harness.generate_lockfile();
     harness.server.reset_counts();
 
-    let output = harness.run_cooldown(&[("COOLDOWN_MODE", "off")]);
+    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_MODE", "off")]);
     assert!(
         output.status.success(),
         "mode=off should bypass cooldown: {}",
@@ -179,7 +208,7 @@ fn honors_manifest_path_in_cargo_style_order_from_external_cwd() {
     let output = harness.run_command_in(
         &runner_dir,
         &["check", "--manifest-path", manifest_path.as_str()],
-        &[],
+        &[LOCKFILE_POLICY_ALL],
     );
     assert!(
         output.status.success(),
@@ -200,7 +229,7 @@ fn honors_manifest_path_before_subcommand_from_external_cwd() {
     let output = harness.run_command_in(
         &runner_dir,
         &["--manifest-path", manifest_path.as_str(), "check"],
-        &[],
+        &[LOCKFILE_POLICY_ALL],
     );
     assert!(
         output.status.success(),
@@ -278,7 +307,10 @@ fn exact_allowlist_keeps_fresh_version_pinned() {
     .expect("allowlist should be writable");
 
     let allowlist_path = allowlist.to_string_lossy().to_string();
-    let output = harness.run_cooldown(&[("COOLDOWN_ALLOWLIST_PATH", allowlist_path.as_str())]);
+    let output = harness.run_cooldown(&[
+        LOCKFILE_POLICY_ALL,
+        ("COOLDOWN_ALLOWLIST_PATH", allowlist_path.as_str()),
+    ]);
     assert!(
         output.status.success(),
         "exact allowlist should bypass cooldown for the pinned version: {}",

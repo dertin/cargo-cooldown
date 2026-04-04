@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -10,6 +10,7 @@ use tracing::{debug, info};
 
 use crate::allowlist::Allowlist;
 use crate::config::Config;
+use crate::lockfile::LockfileBaseline;
 use crate::metadata::read_metadata;
 use crate::registry::{
     RegistryContext, RegistryStore, ReleaseSource, assert_has_timestamp, ensure_timeline_available,
@@ -26,22 +27,27 @@ pub fn run_pinning_flow(
     workspace: &Workspace,
     features: &Features,
 ) -> Result<()> {
-    ensure_lockfile(manifest)?;
-
     let allowlist = Allowlist::load(config.allowlist_path.clone())?;
     let per_crate_minutes = allowlist.per_crate_minutes();
     let global_minutes = allowlist.global_minutes();
     let mut registry_store = RegistryStore::new(config)?;
+    let lockfile_path = workspace_lockfile_path(manifest)?;
+    let initial_lockfile = LockfileBaseline::capture(&lockfile_path, &mut registry_store)?;
+    ensure_lockfile(manifest, &lockfile_path)?;
     let now = config.now_override.unwrap_or_else(Utc::now);
     let mut visited_failures: HashSet<String> = HashSet::new();
     let mut inspection_cache: HashMap<ReleaseInspectionKey, ReleaseInspection> = HashMap::new();
 
     'outer: loop {
+        // After each successful pin we rebuild cargo metadata from scratch so every
+        // decision in this pass reflects the current lockfile and resolved graph.
         let metadata = read_metadata(manifest, features)?;
         let resolve = metadata
             .resolve
             .clone()
             .context("cargo metadata output did not include a resolved dependency graph")?;
+        // When the user targets a package/workspace subset, only enforce cooldown on
+        // the dependency closure reachable from those selected roots.
         let selected_root_ids = selected_package_ids(&metadata, workspace);
         let reachable_ids = reachable_package_ids(&resolve, &selected_root_ids);
         let packages: HashMap<PackageId, cargo_metadata::Package> = metadata
@@ -61,6 +67,9 @@ pub fn run_pinning_flow(
                 .push(id.clone());
         }
 
+        // Build the per-package state we need to reason about cooldowns in one pass:
+        // current version, effective minimum age, semver requirements from parents,
+        // and which locked packages are currently too fresh.
         let mut crate_states: HashMap<PackageId, CrateState> = HashMap::new();
         let mut fresh_entries: Vec<FreshCrate> = Vec::new();
         let mut equality_dependents: HashMap<PackageId, Vec<PackageId>> = HashMap::new();
@@ -103,17 +112,24 @@ pub fn run_pinning_flow(
             }
 
             let exact_allowed = allowlist.is_exact_allowed(pkg.name.as_str(), &current_version);
+            let baseline_exempt = !config.lockfile_policy.applies_to_existing_lockfile()
+                && initial_lockfile.contains_registry_version(
+                    pkg.name.as_str(),
+                    &context.effective_index_url,
+                    &current_version,
+                );
             let state = CrateState {
                 name: pkg.name.to_string(),
-                source_id: source.repr.to_string(),
+                source_id: source.repr.clone(),
                 current_version: current_version.clone(),
                 minimum_minutes,
                 exact_allowed,
                 skipped: context.skipped,
+                baseline_exempt,
             };
             crate_states.insert(node.id.clone(), state.clone());
 
-            if exact_allowed || minimum_minutes == 0 || context.skipped {
+            if state.is_cooldown_exempt() {
                 continue;
             }
 
@@ -153,7 +169,7 @@ pub fn run_pinning_flow(
                 fresh_entries.push(FreshCrate {
                     package_id: node.id.clone(),
                     name: pkg.name.to_string(),
-                    source_id: source.repr.to_string(),
+                    source_id: source.repr.clone(),
                     current_version,
                     minimum_minutes,
                 });
@@ -165,6 +181,8 @@ pub fn run_pinning_flow(
             break;
         }
 
+        // Try the fresh crates that are most likely to unblock others first.
+        // Exact-version dependents are the hardest constraints, so they go earlier.
         let fresh_ids: HashSet<PackageId> = fresh_entries
             .iter()
             .map(|entry| entry.package_id.clone())
@@ -172,18 +190,19 @@ pub fn run_pinning_flow(
         fresh_entries.sort_by_key(|entry| {
             equality_dependents
                 .get(&entry.package_id)
-                .map(|dependents| {
+                .map_or(0, |dependents| {
                     dependents
                         .iter()
                         .filter(|id| fresh_ids.contains(*id))
                         .count()
                 })
-                .unwrap_or(0)
         });
 
         let mut queue: VecDeque<FreshCrate> = fresh_entries.into();
 
         'queue_loop: while let Some(fresh) = queue.pop_front() {
+            // Each queue entry represents one currently locked crate/version pair that
+            // still violates the cooldown window and needs an older acceptable version.
             let key = format!(
                 "{}::{}@{}",
                 fresh.source_id, fresh.name, fresh.current_version
@@ -212,11 +231,14 @@ pub fn run_pinning_flow(
                 fresh.minimum_minutes,
                 now,
             ) else {
+                // No older compatible version exists for this crate as-is. Requeue any
+                // parent that constrained it so we can try to cool down the parent first
+                // and potentially relax the version chosen for this dependency.
                 let mut queued_parent = false;
                 if let Some(origins) = requirement_origins.get(&fresh.package_id) {
                     for origin in origins {
                         if let Some(state) = crate_states.get(&origin.parent_id) {
-                            if state.exact_allowed || state.minimum_minutes == 0 || state.skipped {
+                            if state.is_cooldown_exempt() {
                                 continue;
                             }
                             queue.push_front(FreshCrate {
@@ -259,6 +281,8 @@ pub fn run_pinning_flow(
                 &candidate.version,
             )? {
                 PinOutcome::Applied => {
+                    // A successful pin changes the lockfile, so restart from the top and
+                    // recompute metadata instead of trying to patch our in-memory graph.
                     info!(
                         crate = %fresh.name,
                         registry = %context.effective_index_url,
@@ -279,10 +303,11 @@ pub fn run_pinning_flow(
                         );
                     }
 
-                    let blocker_descriptions = blockers
-                        .iter()
-                        .map(|blocker| blocker.label())
-                        .collect::<Vec<_>>();
+                    // Cargo can reject a pin because some other locked package still
+                    // requires the fresher version. Requeue those blockers first, then
+                    // revisit this crate later in the same pass.
+                    let blocker_descriptions =
+                        blockers.iter().map(Blocker::label).collect::<Vec<_>>();
                     let mut queued_blocker = false;
                     for blocker in blockers {
                         let matches = blocker
@@ -306,10 +331,7 @@ pub fn run_pinning_flow(
 
                         for id in matches {
                             if let Some(state) = crate_states.get(&id) {
-                                if state.exact_allowed
-                                    || state.minimum_minutes == 0
-                                    || state.skipped
-                                {
+                                if state.is_cooldown_exempt() {
                                     continue;
                                 }
                                 queue.push_front(FreshCrate {
@@ -336,7 +358,6 @@ pub fn run_pinning_flow(
                     }
 
                     queue.push_back(fresh.clone());
-                    continue 'queue_loop;
                 }
             }
         }
@@ -386,8 +407,7 @@ fn reachable_package_ids(
     reachable
 }
 
-fn ensure_lockfile(manifest: &Manifest) -> Result<()> {
-    let lockfile_path = workspace_lockfile_path(manifest)?;
+fn ensure_lockfile(manifest: &Manifest, lockfile_path: &Path) -> Result<()> {
     if lockfile_path.exists() {
         return Ok(());
     }
@@ -454,6 +474,13 @@ struct CrateState {
     minimum_minutes: u64,
     exact_allowed: bool,
     skipped: bool,
+    baseline_exempt: bool,
+}
+
+impl CrateState {
+    fn is_cooldown_exempt(&self) -> bool {
+        self.exact_allowed || self.minimum_minutes == 0 || self.skipped || self.baseline_exempt
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -526,8 +553,7 @@ fn find_manifest_dependency<'a>(
         candidate
             .rename
             .as_deref()
-            .map(|rename| rename == dep_name)
-            .unwrap_or(false)
+            .is_some_and(|rename| rename == dep_name)
             || candidate.name == dep_name
             || candidate.name == package_name
     })
@@ -622,17 +648,17 @@ struct Blocker {
 
 impl Blocker {
     fn label(&self) -> String {
-        self.version
-            .as_ref()
-            .map(|version| format!("{} {}", self.name, version))
-            .unwrap_or_else(|| self.name.clone())
+        self.version.as_ref().map_or_else(
+            || self.name.clone(),
+            |version| format!("{} {}", self.name, version),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, Mode};
+    use crate::config::{Config, LockfilePolicy, Mode};
     use serde_json::json;
 
     fn dependency_with(rename: Option<&str>, req: &str) -> cargo_metadata::Dependency {
@@ -1016,10 +1042,31 @@ mod tests {
     }
 
     #[test]
+    fn baseline_exempt_state_stays_out_of_cooldown() {
+        let unchanged = CrateState {
+            name: "demo".to_string(),
+            source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+            current_version: "1.0.0".to_string(),
+            minimum_minutes: 60,
+            exact_allowed: false,
+            skipped: false,
+            baseline_exempt: true,
+        };
+        let changed = CrateState {
+            baseline_exempt: false,
+            ..unchanged.clone()
+        };
+
+        assert!(unchanged.is_cooldown_exempt());
+        assert!(!changed.is_cooldown_exempt());
+    }
+
+    #[test]
     fn config_fixture_remains_constructible_for_executor_tests() {
         let config = Config {
             cooldown_minutes: 60,
             mode: Mode::Enforce,
+            lockfile_policy: LockfilePolicy::Changed,
             now_override: None,
             ttl_seconds: 60,
             allowlist_path: None,

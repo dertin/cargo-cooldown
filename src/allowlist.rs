@@ -82,7 +82,7 @@ impl Allowlist {
         self.allow
             .global
             .as_ref()
-            .and_then(|g| g.effective_minutes())
+            .and_then(AllowGlobal::effective_minutes)
     }
     #[cfg(test)]
     pub fn effective_minutes_for(&self, name: &str, default_minutes: u64) -> u64 {

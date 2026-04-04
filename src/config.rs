@@ -14,8 +14,8 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn from_env(value: Option<String>) -> Self {
-        match value.as_deref() {
+    pub fn from_env(value: Option<&str>) -> Self {
+        match value {
             Some("warn") => Mode::Warn,
             Some("off") => Mode::Off,
             _ => Mode::Enforce,
@@ -23,10 +23,30 @@ impl Mode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockfilePolicy {
+    Changed,
+    All,
+}
+
+impl LockfilePolicy {
+    pub fn from_env(value: Option<&str>) -> Self {
+        match value {
+            Some("all") => LockfilePolicy::All,
+            _ => LockfilePolicy::Changed,
+        }
+    }
+
+    pub fn applies_to_existing_lockfile(self) -> bool {
+        matches!(self, LockfilePolicy::All)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cooldown_minutes: u64,
     pub mode: Mode,
+    pub lockfile_policy: LockfilePolicy,
     pub now_override: Option<DateTime<Utc>>,
     pub ttl_seconds: u64,
     pub allowlist_path: Option<PathBuf>,
@@ -50,10 +70,20 @@ impl Config {
             })
             .unwrap_or(0);
 
-        let mode = Mode::from_env(
-            env::var("COOLDOWN_MODE")
+        let mode = Mode::from_env(env::var("COOLDOWN_MODE").ok().as_deref().or_else(|| {
+            file_config
+                .as_ref()
+                .and_then(|cfg| cfg.data.mode.as_deref())
+        }));
+        let lockfile_policy = LockfilePolicy::from_env(
+            env::var("COOLDOWN_LOCKFILE_POLICY")
                 .ok()
-                .or_else(|| file_config.as_ref().and_then(|cfg| cfg.data.mode.clone())),
+                .as_deref()
+                .or_else(|| {
+                    file_config
+                        .as_ref()
+                        .and_then(|cfg| cfg.data.lockfile_policy.as_deref())
+                }),
         );
 
         let now_override = env::var("COOLDOWN_NOW")
@@ -74,12 +104,12 @@ impl Config {
 
         let allowlist_path = env::var_os("COOLDOWN_ALLOWLIST_PATH")
             .map(PathBuf::from)
-            .or_else(|| file_config.as_ref().and_then(|cfg| cfg.allowlist_path()))
+            .or_else(|| file_config.as_ref().and_then(FileConfig::allowlist_path))
             .filter(|path| !path.as_os_str().is_empty());
 
         let cache_dir = env::var_os("COOLDOWN_CACHE_DIR")
             .map(PathBuf::from)
-            .or_else(|| file_config.as_ref().and_then(|cfg| cfg.cache_dir()))
+            .or_else(|| file_config.as_ref().and_then(FileConfig::cache_dir))
             .filter(|path| !path.as_os_str().is_empty());
 
         let http_retries = env::var("COOLDOWN_HTTP_RETRIES")
@@ -116,6 +146,7 @@ impl Config {
         Self {
             cooldown_minutes,
             mode,
+            lockfile_policy,
             now_override,
             ttl_seconds,
             allowlist_path,
@@ -129,7 +160,7 @@ impl Config {
 
 fn parse_registry_skip_list(raw: &str) -> Vec<String> {
     raw.split(',')
-        .map(|part| part.trim())
+        .map(str::trim)
         .filter(|part| !part.is_empty())
         .map(ToOwned::to_owned)
         .collect()
@@ -172,6 +203,8 @@ struct RawFileConfig {
     cooldown_minutes: Option<u64>,
     #[serde(alias = "COOLDOWN_MODE")]
     mode: Option<String>,
+    #[serde(alias = "COOLDOWN_LOCKFILE_POLICY")]
+    lockfile_policy: Option<String>,
     #[serde(alias = "COOLDOWN_NOW")]
     now: Option<String>,
     #[serde(alias = "COOLDOWN_ALLOWLIST_PATH")]
@@ -198,8 +231,7 @@ impl FileConfig {
     fn base_dir(&self) -> PathBuf {
         self.path
             .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
     }
 
     fn resolve_path(&self, candidate: &PathBuf) -> PathBuf {
@@ -325,6 +357,14 @@ mod tests {
     }
 
     #[test]
+    fn lockfile_policy_supports_all_env() {
+        with_env_var("COOLDOWN_LOCKFILE_POLICY", Some("all"), || {
+            let config = Config::from_env();
+            assert_eq!(config.lockfile_policy, LockfilePolicy::All);
+        });
+    }
+
+    #[test]
     fn cooldown_now_parses_rfc3339_override() {
         with_env_var("COOLDOWN_NOW", Some("2026-04-03T00:00:00Z"), || {
             let config = Config::from_env();
@@ -360,6 +400,7 @@ mod tests {
             .write_str(
                 r#"cooldown_minutes = 15
 mode = "warn"
+lockfile_policy = "all"
 allowlist_path = "allow.toml"
 skip_registries = ["crates-io", "mirror"]
 verbose = true
@@ -371,6 +412,7 @@ verbose = true
 
         assert_eq!(config.cooldown_minutes, 15);
         assert_eq!(config.mode, Mode::Warn);
+        assert_eq!(config.lockfile_policy, LockfilePolicy::All);
         assert!(config.allowlist_path.is_some());
         assert!(config.allowlist_path.unwrap().ends_with("allow.toml"));
         assert_eq!(
@@ -457,6 +499,7 @@ http_retries = 3
         let workspace = TempDir::new().unwrap();
         let original_dir = env::current_dir().unwrap();
         let original_mode = env::var("COOLDOWN_MODE").ok();
+        let original_lockfile_policy = env::var("COOLDOWN_LOCKFILE_POLICY").ok();
         let original_skips = env::var("COOLDOWN_SKIP_REGISTRIES").ok();
 
         env::set_current_dir(workspace.path()).unwrap();
@@ -464,22 +507,29 @@ http_retries = 3
             .child("cooldown.toml")
             .write_str(
                 r#"mode = "warn"
+lockfile_policy = "all"
 skip_registries = ["from-file"]
 "#,
             )
             .unwrap();
 
         unsafe { env::set_var("COOLDOWN_MODE", "off") };
+        unsafe { env::set_var("COOLDOWN_LOCKFILE_POLICY", "changed") };
         unsafe { env::set_var("COOLDOWN_SKIP_REGISTRIES", "from-env") };
 
         let config = Config::from_env();
         assert_eq!(config.mode, Mode::Off);
+        assert_eq!(config.lockfile_policy, LockfilePolicy::Changed);
         assert_eq!(config.skip_registries, vec!["from-env".to_string()]);
 
         env::set_current_dir(original_dir).unwrap();
         match original_mode {
             Some(val) => unsafe { env::set_var("COOLDOWN_MODE", val) },
             None => unsafe { env::remove_var("COOLDOWN_MODE") },
+        }
+        match original_lockfile_policy {
+            Some(val) => unsafe { env::set_var("COOLDOWN_LOCKFILE_POLICY", val) },
+            None => unsafe { env::remove_var("COOLDOWN_LOCKFILE_POLICY") },
         }
         match original_skips {
             Some(val) => unsafe { env::set_var("COOLDOWN_SKIP_REGISTRIES", val) },
@@ -502,6 +552,7 @@ skip_registries = ["from-file"]
             .write_str(
                 r#"COOLDOWN_MINUTES = 9
 COOLDOWN_MODE = "warn"
+COOLDOWN_LOCKFILE_POLICY = "all"
 COOLDOWN_SKIP_REGISTRIES = "crates-io,mirror"
 "#,
             )
@@ -510,6 +561,7 @@ COOLDOWN_SKIP_REGISTRIES = "crates-io,mirror"
         let config = Config::from_env();
         assert_eq!(config.cooldown_minutes, 9);
         assert_eq!(config.mode, Mode::Warn);
+        assert_eq!(config.lockfile_policy, LockfilePolicy::All);
         assert_eq!(
             config.skip_registries,
             vec!["crates-io".to_string(), "mirror".to_string()]

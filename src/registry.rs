@@ -173,12 +173,12 @@ impl RegistryStore {
             .join(&format!("crates/{crate_name}"))
             .with_context(|| format!("failed to build registry API URL for {crate_name}"))?;
 
-        let versions = self.get_json::<CrateResponse>(url)?.versions;
+        let versions = self.get_json::<CrateResponse>(&url)?.versions;
         self.cache.put(&key, &versions)?;
         Ok(Some(versions))
     }
 
-    fn get_json<T: for<'de> Deserialize<'de>>(&self, url: Url) -> Result<T> {
+    fn get_json<T: for<'de> Deserialize<'de>>(&self, url: &Url) -> Result<T> {
         let mut attempt = 0;
         loop {
             let response = self.http.get(url.clone()).send();
@@ -193,7 +193,7 @@ impl RegistryStore {
                     if attempt > self.retries {
                         return Err(err.into());
                     }
-                    sleep(Duration::from_millis(200 * attempt as u64));
+                    sleep(Duration::from_millis(200 * u64::from(attempt)));
                 }
             }
         }
@@ -377,11 +377,11 @@ fn load_index_api(index_root: &TamePathBuf, is_crates_io: bool) -> Result<Option
             Some("https://crates.io".to_string())
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path)),
+        Err(err) => return Err(err).with_context(|| format!("failed to read {path}")),
     };
 
     api.map(|value| {
-        Url::parse(&value).with_context(|| format!("invalid registry API URL in {}", path))
+        Url::parse(&value).with_context(|| format!("invalid registry API URL in {path}"))
     })
     .transpose()
 }

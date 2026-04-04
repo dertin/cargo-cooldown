@@ -2,6 +2,7 @@ mod allowlist;
 mod cache;
 mod config;
 mod executor;
+mod lockfile;
 mod metadata;
 mod registry;
 mod resolver;
@@ -52,7 +53,7 @@ struct Cli {
 fn init_logging(verbose: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if verbose {
-            EnvFilter::new("cargo_cooldown=debug,cargo_cooldown::executor=debug,info")
+            EnvFilter::new("cargo_cooldown=debug,info")
         } else {
             EnvFilter::new("info")
         }
@@ -77,11 +78,7 @@ fn normalize_cli_args(raw_args: &[OsString]) -> Vec<OsString> {
         return Vec::new();
     };
 
-    let user_args = if raw_args
-        .get(1)
-        .map(|arg| arg == "cooldown")
-        .unwrap_or(false)
-    {
+    let user_args = if raw_args.get(1).is_some_and(|arg| arg == "cooldown") {
         &raw_args[2..]
     } else {
         &raw_args[1..]
@@ -231,7 +228,7 @@ fn assemble_cargo_args(cli: &Cli) -> Vec<OsString> {
 fn split_features(raw: &str) -> Vec<String> {
     raw.split([' ', ','])
         .filter(|value| !value.is_empty())
-        .map(|value| value.to_string())
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -268,7 +265,7 @@ fn main() -> Result<()> {
 
     if config.mode != Mode::Off && config.cooldown_minutes > 0 {
         match executor::run_pinning_flow(&config, &cli.manifest, &cli.workspace, &cli.features) {
-            Ok(_) => {}
+            Ok(()) => {}
             Err(err) => match config.mode {
                 Mode::Warn => {
                     warn!(error = %err, "cooldown guard failed; continuing due to warn mode");
