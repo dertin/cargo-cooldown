@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 - Unreleased
+## 0.3.0 - 2026-04-04
 
 This is an intentionally breaking release.
 
@@ -10,9 +10,9 @@ Migration guide:
 
 ### Added
 
+- multi-registry support for Cargo registries, mirrors, and source replacements
 - index-first release-time resolution from Cargo's local registry cache
 - per-crate HTTP fallback when `pubtime` is missing
-- multi-registry support for Cargo registries, mirrors, and source replacements
 - explicit `skip_registries` / `COOLDOWN_SKIP_REGISTRIES`
 - explicit `lockfile_policy` / `COOLDOWN_LOCKFILE_POLICY` to choose between
   cooling only changed lockfile entries or cooling all eligible entries
@@ -35,8 +35,11 @@ Migration guide:
 
 ### Breaking changes
 
-- configuration and registry-scoping changes require migration from older
-  setups; see the [Migration Guide](docs/migration-guide.md)
+- `COOLDOWN_REGISTRY_INDEX`, `COOLDOWN_REGISTRY_API`, and
+  `COOLDOWN_OFFLINE_OK` are replaced by the current registry-aware model; see
+  the [Migration Guide](docs/migration-guide.md)
+- default cooldown behavior now respects the initial `Cargo.lock` baseline
+  unless `lockfile_policy = "all"` is enabled
 
 ### Fixed
 

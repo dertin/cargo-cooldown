@@ -28,7 +28,7 @@ clap-cargo = { version = "0.18.3", features = ["cargo_metadata"] }
 [dev-dependencies]
 assert_fs = "1"
 flate2 = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tar = "0.4"
 tempfile = "3"
 

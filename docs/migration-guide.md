@@ -76,26 +76,28 @@ If you want a registry to be excluded from cooldown entirely, use
 
 ## Internal registries
 
-Registries that are not skipped must provide enough release-time metadata for
-cooldown to decide whether a locked version is fresh.
+Registries that participate in cooldown must expose enough release-time
+metadata for the resolver to decide whether a locked version is fresh.
 
-The resolver uses:
+The resolver uses Cargo's local index `pubtime` first and falls back to
+per-crate HTTP only when `pubtime` is missing.
 
-- `pubtime` from Cargo's local registry index cache as the primary source;
-- per-crate HTTP fallback only when `pubtime` is missing.
-
-If an internal registry does not provide enough release-time metadata and is not
-skipped:
+If an internal registry still cannot provide timestamps:
 
 - `enforce` mode fails closed;
 - `warn` mode emits a warning and continues;
 - `off` mode disables cooldown entirely.
 
-For registries such as CodeArtifact, the practical migration path is:
+For registries such as CodeArtifact, the practical migration path is usually:
 
 1. keep crates.io under cooldown;
-2. add the internal registry to `skip_registries` if it does not expose enough
-   metadata yet.
+2. put the internal registry in `skip_registries` until it exposes compatible
+   metadata.
+
+See also:
+
+- [Registries](registries.md)
+- [Troubleshooting](troubleshooting.md)
 
 ## Behavior changes to expect
 
