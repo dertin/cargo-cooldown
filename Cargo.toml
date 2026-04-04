@@ -1,6 +1,6 @@
 [package]
 name = "cargo-cooldown"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Cargo wrapper that enforces a cooldown window for freshly published crates on crates.io for improved supply chain security."
 keywords =["cargo", "cooldown"]
@@ -14,10 +14,10 @@ anyhow = "1"
 cargo_metadata = "0.23.1"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
-reqwest = { version = "0.13.2", default-features = false, features = ["json", "gzip", "rustls"] }
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "gzip", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tame-index = "0.26.1"
 toml = "1.1.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -27,6 +27,9 @@ clap-cargo = { version = "0.18.3", features = ["cargo_metadata"] }
 
 [dev-dependencies]
 assert_fs = "1"
+flate2 = "1"
+sha2 = "0.10"
+tar = "0.4"
 tempfile = "3"
 
 [profile.release]

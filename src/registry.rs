@@ -1,60 +1,191 @@
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
+use std::thread::sleep;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use reqwest::{Client, Url};
+use reqwest::Url;
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
+use tame_index::index::{FileLock, IndexCache, IndexConfig, IndexLocation, IndexUrl};
+use tame_index::utils::canonicalize_url;
+use tame_index::{IndexKrate, PathBuf as TamePathBuf};
 
+use crate::cache::Cache;
 use crate::config::Config;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct VersionMeta {
-    pub created_at: DateTime<Utc>,
-    pub yanked: bool,
-    #[serde(default)]
-    pub num: String,
+const CRATES_IO_LEGACY_SOURCE_ID: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const CRATES_IO_SPARSE_SOURCE_ID: &str = "sparse+https://index.crates.io/";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseSource {
+    Index,
+    Api,
 }
 
-#[derive(Debug, Deserialize)]
-struct VersionResponse {
-    version: VersionMeta,
+impl ReleaseSource {
+    pub fn log_label(self) -> &'static str {
+        match self {
+            Self::Index => "index_pubtime",
+            Self::Api => "registry_api_fallback",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Release {
+    pub version: String,
+    pub published_at: Option<DateTime<Utc>>,
+    pub yanked: bool,
+    pub source: ReleaseSource,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReleaseTimeline {
+    pub releases: Vec<Release>,
+}
+
+impl ReleaseTimeline {
+    pub fn release(&self, version: &str) -> Option<&Release> {
+        self.releases
+            .iter()
+            .find(|release| release.version == version)
+    }
+
+    pub fn has_missing_timestamps(&self) -> bool {
+        self.releases
+            .iter()
+            .any(|release| release.published_at.is_none())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RegistryContext {
+    pub logical_name: String,
+    pub source_id: String,
+    pub effective_index_url: String,
+    pub api: Option<Url>,
+    pub cache_fingerprint: String,
+    pub skipped: bool,
+    index_root: TamePathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct ApiVersion {
+    created_at: DateTime<Utc>,
+    yanked: bool,
+    #[serde(default, alias = "vers")]
+    num: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct CrateResponse {
-    versions: Vec<VersionMeta>,
+    versions: Vec<ApiVersion>,
 }
 
-#[derive(Clone)]
-pub struct RegistryClient {
+pub struct RegistryStore {
+    cache: Cache,
     http: Client,
-    base: Url,
     retries: u32,
+    registries: HashMap<String, RegistryContext>,
+    timelines: HashMap<(String, String), ReleaseTimeline>,
+    skip_registries: Vec<String>,
 }
 
-impl RegistryClient {
+impl RegistryStore {
     pub fn new(config: &Config) -> Result<Self> {
+        let cache = if let Some(ref root) = config.cache_dir {
+            Cache::with_root(root.clone(), Duration::from_secs(config.ttl_seconds))?
+        } else {
+            Cache::new(config.ttl_seconds)?
+        };
+
         let http = Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent("cargo-cooldown/0.1")
+            .user_agent("cargo-cooldown/0.3")
             .build()?;
-        let base = Url::parse(&config.registry_api).context("invalid registry API URL")?;
+
         Ok(Self {
+            cache,
             http,
-            base,
             retries: config.http_retries,
+            registries: HashMap::new(),
+            timelines: HashMap::new(),
+            skip_registries: config.skip_registries.clone(),
         })
     }
 
-    async fn get_json<T: for<'de> Deserialize<'de>>(&self, url: Url) -> Result<T> {
+    pub fn context_for_source(&mut self, source_id: &str) -> Result<&RegistryContext> {
+        if !self.registries.contains_key(source_id) {
+            let context = resolve_registry_context(source_id, &self.skip_registries)?;
+            self.registries.insert(source_id.to_string(), context);
+        }
+
+        self.registries
+            .get(source_id)
+            .context("resolved registry context should be present")
+    }
+
+    pub fn timeline_for(&mut self, source_id: &str, crate_name: &str) -> Result<ReleaseTimeline> {
+        let cache_key = (source_id.to_string(), crate_name.to_string());
+        if let Some(cached) = self.timelines.get(&cache_key) {
+            return Ok(cached.clone());
+        }
+
+        let context = self.context_for_source(source_id)?.clone();
+        if context.skipped {
+            return Ok(ReleaseTimeline::default());
+        }
+
+        let local = load_local_timeline(&context, crate_name)?;
+        let api = if local
+            .as_ref()
+            .is_none_or(ReleaseTimeline::has_missing_timestamps)
+        {
+            self.fetch_api_versions(&context, crate_name)?
+        } else {
+            None
+        };
+
+        let timeline = merge_timelines(local, api);
+        self.timelines.insert(cache_key, timeline.clone());
+        Ok(timeline)
+    }
+
+    fn fetch_api_versions(
+        &self,
+        context: &RegistryContext,
+        crate_name: &str,
+    ) -> Result<Option<Vec<ApiVersion>>> {
+        let Some(api_root) = context.api.as_ref() else {
+            return Ok(None);
+        };
+
+        let key = format!("registry_api/{}/{crate_name}", context.cache_fingerprint);
+        if let Some(cached) = self.cache.get::<Vec<ApiVersion>>(&key)? {
+            return Ok(Some(cached));
+        }
+
+        let base = registry_api_base(api_root)?;
+        let url = base
+            .join(&format!("crates/{crate_name}"))
+            .with_context(|| format!("failed to build registry API URL for {crate_name}"))?;
+
+        let versions = self.get_json::<CrateResponse>(url)?.versions;
+        self.cache.put(&key, &versions)?;
+        Ok(Some(versions))
+    }
+
+    fn get_json<T: for<'de> Deserialize<'de>>(&self, url: Url) -> Result<T> {
         let mut attempt = 0;
         loop {
-            let response = self.http.get(url.clone()).send().await;
+            let response = self.http.get(url.clone()).send();
             match response {
                 Ok(resp) => {
                     let status_resp = resp.error_for_status()?;
-                    let value = status_resp.json::<T>().await?;
+                    let value = status_resp.json::<T>()?;
                     return Ok(value);
                 }
                 Err(err) => {
@@ -62,28 +193,529 @@ impl RegistryClient {
                     if attempt > self.retries {
                         return Err(err.into());
                     }
-                    let backoff = Duration::from_millis(200 * attempt as u64);
-                    sleep(backoff).await;
+                    sleep(Duration::from_millis(200 * attempt as u64));
                 }
             }
         }
     }
+}
 
-    pub async fn fetch_version(&self, name: &str, version: &str) -> Result<VersionMeta> {
-        let url = self
-            .base
-            .join(&format!("crates/{}/{}", name, version))
-            .with_context(|| format!("failed to build version URL for {name}:{version}"))?;
-        let resp: VersionResponse = self.get_json(url).await?;
-        Ok(resp.version)
+pub fn is_registry_source(source: &str) -> bool {
+    source.starts_with("registry+") || source.starts_with("sparse+")
+}
+
+fn resolve_registry_context(
+    source_id: &str,
+    skip_registries: &[String],
+) -> Result<RegistryContext> {
+    let config_root = cargo_config_root();
+    let is_crates_io = is_crates_io_source_id(source_id);
+    let (index_root, effective_index_url) = if is_crates_io {
+        let index_url = IndexUrl::crates_io(config_root.clone(), None, None)?;
+        IndexLocation::new(index_url).into_parts()?
+    } else {
+        resolve_non_crates_io_index_location(source_id)?
+    };
+    let api = load_index_api(&index_root, is_crates_io)?;
+    let normalized_source_id = normalize_registry_identifier(source_id)?;
+    let normalized_effective_index_url = normalize_registry_identifier(&effective_index_url)?;
+    let skipped = skip_registries
+        .iter()
+        .try_fold(false, |matched, candidate| {
+            if matched {
+                Ok(true)
+            } else {
+                skip_registry_matches(
+                    candidate,
+                    is_crates_io,
+                    &normalized_source_id,
+                    &normalized_effective_index_url,
+                    config_root.clone(),
+                )
+            }
+        })?;
+
+    Ok(RegistryContext {
+        logical_name: if is_crates_io {
+            "crates-io".to_string()
+        } else {
+            effective_index_url.clone()
+        },
+        source_id: source_id.to_string(),
+        effective_index_url: effective_index_url.clone(),
+        api,
+        cache_fingerprint: registry_cache_fingerprint(&effective_index_url),
+        skipped,
+        index_root,
+    })
+}
+
+fn resolve_non_crates_io_index_location(source_id: &str) -> Result<(TamePathBuf, String)> {
+    let primary = IndexLocation::new(IndexUrl::from(source_id)).into_parts()?;
+    let Some(url) = source_id.strip_prefix("registry+") else {
+        return Ok(primary);
+    };
+
+    let sparse_source = format!("sparse+{url}");
+    let sparse = IndexLocation::new(IndexUrl::from(sparse_source.as_str())).into_parts()?;
+
+    match (
+        index_location_exists(&primary.0),
+        index_location_exists(&sparse.0),
+    ) {
+        (false, true) => Ok(sparse),
+        _ => Ok(primary),
+    }
+}
+
+fn index_location_exists(path: &TamePathBuf) -> bool {
+    path.join("config.json").exists() || path.join(".cache").exists()
+}
+
+fn load_local_timeline(
+    context: &RegistryContext,
+    crate_name: &str,
+) -> Result<Option<ReleaseTimeline>> {
+    let cache = IndexCache::at_path(context.index_root.clone());
+    let lock = FileLock::unlocked();
+    let Some(krate) = cache.cached_krate(crate_name.try_into()?, None, &lock)? else {
+        return Ok(None);
+    };
+
+    index_krate_to_timeline(crate_name, &krate).map(Some)
+}
+
+fn index_krate_to_timeline(crate_name: &str, krate: &IndexKrate) -> Result<ReleaseTimeline> {
+    let releases = krate
+        .versions
+        .iter()
+        .map(|version| {
+            let published_at = version
+                .pubtime
+                .as_deref()
+                .map(|value| parse_pubtime(crate_name, version.version.as_str(), value))
+                .transpose()?;
+
+            Ok(Release {
+                version: version.version.to_string(),
+                published_at,
+                yanked: version.yanked,
+                source: ReleaseSource::Index,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ReleaseTimeline { releases })
+}
+
+fn merge_timelines(
+    local: Option<ReleaseTimeline>,
+    api: Option<Vec<ApiVersion>>,
+) -> ReleaseTimeline {
+    let Some(api_versions) = api else {
+        return local.unwrap_or_default();
+    };
+
+    let mut api_versions = api_versions;
+    api_versions.sort_by_key(|version| version.created_at);
+
+    let Some(local) = local else {
+        return ReleaseTimeline {
+            releases: api_versions
+                .into_iter()
+                .map(|version| Release {
+                    version: version.num,
+                    published_at: Some(version.created_at),
+                    yanked: version.yanked,
+                    source: ReleaseSource::Api,
+                })
+                .collect(),
+        };
+    };
+
+    let mut api_map: BTreeMap<String, ApiVersion> = api_versions
+        .into_iter()
+        .map(|version| (version.num.clone(), version))
+        .collect();
+
+    let mut releases = Vec::with_capacity(local.releases.len() + api_map.len());
+    for release in local.releases {
+        if let Some(api_version) = api_map.remove(&release.version) {
+            let published_at = release.published_at.or(Some(api_version.created_at));
+            let source = if release.published_at.is_some() {
+                release.source
+            } else {
+                ReleaseSource::Api
+            };
+
+            releases.push(Release {
+                version: release.version,
+                published_at,
+                yanked: release.yanked,
+                source,
+            });
+        } else {
+            releases.push(release);
+        }
     }
 
-    pub async fn list_versions(&self, name: &str) -> Result<Vec<VersionMeta>> {
-        let url = self
-            .base
-            .join(&format!("crates/{}", name))
-            .with_context(|| format!("failed to build crate URL for {name}"))?;
-        let resp: CrateResponse = self.get_json(url).await?;
-        Ok(resp.versions)
+    releases.extend(api_map.into_values().map(|version| Release {
+        version: version.num,
+        published_at: Some(version.created_at),
+        yanked: version.yanked,
+        source: ReleaseSource::Api,
+    }));
+
+    ReleaseTimeline { releases }
+}
+
+fn load_index_api(index_root: &TamePathBuf, is_crates_io: bool) -> Result<Option<Url>> {
+    let path = index_root.join("config.json");
+    let api = match std::fs::read_to_string(&path) {
+        Ok(contents) => serde_json::from_str::<IndexConfig>(&contents)?.api,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && is_crates_io => {
+            Some("https://crates.io".to_string())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err).with_context(|| format!("failed to read {}", path)),
+    };
+
+    api.map(|value| {
+        Url::parse(&value).with_context(|| format!("invalid registry API URL in {}", path))
+    })
+    .transpose()
+}
+
+fn registry_api_base(api_root: &Url) -> Result<Url> {
+    let raw = api_root.as_str();
+    if raw.ends_with("/api/v1/") {
+        return Ok(api_root.clone());
+    }
+    if raw.ends_with("/api/v1") {
+        return Url::parse(&format!("{raw}/")).context("invalid registry API base URL");
+    }
+
+    api_root
+        .join("api/v1/")
+        .context("invalid registry API base URL")
+}
+
+fn parse_pubtime(crate_name: &str, version: &str, value: &str) -> Result<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .with_context(|| format!("invalid pubtime for {crate_name}@{version}: {value}"))
+}
+
+fn skip_registry_matches(
+    raw: &str,
+    is_crates_io: bool,
+    normalized_source_id: &str,
+    normalized_effective_index_url: &str,
+    config_root: Option<TamePathBuf>,
+) -> Result<bool> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+
+    if trimmed.eq_ignore_ascii_case("crates-io") {
+        return Ok(is_crates_io);
+    }
+
+    let normalized = if looks_like_registry_identifier(trimmed) {
+        normalize_registry_identifier(trimmed)?
+    } else {
+        let resolved = IndexUrl::for_registry_name(config_root, None, trimmed)?;
+        normalize_registry_identifier(resolved.as_str())?
+    };
+
+    Ok(normalized == normalized_source_id || normalized == normalized_effective_index_url)
+}
+
+fn looks_like_registry_identifier(value: &str) -> bool {
+    value.starts_with("registry+") || value.starts_with("sparse+") || value.contains("://")
+}
+
+fn is_crates_io_source_id(source_id: &str) -> bool {
+    source_id == CRATES_IO_LEGACY_SOURCE_ID || source_id == CRATES_IO_SPARSE_SOURCE_ID
+}
+
+fn normalize_registry_identifier(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if let Some(url) = trimmed.strip_prefix("sparse+") {
+        return Ok(format!("sparse+{}", canonicalize_url(url)?));
+    }
+    if let Some(url) = trimmed.strip_prefix("registry+") {
+        return Ok(canonicalize_url(url)?);
+    }
+    if trimmed.contains("://") {
+        return Ok(canonicalize_url(trimmed)?);
+    }
+
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+fn registry_cache_fingerprint(value: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn cargo_config_root() -> Option<TamePathBuf> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|path| TamePathBuf::from_path_buf(path).ok())
+}
+
+pub fn assert_has_timestamp(
+    context: &RegistryContext,
+    crate_name: &str,
+    release: &Release,
+) -> Result<DateTime<Utc>> {
+    release.published_at.with_context(|| {
+        format!(
+            "missing release timestamp for {crate_name}@{} from registry {}. Either provide registry metadata or skip that registry via COOLDOWN_SKIP_REGISTRIES.",
+            release.version, context.logical_name
+        )
+    })
+}
+
+pub fn require_release<'a>(
+    timeline: &'a ReleaseTimeline,
+    context: &RegistryContext,
+    crate_name: &str,
+    version: &str,
+) -> Result<&'a Release> {
+    timeline.release(version).with_context(|| {
+        format!(
+            "registry {} ({}) does not contain metadata for {crate_name}@{version}",
+            context.logical_name, context.source_id
+        )
+    })
+}
+
+pub fn ensure_timeline_available(
+    context: &RegistryContext,
+    crate_name: &str,
+    timeline: &ReleaseTimeline,
+) -> Result<()> {
+    if timeline.releases.is_empty() {
+        bail!(
+            "registry {} ({}) does not provide cached metadata for crate {crate_name}, and no fallback data could be loaded",
+            context.logical_name,
+            context.source_id
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use std::fs;
+    use tame_index::IndexVersion;
+    use tempfile::tempdir;
+
+    #[test]
+    fn merge_prefers_index_data_and_fills_missing_pubtime() {
+        let local = ReleaseTimeline {
+            releases: vec![
+                Release {
+                    version: "1.0.0".to_string(),
+                    published_at: None,
+                    yanked: false,
+                    source: ReleaseSource::Index,
+                },
+                Release {
+                    version: "1.1.0".to_string(),
+                    published_at: Some(Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap()),
+                    yanked: false,
+                    source: ReleaseSource::Index,
+                },
+            ],
+        };
+        let api = vec![
+            ApiVersion {
+                created_at: Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+                yanked: false,
+                num: "1.0.0".to_string(),
+            },
+            ApiVersion {
+                created_at: Utc.with_ymd_and_hms(2026, 1, 3, 0, 0, 0).unwrap(),
+                yanked: false,
+                num: "1.2.0".to_string(),
+            },
+        ];
+
+        let merged = merge_timelines(Some(local), Some(api));
+        assert_eq!(merged.releases.len(), 3);
+        assert_eq!(
+            merged
+                .release("1.0.0")
+                .and_then(|release| release.published_at),
+            Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap())
+        );
+        assert_eq!(
+            merged.release("1.0.0").map(|release| release.source),
+            Some(ReleaseSource::Api)
+        );
+    }
+
+    #[test]
+    fn registry_api_base_adds_api_v1_only_once() {
+        let base = Url::parse("https://example.com").unwrap();
+        assert_eq!(
+            registry_api_base(&base).unwrap().as_str(),
+            "https://example.com/api/v1/"
+        );
+
+        let already = Url::parse("https://example.com/api/v1/").unwrap();
+        assert_eq!(
+            registry_api_base(&already).unwrap().as_str(),
+            "https://example.com/api/v1/"
+        );
+    }
+
+    #[test]
+    fn skip_registry_matches_name_or_url() {
+        let source_id =
+            normalize_registry_identifier("registry+https://mirror.example/index").unwrap();
+        let effective = normalize_registry_identifier("https://mirror.example/index").unwrap();
+        let root = cargo_config_root();
+
+        assert!(
+            skip_registry_matches(
+                "https://mirror.example/index",
+                false,
+                &source_id,
+                &effective,
+                root.clone()
+            )
+            .unwrap()
+        );
+        assert!(
+            skip_registry_matches(
+                "registry+https://mirror.example/index",
+                false,
+                &source_id,
+                &effective,
+                root
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn normalize_registry_identifier_handles_known_prefixes() {
+        assert_eq!(
+            normalize_registry_identifier("registry+https://mirror.example/index").unwrap(),
+            "https://mirror.example/index"
+        );
+        assert_eq!(
+            normalize_registry_identifier("sparse+https://mirror.example/index").unwrap(),
+            "sparse+https://mirror.example/index"
+        );
+        assert_eq!(
+            normalize_registry_identifier("CrAtEs-IO").unwrap(),
+            "crates-io"
+        );
+    }
+
+    #[test]
+    fn helper_checks_surface_meaningful_registry_errors() {
+        let context = RegistryContext {
+            logical_name: "mirror".to_string(),
+            source_id: "sparse+https://mirror.example/index".to_string(),
+            effective_index_url: "https://mirror.example/index".to_string(),
+            api: None,
+            cache_fingerprint: "test".to_string(),
+            skipped: false,
+            index_root: TamePathBuf::new(),
+        };
+        let timeline = ReleaseTimeline::default();
+
+        let timeline_err = ensure_timeline_available(&context, "demo", &timeline).unwrap_err();
+        assert!(
+            timeline_err
+                .to_string()
+                .contains("does not provide cached metadata")
+        );
+
+        let release = Release {
+            version: "1.0.0".to_string(),
+            published_at: None,
+            yanked: false,
+            source: ReleaseSource::Index,
+        };
+        let timestamp_err = assert_has_timestamp(&context, "demo", &release).unwrap_err();
+        assert!(
+            timestamp_err
+                .to_string()
+                .contains("missing release timestamp")
+        );
+
+        let missing_release =
+            require_release(&ReleaseTimeline::default(), &context, "demo", "1.0.0").unwrap_err();
+        assert!(
+            missing_release
+                .to_string()
+                .contains("does not contain metadata")
+        );
+    }
+
+    #[test]
+    fn load_index_api_uses_crates_io_default_when_config_is_missing() {
+        let dir = tempdir().unwrap();
+        let root = TamePathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+
+        let api = load_index_api(&root, true).unwrap();
+        assert_eq!(api.unwrap().as_str(), "https://crates.io/");
+
+        let non_crates_api = load_index_api(&root, false).unwrap();
+        assert!(non_crates_api.is_none());
+    }
+
+    #[test]
+    fn loads_sparse_timeline_from_local_cache() {
+        let dir = tempdir().unwrap();
+        let index_root = TamePathBuf::from_path_buf(dir.path().join("registry-index")).unwrap();
+        let effective_index_url = "sparse+https://index.example.test/".to_string();
+
+        fs::create_dir_all(&index_root).unwrap();
+        fs::write(
+            index_root.join("config.json"),
+            r#"{"dl":"https://index.example.test/api/v1/crates","api":"https://index.example.test"}"#,
+        )
+        .unwrap();
+
+        let mut version = IndexVersion::fake("demo", "1.0.0");
+        version.pubtime = Some("2026-01-01T00:00:00Z".into());
+        let krate = IndexKrate {
+            versions: vec![version],
+        };
+        let lock = FileLock::unlocked();
+        IndexCache::at_path(index_root.clone())
+            .write_to_cache(&krate, "etag: test", &lock)
+            .unwrap();
+
+        let context = RegistryContext {
+            logical_name: "https://index.example.test/".to_string(),
+            source_id: "sparse+https://index.example.test/".to_string(),
+            effective_index_url,
+            api: Some(Url::parse("https://index.example.test").unwrap()),
+            cache_fingerprint: "test".to_string(),
+            skipped: false,
+            index_root,
+        };
+
+        let timeline = load_local_timeline(&context, "demo").unwrap().unwrap();
+        assert_eq!(timeline.releases.len(), 1);
+        assert_eq!(timeline.releases[0].version, "1.0.0");
+        assert_eq!(
+            timeline.releases[0].published_at,
+            Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap())
+        );
     }
 }

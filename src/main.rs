@@ -7,6 +7,7 @@ mod registry;
 mod resolver;
 
 use std::ffi::OsString;
+use std::io::Write;
 use std::process::Command;
 
 use anyhow::Result;
@@ -22,7 +23,7 @@ use crate::config::{Config, Mode};
 enum CargoCli {
     #[command(
         name = "cooldown",
-        about = "Cargo wrapper that enforces a cooldown window for freshly published crates on crates.io.",
+        about = "Cargo wrapper that enforces a cooldown window for freshly published registry crates.",
         disable_help_subcommand = true,
         arg_required_else_help = true,
         styles = clap_cargo::style::CLAP_STYLING
@@ -65,24 +66,107 @@ fn init_logging(verbose: bool) {
 }
 
 fn parse_cli(raw_args: &[OsString]) -> Cli {
-    match CargoCli::try_parse_from(raw_args.iter().cloned()) {
+    match CargoCli::try_parse_from(normalize_cli_args(raw_args)) {
         Ok(CargoCli::Cooldown(cli)) => cli,
-        Err(original_err) => {
-            if raw_args.len() > 1 && raw_args.get(1).map(|arg| arg != "cooldown").unwrap_or(true) {
-                let mut patched = Vec::with_capacity(raw_args.len() + 1);
-                if let Some(first) = raw_args.first() {
-                    patched.push(first.clone());
-                }
-                patched.push(OsString::from("cooldown"));
-                patched.extend(raw_args.iter().skip(1).cloned());
-                match CargoCli::try_parse_from(patched) {
-                    Ok(CargoCli::Cooldown(cli)) => cli,
-                    Err(err) => err.exit(),
+        Err(err) => err.exit(),
+    }
+}
+
+fn normalize_cli_args(raw_args: &[OsString]) -> Vec<OsString> {
+    let Some(binary) = raw_args.first() else {
+        return Vec::new();
+    };
+
+    let user_args = if raw_args
+        .get(1)
+        .map(|arg| arg == "cooldown")
+        .unwrap_or(false)
+    {
+        &raw_args[2..]
+    } else {
+        &raw_args[1..]
+    };
+    let (selectors, cargo_args) = hoist_cargo_selectors(user_args);
+
+    let mut normalized = Vec::with_capacity(raw_args.len() + 1);
+    normalized.push(binary.clone());
+    normalized.push(OsString::from("cooldown"));
+    normalized.extend(selectors);
+    normalized.extend(cargo_args);
+    normalized
+}
+
+fn hoist_cargo_selectors(args: &[OsString]) -> (Vec<OsString>, Vec<OsString>) {
+    let mut selectors = Vec::new();
+    let mut cargo_args = Vec::new();
+    let mut command_seen = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        let arg = &args[index];
+        let Some(arg_str) = arg.to_str() else {
+            if !command_seen {
+                command_seen = true;
+            }
+            cargo_args.push(arg.clone());
+            index += 1;
+            continue;
+        };
+
+        if arg_str == "--" {
+            cargo_args.extend(args[index..].iter().cloned());
+            break;
+        }
+
+        if is_top_level_help_flag(arg_str) && !command_seen {
+            selectors.push(arg.clone());
+            index += 1;
+            continue;
+        }
+
+        if let Some(consumed) = selector_width(arg_str) {
+            selectors.push(arg.clone());
+            if consumed == 2 {
+                if let Some(value) = args.get(index + 1) {
+                    selectors.push(value.clone());
+                    index += 2;
+                } else {
+                    index += 1;
                 }
             } else {
-                original_err.exit()
+                index += 1;
             }
+            continue;
         }
+
+        if !command_seen {
+            command_seen = true;
+        }
+        cargo_args.push(arg.clone());
+        index += 1;
+    }
+
+    (selectors, cargo_args)
+}
+
+fn is_top_level_help_flag(value: &str) -> bool {
+    matches!(value, "-h" | "--help")
+}
+
+fn selector_width(value: &str) -> Option<usize> {
+    match value {
+        "--manifest-path" | "--package" | "-p" | "--exclude" | "--features" | "-F" => Some(2),
+        "--workspace" | "--all" | "--all-features" | "--no-default-features" => Some(1),
+        _ if value.starts_with("--manifest-path=")
+            || value.starts_with("--package=")
+            || value.starts_with("--exclude=")
+            || value.starts_with("--features=")
+            || (value.starts_with("-p") && value.len() > 2)
+            || (value.starts_with("-F") && value.len() > 2) =>
+        {
+            Some(1)
+        }
+        _ => None,
     }
 }
 
@@ -151,8 +235,13 @@ fn split_features(raw: &str) -> Vec<String> {
         .collect()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn exit_with(code: i32) -> ! {
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    std::process::exit(code);
+}
+
+fn main() -> Result<()> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = parse_cli(&raw_args);
     let config = Config::from_env();
@@ -162,7 +251,7 @@ async fn main() -> Result<()> {
 
     if forwarded_args.is_empty() {
         eprintln!("Usage: cargo cooldown <cargo-command> [args...]");
-        std::process::exit(2);
+        exit_with(2);
     }
 
     if matches!(
@@ -174,11 +263,11 @@ async fn main() -> Result<()> {
              Running it with `cargo update` would replace the lockfile you just cooled down.\n\
              Invoke `cargo update` directly instead if you truly intend to refresh dependency versions."
         );
-        std::process::exit(2);
+        exit_with(2);
     }
 
     if config.mode != Mode::Off && config.cooldown_minutes > 0 {
-        match executor::run_pinning_flow(&config, &cli.manifest, &cli.features).await {
+        match executor::run_pinning_flow(&config, &cli.manifest, &cli.workspace, &cli.features) {
             Ok(_) => {}
             Err(err) => match config.mode {
                 Mode::Warn => {
@@ -193,12 +282,12 @@ async fn main() -> Result<()> {
     }
 
     let status = Command::new("cargo").args(&forwarded_args).status()?;
-    std::process::exit(status.code().unwrap_or(1));
+    exit_with(status.code().unwrap_or(1));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_cargo_args, parse_cli};
+    use super::{assemble_cargo_args, parse_cli, split_features};
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -284,7 +373,119 @@ mod tests {
         let forwarded = assemble_cargo_args(&cli);
         assert_eq!(
             to_string_vec(&forwarded),
-            vec!["test", "--features", "foo bar", "--", "--nocapture"]
+            vec!["test", "--features", "foo,bar", "--", "--nocapture"]
+        );
+    }
+
+    #[test]
+    fn split_features_accepts_commas_and_spaces() {
+        assert_eq!(
+            split_features("foo,bar baz,,qux"),
+            vec!["foo", "bar", "baz", "qux"]
+        );
+    }
+
+    #[test]
+    fn assemble_reapplies_workspace_and_feature_selectors() {
+        let raw = to_os_vec(&[
+            "cargo-cooldown",
+            "cooldown",
+            "--manifest-path",
+            "examples/demo/Cargo.toml",
+            "--package",
+            "demo",
+            "--workspace",
+            "--exclude",
+            "internal-only",
+            "--all-features",
+            "--no-default-features",
+            "--features",
+            "foo bar,baz",
+            "check",
+            "--quiet",
+        ]);
+
+        let cli = parse_cli(&raw);
+        let forwarded = assemble_cargo_args(&cli);
+        assert_eq!(
+            to_string_vec(&forwarded),
+            vec![
+                "check",
+                "--manifest-path",
+                "examples/demo/Cargo.toml",
+                "--package",
+                "demo",
+                "--workspace",
+                "--exclude",
+                "internal-only",
+                "--all-features",
+                "--no-default-features",
+                "--features",
+                "foo,bar,baz",
+                "--quiet",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_supports_manifest_after_cargo_subcommand() {
+        let raw = to_os_vec(&[
+            "cargo-cooldown",
+            "check",
+            "--manifest-path",
+            "examples/demo/Cargo.toml",
+        ]);
+
+        let cli = parse_cli(&raw);
+        assert_eq!(
+            cli.manifest.manifest_path,
+            Some(PathBuf::from("examples/demo/Cargo.toml"))
+        );
+        assert_eq!(
+            to_string_vec(&assemble_cargo_args(&cli)),
+            vec!["check", "--manifest-path", "examples/demo/Cargo.toml",]
+        );
+    }
+
+    #[test]
+    fn parse_supports_workspace_selectors_after_cargo_subcommand() {
+        let raw = to_os_vec(&[
+            "cargo-cooldown",
+            "check",
+            "--package",
+            "demo",
+            "--workspace",
+            "--exclude",
+            "internal-only",
+            "--all-features",
+            "--no-default-features",
+            "--features",
+            "foo bar,baz",
+            "--quiet",
+        ]);
+
+        let cli = parse_cli(&raw);
+        assert_eq!(cli.workspace.package, vec!["demo"]);
+        assert!(cli.workspace.workspace);
+        assert_eq!(cli.workspace.exclude, vec!["internal-only"]);
+        assert!(cli.features.all_features);
+        assert!(cli.features.no_default_features);
+        assert_eq!(cli.features.features, vec!["foo", "bar,baz"]);
+        assert_eq!(
+            to_string_vec(&assemble_cargo_args(&cli)),
+            vec![
+                "check",
+                "--package",
+                "demo",
+                "--workspace",
+                "--exclude",
+                "internal-only",
+                "--all-features",
+                "--no-default-features",
+                "--features",
+                "foo,bar,baz",
+                "--quiet",
+            ]
         );
     }
 }

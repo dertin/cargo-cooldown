@@ -1,40 +1,40 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::PackageId;
-use chrono::Utc;
-use semver::{Op, Version, VersionReq};
-use tracing::{debug, info, warn};
+use chrono::{DateTime, Utc};
+use semver::{Op, VersionReq};
+use tracing::{debug, info};
 
 use crate::allowlist::Allowlist;
-use crate::cache::Cache;
 use crate::config::Config;
 use crate::metadata::read_metadata;
-use crate::registry::{RegistryClient, VersionMeta};
-use crate::resolver::{PinOutcome, filter_candidates, try_pin_precise};
-use clap_cargo::{Features, Manifest};
+use crate::registry::{
+    RegistryContext, RegistryStore, ReleaseSource, assert_has_timestamp, ensure_timeline_available,
+    is_registry_source, require_release,
+};
+use crate::resolver::{
+    PinOutcome, cutoff_time, is_release_fresh, select_candidate, try_pin_precise,
+};
+use clap_cargo::{Features, Manifest, Workspace};
 
-pub async fn run_pinning_flow(
+pub fn run_pinning_flow(
     config: &Config,
     manifest: &Manifest,
+    workspace: &Workspace,
     features: &Features,
 ) -> Result<()> {
-    ensure_lockfile()?;
+    ensure_lockfile(manifest)?;
 
     let allowlist = Allowlist::load(config.allowlist_path.clone())?;
     let per_crate_minutes = allowlist.per_crate_minutes();
     let global_minutes = allowlist.global_minutes();
-    let cache = if let Some(ref root) = config.cache_dir {
-        Cache::with_root(root.clone(), Duration::from_secs(config.ttl_seconds))?
-    } else {
-        Cache::new(config.ttl_seconds)?
-    };
-    let client = RegistryClient::new(config)?;
-
+    let mut registry_store = RegistryStore::new(config)?;
+    let now = config.now_override.unwrap_or_else(Utc::now);
     let mut visited_failures: HashSet<String> = HashSet::new();
+    let mut inspection_cache: HashMap<ReleaseInspectionKey, ReleaseInspection> = HashMap::new();
 
     'outer: loop {
         let metadata = read_metadata(manifest, features)?;
@@ -42,18 +42,25 @@ pub async fn run_pinning_flow(
             .resolve
             .clone()
             .context("cargo metadata output did not include a resolved dependency graph")?;
+        let selected_root_ids = selected_package_ids(&metadata, workspace);
+        let reachable_ids = reachable_package_ids(&resolve, &selected_root_ids);
         let packages: HashMap<PackageId, cargo_metadata::Package> = metadata
             .packages
             .into_iter()
             .map(|pkg| (pkg.id.clone(), pkg))
             .collect();
 
-        let mut name_version_to_id: HashMap<(String, String), PackageId> = HashMap::new();
+        let mut name_version_to_ids: HashMap<(String, String), Vec<PackageId>> = HashMap::new();
         for (id, pkg) in &packages {
-            name_version_to_id.insert((pkg.name.to_string(), pkg.version.to_string()), id.clone());
+            if !reachable_ids.contains(id) {
+                continue;
+            }
+            name_version_to_ids
+                .entry((pkg.name.to_string(), pkg.version.to_string()))
+                .or_default()
+                .push(id.clone());
         }
 
-        let now = config.now_override.unwrap_or_else(Utc::now);
         let mut crate_states: HashMap<PackageId, CrateState> = HashMap::new();
         let mut fresh_entries: Vec<FreshCrate> = Vec::new();
         let mut equality_dependents: HashMap<PackageId, Vec<PackageId>> = HashMap::new();
@@ -62,7 +69,7 @@ pub async fn run_pinning_flow(
         let mut seen: HashSet<PackageId> = HashSet::new();
 
         for node in &resolve.nodes {
-            if !seen.insert(node.id.clone()) {
+            if !reachable_ids.contains(&node.id) || !seen.insert(node.id.clone()) {
                 continue;
             }
             let Some(pkg) = packages.get(&node.id) else {
@@ -73,7 +80,6 @@ pub async fn run_pinning_flow(
                 node,
                 pkg,
                 &packages,
-                config,
                 &mut version_requirements,
                 &mut requirement_origins,
                 &mut equality_dependents,
@@ -82,11 +88,11 @@ pub async fn run_pinning_flow(
             let Some(source) = pkg.source.as_ref() else {
                 continue;
             };
-            if !config.is_registry_allowed(&source.repr) {
-                debug!(crate = %pkg.name, source = %source.repr, "skipping non-crates.io registry dependency");
+            if !is_registry_source(&source.repr) {
                 continue;
             }
 
+            let context = registry_store.context_for_source(&source.repr)?.clone();
             let current_version = pkg.version.to_string();
             let mut minimum_minutes = config.cooldown_minutes;
             if let Some(global) = global_minutes {
@@ -97,46 +103,60 @@ pub async fn run_pinning_flow(
             }
 
             let exact_allowed = allowlist.is_exact_allowed(pkg.name.as_str(), &current_version);
-            crate_states.insert(
-                node.id.clone(),
-                CrateState {
-                    name: pkg.name.to_string(),
-                    current_version: current_version.clone(),
-                    minimum_minutes,
-                    exact_allowed,
-                },
-            );
+            let state = CrateState {
+                name: pkg.name.to_string(),
+                source_id: source.repr.to_string(),
+                current_version: current_version.clone(),
+                minimum_minutes,
+                exact_allowed,
+                skipped: context.skipped,
+            };
+            crate_states.insert(node.id.clone(), state.clone());
 
-            if exact_allowed || minimum_minutes == 0 {
+            if exact_allowed || minimum_minutes == 0 || context.skipped {
                 continue;
             }
 
-            match fetch_version_meta(&client, &cache, pkg.name.as_str(), &current_version).await {
-                Ok(meta) => {
-                    let age_minutes = (now - meta.created_at).num_minutes();
-                    debug!(
-                        crate = %pkg.name,
-                        %age_minutes,
-                        %minimum_minutes,
-                        created_at = %meta.created_at,
-                        "crate age inspected"
-                    );
-                    if age_minutes < minimum_minutes as i64 {
-                        fresh_entries.push(FreshCrate {
-                            package_id: node.id.clone(),
-                            name: pkg.name.to_string(),
-                            current_version: current_version.clone(),
-                            minimum_minutes,
-                        });
-                    }
-                }
-                Err(err) => {
-                    if config.offline_ok {
-                        warn!(crate = %pkg.name, error = %err, "skipping metadata fetch due to offline mode");
-                    } else {
-                        return Err(err);
-                    }
-                }
+            let (inspection, cache_hit) = inspect_current_release(
+                &mut registry_store,
+                &mut inspection_cache,
+                &context,
+                &state,
+                now,
+            )?;
+            let cutoff = cutoff_time(minimum_minutes, now);
+            debug!(
+                crate = %pkg.name,
+                version = %current_version,
+                published_at = %inspection.published_at,
+                release_time_source = inspection.release_time_source.log_label(),
+                cutoff = %cutoff,
+                cache = if cache_hit { "hit" } else { "miss" },
+                registry = %context.effective_index_url,
+                "evaluated release age for locked dependency"
+            );
+            if config.verbose {
+                eprintln!(
+                    "cooldown: {} crate={} version={} registry={} published_at={} cutoff={} release_time_source={} cache={}",
+                    if cache_hit { "reused" } else { "inspected" },
+                    pkg.name,
+                    current_version,
+                    context.effective_index_url,
+                    inspection.published_at,
+                    cutoff,
+                    inspection.release_time_source.log_label(),
+                    if cache_hit { "hit" } else { "miss" },
+                );
+            }
+
+            if inspection.fresh {
+                fresh_entries.push(FreshCrate {
+                    package_id: node.id.clone(),
+                    name: pkg.name.to_string(),
+                    source_id: source.repr.to_string(),
+                    current_version,
+                    minimum_minutes,
+                });
             }
         }
 
@@ -145,8 +165,10 @@ pub async fn run_pinning_flow(
             break;
         }
 
-        let fresh_ids: HashSet<PackageId> =
-            fresh_entries.iter().map(|f| f.package_id.clone()).collect();
+        let fresh_ids: HashSet<PackageId> = fresh_entries
+            .iter()
+            .map(|entry| entry.package_id.clone())
+            .collect();
         fresh_entries.sort_by_key(|entry| {
             equality_dependents
                 .get(&entry.package_id)
@@ -162,59 +184,45 @@ pub async fn run_pinning_flow(
         let mut queue: VecDeque<FreshCrate> = fresh_entries.into();
 
         'queue_loop: while let Some(fresh) = queue.pop_front() {
-            let key = format!("{}@{}", fresh.name, fresh.current_version);
+            let key = format!(
+                "{}::{}@{}",
+                fresh.source_id, fresh.name, fresh.current_version
+            );
             if visited_failures.contains(&key) {
                 bail!(
-                    "no acceptable version found for {} (cooldown {} minutes). Consider waiting for the cooldown window, temporarily downgrading, or applying a [patch.crates-io] override.",
+                    "no acceptable version found for {} from registry {} (cooldown {} minutes). Consider waiting for the cooldown window, relaxing the requirement, or skipping that registry via COOLDOWN_SKIP_REGISTRIES.",
                     fresh.name,
+                    fresh.source_id,
                     fresh.minimum_minutes
                 );
             }
 
-            let candidate_list = match fetch_version_list(&client, &cache, &fresh.name).await {
-                Ok(list) => list,
-                Err(err) => {
-                    if config.offline_ok {
-                        warn!(crate = %fresh.name, error = %err, "skipping candidate discovery due to offline mode");
-                        queue.push_back(fresh);
-                        continue;
-                    } else {
-                        return Err(err);
-                    }
-                }
-            };
-
-            let mut candidates = filter_candidates(candidate_list, fresh.minimum_minutes, now);
+            let context = registry_store.context_for_source(&fresh.source_id)?.clone();
+            let timeline = registry_store.timeline_for(&fresh.source_id, &fresh.name)?;
+            ensure_timeline_available(&context, &fresh.name, &timeline)?;
             let requirements = version_requirements
                 .get(&fresh.package_id)
                 .cloned()
                 .unwrap_or_default();
-            if !requirements.is_empty() {
-                candidates
-                    .retain(|candidate| satisfies_requirements(&candidate.version, &requirements));
-            }
 
-            if let Ok(current_semver) = Version::parse(&fresh.current_version) {
-                candidates.retain(|candidate| {
-                    Version::parse(&candidate.version)
-                        .map(|version| version < current_semver)
-                        .unwrap_or(true)
-                });
-            }
-
-            if candidates.is_empty() {
-                debug!(crate = %fresh.name, requirements = ?requirements, "no candidates satisfied semver requirements after cooldown filter");
+            let Some(candidate) = select_candidate(
+                &timeline,
+                &fresh.current_version,
+                &requirements,
+                fresh.minimum_minutes,
+                now,
+            ) else {
                 let mut queued_parent = false;
                 if let Some(origins) = requirement_origins.get(&fresh.package_id) {
-                    debug!(crate = %fresh.name, parents = ?origins, "enqueuing parents due to unsatisfied requirements");
                     for origin in origins {
                         if let Some(state) = crate_states.get(&origin.parent_id) {
-                            if state.exact_allowed || state.minimum_minutes == 0 {
+                            if state.exact_allowed || state.minimum_minutes == 0 || state.skipped {
                                 continue;
                             }
                             queue.push_front(FreshCrate {
                                 package_id: origin.parent_id.clone(),
                                 name: origin.parent_name.clone(),
+                                source_id: state.source_id.clone(),
                                 current_version: state.current_version.clone(),
                                 minimum_minutes: state.minimum_minutes,
                             });
@@ -227,81 +235,110 @@ pub async fn run_pinning_flow(
                     continue 'queue_loop;
                 }
 
-                visited_failures.insert(key.clone());
+                visited_failures.insert(key);
                 bail!(
-                    "crate {} lacks versions older than {} minutes that satisfy the semver constraint. Options: wait for the cooldown to elapse, relax the dependency requirement, or pin explicitly via [patch.crates-io].",
+                    "crate {} from registry {} lacks versions older than {} minutes that satisfy the semver constraints",
                     fresh.name,
+                    context.effective_index_url,
                     fresh.minimum_minutes
                 );
-            }
+            };
 
-            for candidate in candidates {
-                if candidate.version == fresh.current_version {
-                    continue;
+            info!(
+                crate = %fresh.name,
+                registry = %context.effective_index_url,
+                current = %fresh.current_version,
+                candidate = %candidate.version,
+                "attempting pin"
+            );
+
+            match try_pin_precise(
+                manifest,
+                &fresh.name,
+                &fresh.current_version,
+                &candidate.version,
+            )? {
+                PinOutcome::Applied => {
+                    info!(
+                        crate = %fresh.name,
+                        registry = %context.effective_index_url,
+                        pinned = %candidate.version,
+                        "pin applied"
+                    );
+                    continue 'outer;
                 }
-                info!(crate = %fresh.name, current = %fresh.current_version, candidate = %candidate.version, "attempting pin");
-                match try_pin_precise(&fresh.name, &fresh.current_version, &candidate.version) {
-                    Ok(PinOutcome::Applied) => {
-                        info!(crate = %fresh.name, pinned = %candidate.version, "pin applied");
-                        continue 'outer;
+                PinOutcome::Rejected { stdout, stderr } => {
+                    let blockers = parse_blockers(&stdout, &stderr);
+                    if blockers.is_empty() {
+                        visited_failures.insert(key);
+                        bail!(
+                            "cargo rejected pinning {} from registry {} to {} without exposing actionable blockers",
+                            fresh.name,
+                            context.effective_index_url,
+                            candidate.version
+                        );
                     }
-                    Ok(PinOutcome::Rejected { stdout, stderr }) => {
-                        let blockers = parse_blockers(&stdout, &stderr);
-                        if blockers.is_empty() {
-                            debug!(crate = %fresh.name, candidate = %candidate.version, "cargo update rejected candidate");
-                            continue;
-                        }
-                        for blocker in blockers {
-                            let blocker_id = blocker
-                                .version
-                                .as_ref()
-                                .and_then(|ver| {
-                                    name_version_to_id.get(&(blocker.name.clone(), ver.clone()))
-                                })
-                                .cloned()
-                                .or_else(|| {
+
+                    let blocker_descriptions = blockers
+                        .iter()
+                        .map(|blocker| blocker.label())
+                        .collect::<Vec<_>>();
+                    let mut queued_blocker = false;
+                    for blocker in blockers {
+                        let matches = blocker
+                            .version
+                            .as_ref()
+                            .and_then(|version| {
+                                name_version_to_ids
+                                    .get(&(blocker.name.clone(), version.clone()))
+                                    .cloned()
+                            })
+                            .or_else(|| {
+                                Some(
                                     crate_states
                                         .iter()
-                                        .find(|(_, state)| state.name == blocker.name)
+                                        .filter(|(_, state)| state.name == blocker.name)
                                         .map(|(id, _)| id.clone())
-                                });
+                                        .collect(),
+                                )
+                            })
+                            .unwrap_or_default();
 
-                            if let Some(id) = blocker_id
-                                && let Some(state) = crate_states.get(&id)
-                            {
-                                if state.exact_allowed || state.minimum_minutes == 0 {
-                                    debug!(crate = %state.name, "blocking crate is exempt from cooldown; skipping downgrade");
+                        for id in matches {
+                            if let Some(state) = crate_states.get(&id) {
+                                if state.exact_allowed
+                                    || state.minimum_minutes == 0
+                                    || state.skipped
+                                {
                                     continue;
                                 }
                                 queue.push_front(FreshCrate {
                                     package_id: id,
                                     name: state.name.clone(),
+                                    source_id: state.source_id.clone(),
                                     current_version: state.current_version.clone(),
                                     minimum_minutes: state.minimum_minutes,
                                 });
+                                queued_blocker = true;
                             }
                         }
-                        queue.push_back(fresh.clone());
-                        continue 'queue_loop;
                     }
-                    Err(err) => {
-                        if config.offline_ok {
-                            warn!(crate = %fresh.name, candidate = %candidate.version, error = %err, "pin attempt failed in offline mode");
-                            queue.push_back(fresh.clone());
-                            continue 'queue_loop;
-                        } else {
-                            return Err(err);
-                        }
+
+                    if !queued_blocker {
+                        visited_failures.insert(key);
+                        bail!(
+                            "cargo rejected pinning {} from registry {} to {} due to blockers outside the selected cooldown scope or otherwise ineligible blockers: {}",
+                            fresh.name,
+                            context.effective_index_url,
+                            candidate.version,
+                            blocker_descriptions.join(", ")
+                        );
                     }
+
+                    queue.push_back(fresh.clone());
+                    continue 'queue_loop;
                 }
             }
-
-            visited_failures.insert(key.clone());
-            bail!(
-                "unable to pin crate {} to an older compatible release within the cooldown window ({} minutes). Try waiting or adding a manual override.",
-                fresh.name,
-                fresh.minimum_minutes
-            );
         }
 
         bail!(
@@ -312,11 +349,63 @@ pub async fn run_pinning_flow(
     Ok(())
 }
 
-fn ensure_lockfile() -> Result<()> {
-    if Path::new("Cargo.lock").exists() {
+fn selected_package_ids(
+    metadata: &cargo_metadata::Metadata,
+    workspace: &Workspace,
+) -> HashSet<PackageId> {
+    workspace
+        .partition_packages(metadata)
+        .0
+        .into_iter()
+        .map(|package| package.id.clone())
+        .collect()
+}
+
+fn reachable_package_ids(
+    resolve: &cargo_metadata::Resolve,
+    selected_root_ids: &HashSet<PackageId>,
+) -> HashSet<PackageId> {
+    let nodes_by_id: HashMap<PackageId, &cargo_metadata::Node> = resolve
+        .nodes
+        .iter()
+        .map(|node| (node.id.clone(), node))
+        .collect();
+    let mut reachable = HashSet::new();
+    let mut queue: VecDeque<PackageId> = selected_root_ids.iter().cloned().collect();
+
+    while let Some(package_id) = queue.pop_front() {
+        if !reachable.insert(package_id.clone()) {
+            continue;
+        }
+
+        if let Some(node) = nodes_by_id.get(&package_id) {
+            queue.extend(node.deps.iter().map(|dep| dep.pkg.clone()));
+        }
+    }
+
+    reachable
+}
+
+fn ensure_lockfile(manifest: &Manifest) -> Result<()> {
+    let lockfile_path = manifest
+        .manifest_path
+        .as_ref()
+        .and_then(|path| path.parent().map(|parent| parent.join("Cargo.lock")));
+    if lockfile_path
+        .as_ref()
+        .map(|path| path.exists())
+        .unwrap_or_else(|| Path::new("Cargo.lock").exists())
+    {
         return Ok(());
     }
-    let status = Command::new("cargo").args(["generate-lockfile"]).status()?;
+
+    let mut command = Command::new("cargo");
+    command.arg("generate-lockfile");
+    if let Some(path) = &manifest.manifest_path {
+        command.arg("--manifest-path").arg(path);
+    }
+
+    let status = command.status()?;
     if !status.success() {
         bail!("failed to generate Cargo.lock via `cargo generate-lockfile`");
     }
@@ -327,15 +416,34 @@ fn ensure_lockfile() -> Result<()> {
 struct FreshCrate {
     package_id: PackageId,
     name: String,
+    source_id: String,
     current_version: String,
     minimum_minutes: u64,
 }
 
+#[derive(Clone)]
 struct CrateState {
     name: String,
+    source_id: String,
     current_version: String,
     minimum_minutes: u64,
     exact_allowed: bool,
+    skipped: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ReleaseInspectionKey {
+    source_id: String,
+    crate_name: String,
+    current_version: String,
+    minimum_minutes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ReleaseInspection {
+    published_at: DateTime<Utc>,
+    release_time_source: ReleaseSource,
+    fresh: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -345,33 +453,36 @@ struct RequirementOrigin {
     requirement: VersionReq,
 }
 
-async fn fetch_version_meta(
-    client: &RegistryClient,
-    cache: &Cache,
-    name: &str,
-    version: &str,
-) -> Result<VersionMeta> {
-    let key = format!("{name}/{version}");
-    if let Some(meta) = cache.get::<VersionMeta>(&key)? {
-        return Ok(meta);
+fn inspect_current_release(
+    registry_store: &mut RegistryStore,
+    inspection_cache: &mut HashMap<ReleaseInspectionKey, ReleaseInspection>,
+    context: &RegistryContext,
+    state: &CrateState,
+    now: DateTime<Utc>,
+) -> Result<(ReleaseInspection, bool)> {
+    let key = ReleaseInspectionKey {
+        source_id: state.source_id.clone(),
+        crate_name: state.name.clone(),
+        current_version: state.current_version.clone(),
+        minimum_minutes: state.minimum_minutes,
+    };
+    if let Some(cached) = inspection_cache.get(&key) {
+        return Ok((cached.clone(), true));
     }
-    let meta = client.fetch_version(name, version).await?;
-    cache.put(&key, &meta)?;
-    Ok(meta)
-}
 
-async fn fetch_version_list(
-    client: &RegistryClient,
-    cache: &Cache,
-    name: &str,
-) -> Result<Vec<VersionMeta>> {
-    let key = format!("{name}/_list");
-    if let Some(list) = cache.get::<Vec<VersionMeta>>(&key)? {
-        return Ok(list);
-    }
-    let list = client.list_versions(name).await?;
-    cache.put(&key, &list)?;
-    Ok(list)
+    // A single cooldown run should reason over one stable timeline snapshot
+    // instead of re-reading the same release metadata after each successful pin.
+    let timeline = registry_store.timeline_for(&state.source_id, &state.name)?;
+    ensure_timeline_available(context, &state.name, &timeline)?;
+    let current_release = require_release(&timeline, context, &state.name, &state.current_version)?;
+    let published_at = assert_has_timestamp(context, &state.name, current_release)?;
+    let inspection = ReleaseInspection {
+        published_at,
+        release_time_source: current_release.source,
+        fresh: is_release_fresh(current_release, state.minimum_minutes, now) == Some(true),
+    };
+    inspection_cache.insert(key, inspection.clone());
+    Ok((inspection, false))
 }
 
 fn is_exact_requirement(req: &semver::VersionReq) -> bool {
@@ -401,7 +512,6 @@ fn record_dependency_requirements(
     node: &cargo_metadata::Node,
     pkg: &cargo_metadata::Package,
     packages: &HashMap<PackageId, cargo_metadata::Package>,
-    config: &Config,
     version_requirements: &mut HashMap<PackageId, Vec<VersionReq>>,
     requirement_origins: &mut HashMap<PackageId, Vec<RequirementOrigin>>,
     equality_dependents: &mut HashMap<PackageId, Vec<PackageId>>,
@@ -410,12 +520,10 @@ fn record_dependency_requirements(
         let Some(dep_pkg) = packages.get(&dep.pkg) else {
             continue;
         };
-        if !dep_pkg
-            .source
-            .as_ref()
-            .map(|src| config.is_registry_allowed(&src.repr))
-            .unwrap_or(false)
-        {
+        let Some(source) = dep_pkg.source.as_ref() else {
+            continue;
+        };
+        if !is_registry_source(&source.repr) {
             continue;
         }
 
@@ -487,25 +595,56 @@ struct Blocker {
     version: Option<String>,
 }
 
-fn satisfies_requirements(version: &str, requirements: &[VersionReq]) -> bool {
-    if requirements.is_empty() {
-        return true;
-    }
-    match Version::parse(version) {
-        Ok(parsed) => requirements.iter().all(|req| req.matches(&parsed)),
-        Err(_) => false,
+impl Blocker {
+    fn label(&self) -> String {
+        self.version
+            .as_ref()
+            .map(|version| format!("{} {}", self.name, version))
+            .unwrap_or_else(|| self.name.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Mode;
+    use crate::config::{Config, Mode};
     use serde_json::json;
+
+    fn dependency_with(rename: Option<&str>, req: &str) -> cargo_metadata::Dependency {
+        serde_json::from_value(json!({
+            "name": "sha2",
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "req": req,
+            "kind": null,
+            "rename": rename,
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "target": null,
+            "registry": null
+        }))
+        .expect("dependency should deserialize")
+    }
+
+    #[test]
+    fn is_exact_requirement_only_accepts_single_exact_comparator() {
+        assert!(is_exact_requirement(&VersionReq::parse("=1.2.3").unwrap()));
+        assert!(!is_exact_requirement(&VersionReq::parse("^1.2.3").unwrap()));
+        assert!(!is_exact_requirement(
+            &VersionReq::parse(">=1.2.3, <2.0.0").unwrap()
+        ));
+    }
+
+    #[test]
+    fn find_manifest_dependency_matches_renamed_dependency() {
+        let deps = vec![dependency_with(Some("digest-sha2"), "^0.10")];
+        let matched = find_manifest_dependency(&deps, "digest-sha2", "sha2")
+            .expect("renamed dependency should match");
+        assert_eq!(matched.req, VersionReq::parse("^0.10").unwrap());
+    }
 
     #[test]
     fn local_workspace_members_constrain_registry_candidates() {
-        let config = test_config();
         let local_pkg: cargo_metadata::Package = serde_json::from_value(json!({
             "name": "workspace-member-app",
             "version": "0.1.0",
@@ -630,7 +769,6 @@ mod tests {
             &local_node,
             packages.get(&local_id).expect("local package exists"),
             &packages,
-            &config,
             &mut version_requirements,
             &mut requirement_origins,
             &mut equality_dependents,
@@ -641,8 +779,6 @@ mod tests {
             .expect("local workspace member should constrain registry dependency");
         assert_eq!(requirements.len(), 1);
         assert_eq!(requirements[0], VersionReq::parse("^0.11").unwrap());
-        assert!(satisfies_requirements("0.11.0", requirements));
-        assert!(!satisfies_requirements("0.11.0-rc.5", requirements));
 
         let origins = requirement_origins
             .get(&registry_id)
@@ -657,21 +793,217 @@ mod tests {
         );
     }
 
-    fn test_config() -> Config {
-        Config {
+    #[test]
+    fn record_dependency_requirements_deduplicates_exact_requirements() {
+        let parent_pkg: cargo_metadata::Package = serde_json::from_value(json!({
+            "name": "demo-app",
+            "version": "0.1.0",
+            "id": "path+file:///tmp/demo#demo-app@0.1.0",
+            "license": null,
+            "license_file": null,
+            "description": null,
+            "source": null,
+            "dependencies": [
+                {
+                    "name": "sha2",
+                    "source": "registry+https://github.com/rust-lang/crates.io-index",
+                    "req": "=1.0.0",
+                    "kind": null,
+                    "rename": null,
+                    "optional": false,
+                    "uses_default_features": true,
+                    "features": [],
+                    "target": null,
+                    "registry": null
+                }
+            ],
+            "targets": [],
+            "features": {},
+            "manifest_path": "/tmp/demo/Cargo.toml",
+            "metadata": null,
+            "publish": null,
+            "authors": [],
+            "categories": [],
+            "keywords": [],
+            "readme": null,
+            "repository": null,
+            "homepage": null,
+            "documentation": null,
+            "edition": "2024",
+            "links": null,
+            "default_run": null,
+            "rust_version": null
+        }))
+        .unwrap();
+        let registry_pkg: cargo_metadata::Package = serde_json::from_value(json!({
+            "name": "sha2",
+            "version": "1.0.0",
+            "id": "registry+https://github.com/rust-lang/crates.io-index#sha2@1.0.0",
+            "license": null,
+            "license_file": null,
+            "description": null,
+            "source": "registry+https://github.com/rust-lang/crates.io-index",
+            "dependencies": [],
+            "targets": [],
+            "features": {},
+            "manifest_path": "/tmp/sha2/Cargo.toml",
+            "metadata": null,
+            "publish": null,
+            "authors": [],
+            "categories": [],
+            "keywords": [],
+            "readme": null,
+            "repository": null,
+            "homepage": null,
+            "documentation": null,
+            "edition": "2024",
+            "links": null,
+            "default_run": null,
+            "rust_version": null
+        }))
+        .unwrap();
+        let node: cargo_metadata::Node = serde_json::from_value(json!({
+            "id": "path+file:///tmp/demo#demo-app@0.1.0",
+            "dependencies": [
+                "registry+https://github.com/rust-lang/crates.io-index#sha2@1.0.0"
+            ],
+            "deps": [
+                {
+                    "name": "sha2",
+                    "pkg": "registry+https://github.com/rust-lang/crates.io-index#sha2@1.0.0",
+                    "dep_kinds": [{ "kind": null, "target": null }]
+                },
+                {
+                    "name": "sha2",
+                    "pkg": "registry+https://github.com/rust-lang/crates.io-index#sha2@1.0.0",
+                    "dep_kinds": [{ "kind": null, "target": null }]
+                }
+            ],
+            "features": []
+        }))
+        .unwrap();
+
+        let parent_id = parent_pkg.id.clone();
+        let registry_id = registry_pkg.id.clone();
+        let packages = HashMap::from([
+            (parent_id.clone(), parent_pkg),
+            (registry_id.clone(), registry_pkg),
+        ]);
+        let mut version_requirements = HashMap::new();
+        let mut requirement_origins = HashMap::new();
+        let mut equality_dependents = HashMap::new();
+
+        record_dependency_requirements(
+            &node,
+            packages.get(&parent_id).unwrap(),
+            &packages,
+            &mut version_requirements,
+            &mut requirement_origins,
+            &mut equality_dependents,
+        );
+
+        assert_eq!(version_requirements.get(&registry_id).unwrap().len(), 1);
+        assert_eq!(requirement_origins.get(&registry_id).unwrap().len(), 1);
+        assert_eq!(equality_dependents.get(&registry_id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reachable_package_ids_stay_within_selected_workspace_member_closure() {
+        let resolve: cargo_metadata::Resolve = serde_json::from_value(json!({
+            "nodes": [
+                {
+                    "id": "path+file:///tmp/ws#targeted@0.1.0",
+                    "dependencies": [
+                        "registry+https://github.com/rust-lang/crates.io-index#targetdep@1.0.1"
+                    ],
+                    "deps": [
+                        {
+                            "name": "targetdep",
+                            "pkg": "registry+https://github.com/rust-lang/crates.io-index#targetdep@1.0.1",
+                            "dep_kinds": [{ "kind": null, "target": null }]
+                        }
+                    ],
+                    "features": []
+                },
+                {
+                    "id": "path+file:///tmp/ws#unrelated@0.1.0",
+                    "dependencies": [
+                        "registry+https://github.com/rust-lang/crates.io-index#otherdep@1.0.1"
+                    ],
+                    "deps": [
+                        {
+                            "name": "otherdep",
+                            "pkg": "registry+https://github.com/rust-lang/crates.io-index#otherdep@1.0.1",
+                            "dep_kinds": [{ "kind": null, "target": null }]
+                        }
+                    ],
+                    "features": []
+                },
+                {
+                    "id": "registry+https://github.com/rust-lang/crates.io-index#targetdep@1.0.1",
+                    "dependencies": [],
+                    "deps": [],
+                    "features": []
+                },
+                {
+                    "id": "registry+https://github.com/rust-lang/crates.io-index#otherdep@1.0.1",
+                    "dependencies": [],
+                    "deps": [],
+                    "features": []
+                }
+            ],
+            "root": null
+        }))
+        .expect("resolve graph should deserialize");
+        let targeted_id: PackageId =
+            serde_json::from_value(json!("path+file:///tmp/ws#targeted@0.1.0")).unwrap();
+        let unrelated_id: PackageId =
+            serde_json::from_value(json!("path+file:///tmp/ws#unrelated@0.1.0")).unwrap();
+        let targetdep_id: PackageId = serde_json::from_value(json!(
+            "registry+https://github.com/rust-lang/crates.io-index#targetdep@1.0.1"
+        ))
+        .unwrap();
+        let otherdep_id: PackageId = serde_json::from_value(json!(
+            "registry+https://github.com/rust-lang/crates.io-index#otherdep@1.0.1"
+        ))
+        .unwrap();
+        let selected = HashSet::from([targeted_id.clone()]);
+
+        let reachable = reachable_package_ids(&resolve, &selected);
+
+        assert!(reachable.contains(&targeted_id));
+        assert!(reachable.contains(&targetdep_id));
+        assert!(!reachable.contains(&unrelated_id));
+        assert!(!reachable.contains(&otherdep_id));
+    }
+
+    #[test]
+    fn parse_blockers_extracts_unique_packages() {
+        let blockers = parse_blockers(
+            "",
+            "required by package `foo 1.2.3`\nrequired by package `foo 1.2.3`\nrequired by package `bar`",
+        );
+        assert_eq!(blockers.len(), 2);
+        assert_eq!(blockers[0].name, "foo");
+        assert_eq!(blockers[0].version.as_deref(), Some("1.2.3"));
+        assert_eq!(blockers[1].name, "bar");
+        assert!(blockers[1].version.is_none());
+    }
+
+    #[test]
+    fn config_fixture_remains_constructible_for_executor_tests() {
+        let config = Config {
             cooldown_minutes: 60,
             mode: Mode::Enforce,
             now_override: None,
             ttl_seconds: 60,
             allowlist_path: None,
             cache_dir: None,
-            offline_ok: false,
             http_retries: 0,
             verbose: false,
-            registry_api: "https://crates.io/api/v1/".to_string(),
-            allowed_registries: vec![
-                "registry+https://github.com/rust-lang/crates.io-index".to_string(),
-            ],
-        }
+            skip_registries: Vec::new(),
+        };
+
+        assert_eq!(config.cooldown_minutes, 60);
     }
 }

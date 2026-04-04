@@ -96,6 +96,7 @@ fn current_epoch() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use tempfile::tempdir;
 
     #[test]
@@ -109,5 +110,35 @@ mod tests {
         let expired = Cache::with_root(dir.path().to_path_buf(), Duration::from_secs(0)).unwrap();
         let value: Option<String> = expired.get("foo/bar").unwrap();
         assert!(value.is_none());
+    }
+
+    #[test]
+    fn get_returns_none_for_missing_entry() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::with_root(dir.path().to_path_buf(), Duration::from_secs(60)).unwrap();
+        let value: Option<String> = cache.get("missing").unwrap();
+        assert!(value.is_none());
+    }
+
+    #[test]
+    fn path_for_sanitizes_non_filesystem_segments() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::with_root(dir.path().to_path_buf(), Duration::from_secs(60)).unwrap();
+        let path = cache.path_for("registry/api?crate=demo@1.0.0");
+        assert_eq!(
+            path,
+            dir.path().join("registry").join("api_crate_demo@1.0.0")
+        );
+    }
+
+    #[test]
+    fn get_reports_invalid_json_entries() {
+        let dir = tempdir().unwrap();
+        let cache = Cache::with_root(dir.path().to_path_buf(), Duration::from_secs(60)).unwrap();
+        let path = cache.path_for("broken");
+        fs::write(path, "not-json").unwrap();
+
+        let err = cache.get::<String>("broken").unwrap_err();
+        assert!(err.to_string().contains("failed to parse cache entry"));
     }
 }
