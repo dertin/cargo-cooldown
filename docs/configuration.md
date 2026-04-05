@@ -174,6 +174,9 @@ COOLDOWN_LOCKFILE_POLICY=all cargo cooldown check
 
 - versions already present in the pre-update `Cargo.lock` are left alone
 - versions introduced or changed by that update become eligible for cooldown
+- if cooling one of those newly updated versions would require degrading
+  baseline-protected or otherwise cooldown-exempt dependencies, cooldown keeps
+  the fresh version, warns, and continues best-effort on the rest of the graph
 
 For `build`, `check`, `test`, or `run`, Cargo usually reuses the existing
 lockfile. Those commands do not proactively refresh dependencies on their own.

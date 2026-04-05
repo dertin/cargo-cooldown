@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use cargo_metadata::PackageId;
 use chrono::{DateTime, Utc};
 use semver::{Op, VersionReq};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::lockfile::LockfileSnapshot;
@@ -64,6 +64,7 @@ pub fn run_pinning_flow_with_snapshot(
         ensure_lockfile(manifest, &lockfile_path)?;
         let now = config.now_override.unwrap_or_else(Utc::now);
         let mut visited_failures: HashSet<String> = HashSet::new();
+        let mut best_effort_skips: HashMap<String, String> = HashMap::new();
         let mut inspection_cache: HashMap<ReleaseInspectionKey, ReleaseInspection> = HashMap::new();
 
         'outer: loop {
@@ -199,6 +200,20 @@ pub fn run_pinning_flow_with_snapshot(
                 }
 
                 if inspection.fresh {
+                    let fresh_key =
+                        crate_failure_key(&source.repr, pkg.name.as_str(), &current_version);
+                    if let Some(reason) = best_effort_skips.get(&fresh_key) {
+                        scan_summary.best_effort_skipped += 1;
+                        debug!(
+                            crate = %pkg.name,
+                            version = %current_version,
+                            registry = %context.effective_index_url,
+                            reason = %reason,
+                            "skipping fresh dependency due to earlier best-effort decision"
+                        );
+                        continue;
+                    }
+
                     scan_summary.fresh += 1;
                     fresh_entries.push(FreshCrate {
                         package_id: node.id.clone(),
@@ -212,11 +227,12 @@ pub fn run_pinning_flow_with_snapshot(
 
             if config.verbose {
                 eprintln!(
-                    "cooldown: scan_summary registry_packages={} inspected={} fresh={} baseline_exempt={} skipped_registries={} exact_allowed={} zero_minutes={}",
+                    "cooldown: scan_summary registry_packages={} inspected={} fresh={} baseline_exempt={} best_effort_skipped={} skipped_registries={} exact_allowed={} zero_minutes={}",
                     scan_summary.registry_packages,
                     scan_summary.inspected,
                     scan_summary.fresh,
                     scan_summary.baseline_exempt,
+                    scan_summary.best_effort_skipped,
                     scan_summary.skipped,
                     scan_summary.exact_allowed,
                     scan_summary.zero_minutes,
@@ -246,14 +262,21 @@ pub fn run_pinning_flow_with_snapshot(
             });
 
             let mut queue: VecDeque<FreshCrate> = fresh_entries.into();
+            let mut attempted_in_pass: HashSet<String> = HashSet::new();
 
             'queue_loop: while let Some(fresh) = queue.pop_front() {
                 // Each queue entry represents one currently locked crate/version pair that
                 // still violates the cooldown window and needs an older acceptable version.
-                let key = format!(
-                    "{}::{}@{}",
-                    fresh.source_id, fresh.name, fresh.current_version
-                );
+                let key = crate_failure_key(&fresh.source_id, &fresh.name, &fresh.current_version);
+                if !attempted_in_pass.insert(key.clone()) {
+                    debug!(
+                        crate = %fresh.name,
+                        version = %fresh.current_version,
+                        registry = %fresh.source_id,
+                        "skipping repeated pin attempt within the same lockfile pass"
+                    );
+                    continue;
+                }
                 if visited_failures.contains(&key) {
                     bail!(
                         "no acceptable version found for {} from registry {} (cooldown {} minutes). Consider waiting for the cooldown window, relaxing the requirement, or skipping that registry via COOLDOWN_SKIP_REGISTRIES.",
@@ -330,6 +353,7 @@ pub fn run_pinning_flow_with_snapshot(
                     PinOutcome::Applied => {
                         // A successful pin changes the lockfile, so restart from the top and
                         // recompute metadata instead of trying to patch our in-memory graph.
+                        best_effort_skips.clear();
                         info!(
                             crate = %fresh.name,
                             registry = %context.effective_index_url,
@@ -356,6 +380,8 @@ pub fn run_pinning_flow_with_snapshot(
                         let blocker_descriptions =
                             blockers.iter().map(Blocker::label).collect::<Vec<_>>();
                         let mut queued_blocker = false;
+                        let mut matched_self = false;
+                        let mut queued_ids: HashSet<PackageId> = HashSet::new();
                         for blocker in blockers {
                             let matches = blocker
                                 .version
@@ -377,8 +403,13 @@ pub fn run_pinning_flow_with_snapshot(
                                 .unwrap_or_default();
 
                             for id in matches {
+                                if id == fresh.package_id {
+                                    matched_self = true;
+                                    continue;
+                                }
                                 if let Some(state) = crate_states.get(&id) {
-                                    if state.is_cooldown_exempt() {
+                                    if state.is_cooldown_exempt() || !queued_ids.insert(id.clone())
+                                    {
                                         continue;
                                     }
                                     queue.push_front(FreshCrate {
@@ -394,14 +425,21 @@ pub fn run_pinning_flow_with_snapshot(
                         }
 
                         if !queued_blocker {
-                            visited_failures.insert(key);
-                            bail!(
-                                "cargo rejected pinning {} from registry {} to {} due to blockers outside the selected cooldown scope or otherwise ineligible blockers: {}",
-                                fresh.name,
-                                context.effective_index_url,
-                                candidate.version,
+                            let reason = format!(
+                                "blockers could not be cooled in this run: {}",
                                 blocker_descriptions.join(", ")
                             );
+                            best_effort_skips.insert(key, reason.clone());
+                            warn!(
+                                crate = %fresh.name,
+                                registry = %context.effective_index_url,
+                                current = %fresh.current_version,
+                                candidate = %candidate.version,
+                                blockers = %blocker_descriptions.join(", "),
+                                self_blocker = matched_self,
+                                "skipping pin because remaining blockers are cooldown-exempt, outside scope, or require the currently locked version"
+                            );
+                            continue;
                         }
 
                         queue.push_back(fresh.clone());
@@ -433,6 +471,7 @@ struct ScanSummary {
     inspected: usize,
     fresh: usize,
     baseline_exempt: usize,
+    best_effort_skipped: usize,
     skipped: usize,
     exact_allowed: usize,
     zero_minutes: usize,
@@ -445,6 +484,10 @@ impl ScanSummary {
         self.exact_allowed += usize::from(state.exact_allowed);
         self.zero_minutes += usize::from(state.minimum_minutes == 0);
     }
+}
+
+fn crate_failure_key(source_id: &str, name: &str, current_version: &str) -> String {
+    format!("{source_id}::{name}@{current_version}")
 }
 
 fn selected_package_ids(

@@ -138,11 +138,23 @@ cutoff:
 Fresh packages are queued and pinned one at a time with `cargo update --precise`.
 
 If Cargo rejects a pin because another package blocks it, the blocker is queued
-and the resolver keeps working inside that same pass. If a pin succeeds, the
-resolver restarts from `cargo metadata` so Cargo can re-resolve the graph from
-the new lockfile state. The initial baseline does not change, so any package
-that moves to a version not present in that baseline becomes eligible for
-cooldown on the next pass.
+and the resolver keeps working inside that same pass.
+
+Two details matter here:
+
+- the same `(registry, crate, version)` is not retried more than once in a
+  single lockfile pass, because the lockfile has not changed yet and a second
+  attempt would be redundant;
+- if the only remaining blockers are outside the selected cooldown scope,
+  protected by the initial lockfile baseline, or otherwise cooldown-exempt, the
+  resolver keeps the currently locked version, emits a warning, and continues
+  cooling the rest of the graph.
+
+If a pin succeeds, the resolver restarts from `cargo metadata` so Cargo can
+re-resolve the graph from the new lockfile state. Any best-effort skips are
+reconsidered after that restart. The initial baseline does not change, so any
+package that moves to a version not present in that baseline becomes eligible
+for cooldown on the next pass.
 
 That is the main remaining cost today: the resolved graph is still rebuilt after
 each successful pin, even though the registry timelines and many locked-version
