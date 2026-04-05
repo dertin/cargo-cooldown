@@ -24,6 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 semver = "1"
 clap = { version = "4.5", features = ["derive"] }
 clap-cargo = { version = "0.18.3", features = ["cargo_metadata"] }
+indicatif = "0.18.4"
 
 [dev-dependencies]
 assert_fs = "1"

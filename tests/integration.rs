@@ -45,6 +45,9 @@ const BUNDLE_OLD_VERSION: &str = "1.0.0";
 const BUNDLE_FRESH_VERSION: &str = "1.1.0";
 const BUNDLE_OLD_PUBTIME: &str = "2026-03-01T00:00:00Z";
 const BUNDLE_FRESH_PUBTIME: &str = "2026-04-02T12:00:00Z";
+const SCOPED_CONFLICT_NAME: &str = "scopedfresh";
+const SCOPED_MEMBER_A: &str = "member-a";
+const SCOPED_MEMBER_B: &str = "member-b";
 
 #[test]
 fn existing_lockfile_fresh_dependency_is_ignored_by_default() {
@@ -67,8 +70,8 @@ fn existing_lockfile_fresh_dependency_is_ignored_by_default() {
         "default lockfile policy should not inspect unchanged baseline versions: {stderr}"
     );
     assert!(
-        stderr.contains("initial Cargo.lock baseline (already installed, lower risk):"),
-        "final warning should summarize remaining baseline-fresh versions: {stderr}"
+        !stderr.contains("cooldown finished with fresh versions remaining."),
+        "baseline-fresh versions from the initial lockfile should not trigger a warning: {stderr}"
     );
 }
 
@@ -133,15 +136,15 @@ fn fails_closed_when_registry_lacks_release_time_metadata() {
 }
 
 #[test]
-fn warn_mode_continues_when_registry_lacks_release_time_metadata() {
+fn best_effort_mode_continues_when_registry_lacks_release_time_metadata() {
     let mut harness =
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");
     harness.generate_lockfile();
 
-    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_MODE", "warn")]);
+    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_MODE", "best_effort")]);
     assert!(
         output.status.success(),
-        "warn mode should continue: {}",
+        "best_effort mode should continue: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), FRESH_VERSION);
@@ -394,7 +397,7 @@ fn cooldown_update_repins_new_fresh_versions_against_pre_update_baseline() {
     assert_eq!(harness.locked_version(), OLD_VERSION);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let expected_cooldown_line = format!(
-        "  - cooldowndep 1.0.1 -> 1.0.0 @ sparse+{}/index/",
+        "     Keeping cooldowndep 1.0.0 (latest: v1.0.1) @ sparse+{}/index/",
         harness.server.base_url()
     );
     assert!(
@@ -405,15 +408,43 @@ fn cooldown_update_repins_new_fresh_versions_against_pre_update_baseline() {
         stderr.contains("cooldown: scan_summary registry_packages=1 inspected=1 fresh=1"),
         "{stderr}"
     );
-    assert!(stderr.contains("cooled versions:"), "{stderr}");
     assert!(stderr.contains(&expected_cooldown_line), "{stderr}");
     assert!(
-        stderr.contains("dependency graph updated and cooled down"),
+        stderr.contains("    Finished dependency graph updated and cooled down"),
         "{stderr}"
     );
     assert!(
         !stderr.contains("Updating `cool-reg` index"),
         "the initial cargo update output should stay hidden on success: {stderr}"
+    );
+}
+
+#[test]
+fn cooldown_update_reports_plain_lockfile_updates_when_no_cooling_is_needed() {
+    let mut harness =
+        TestHarness::new_with_dependency_req(RegistryMode::PubtimeOnly, &format!("={OLD_VERSION}"))
+            .expect("harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+    harness.set_dependency_requirement("1");
+
+    let output = harness.run_command(&["update"], &[("COOLDOWN_MINUTES", "1")]);
+
+    assert!(
+        output.status.success(),
+        "cargo cooldown update should keep plain update results when nothing is fresh enough to cool: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected_update_line = format!(
+        "    Updating cooldowndep v1.0.0 -> v1.0.1 @ sparse+{}/index/",
+        harness.server.base_url()
+    );
+    assert!(stderr.contains(&expected_update_line), "{stderr}");
+    assert!(
+        stderr.contains("    Finished dependency graph updated and cooled down"),
+        "{stderr}"
     );
 }
 
@@ -526,6 +557,50 @@ fn coordinated_bundle_resolution_cools_exactly_coupled_transitives() {
         !stderr.contains("resolver-constrained versions that could not be cooled further"),
         "{stderr}"
     );
+}
+
+#[test]
+fn best_effort_allows_resolver_constrained_versions_outside_selected_scope() {
+    let mut harness = ScopedConflictHarness::new().expect("scoped conflict harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+
+    let output = harness.run_cooldown(Some("best_effort"));
+    assert!(
+        output.status.success(),
+        "best_effort should keep the lockfile and warn: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("resolver-constrained versions that could not be cooled further"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("- scopedfresh 1.0.1"), "{stderr}");
+}
+
+#[test]
+fn strict_rejects_resolver_constrained_versions_outside_selected_scope() {
+    let mut harness = ScopedConflictHarness::new().expect("scoped conflict harness should build");
+    harness.generate_lockfile();
+    let baseline_lockfile = harness.lockfile_contents();
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+
+    let output = harness.run_cooldown(None);
+    assert!(
+        !output.status.success(),
+        "strict should fail when fresh resolver-constrained versions remain: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.lockfile_contents(), baseline_lockfile);
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("strict mode blocked fresh versions"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("scopedfresh 1.0.1"), "{stderr}");
 }
 
 struct TestHarness {
@@ -875,6 +950,88 @@ struct WorkspaceMemberHarness {
     runner_dir: PathBuf,
     cargo_wrapper_log: PathBuf,
     path_with_wrapper: OsString,
+}
+
+struct ScopedConflictHarness {
+    _temp_dir: TempDir,
+    cargo_home: PathBuf,
+    workspace_dir: PathBuf,
+    _server: RegistryServer,
+}
+
+impl ScopedConflictHarness {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_root = temp_dir.path().to_path_buf();
+        let cargo_home = temp_root.join("cargo-home");
+        let workspace_dir = temp_root.join("workspace");
+        let server = RegistryServer::with_crates(
+            vec![PublishedCrate::new(
+                SCOPED_CONFLICT_NAME,
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                ],
+            )],
+            false,
+        )?;
+
+        fs::create_dir_all(&cargo_home)?;
+        create_scoped_conflict_workspace(&workspace_dir, &server)?;
+        write_registry_config(&cargo_home, &server)?;
+
+        Ok(Self {
+            _temp_dir: temp_dir,
+            cargo_home,
+            workspace_dir,
+            _server: server,
+        })
+    }
+
+    fn generate_lockfile(&mut self) {
+        let output = Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .output()
+            .expect("cargo generate-lockfile should run");
+
+        assert!(
+            output.status.success(),
+            "lockfile generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_cooldown(&self, mode: Option<&str>) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command
+            .args(["check", "--package", SCOPED_MEMBER_A])
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .env("COOLDOWN_NOW", NOW)
+            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("COOLDOWN_HTTP_RETRIES", "0")
+            .env("COOLDOWN_LOCKFILE_POLICY", "all");
+
+        if let Some(mode) = mode {
+            command.env("COOLDOWN_MODE", mode);
+        }
+
+        command.output().expect("cargo-cooldown should run")
+    }
+
+    fn lockfile_contents(&self) -> String {
+        fs::read_to_string(self.workspace_dir.join("Cargo.lock"))
+            .expect("lockfile should be readable")
+    }
+
+    fn locked_version(&self) -> String {
+        parse_lockfile_version(&self.lockfile_contents(), SCOPED_CONFLICT_NAME)
+            .expect("crate should exist in lockfile")
+    }
 }
 
 impl WorkspaceMemberHarness {
@@ -1284,6 +1441,83 @@ edition = "2024"
     )?;
 
     Ok(member_dir.join("Cargo.toml"))
+}
+
+fn create_scoped_conflict_workspace(
+    workspace_dir: &Path,
+    server: &RegistryServer,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let selected_member_dir = workspace_dir.join(SCOPED_MEMBER_A);
+    let blocking_member_dir = workspace_dir.join(SCOPED_MEMBER_B);
+    fs::create_dir_all(selected_member_dir.join("src"))?;
+    fs::create_dir_all(blocking_member_dir.join("src"))?;
+    fs::create_dir_all(workspace_dir.join(".cargo"))?;
+
+    fs::write(
+        workspace_dir.join("Cargo.toml"),
+        format!(
+            r#"[workspace]
+members = ["{SCOPED_MEMBER_A}", "{SCOPED_MEMBER_B}"]
+resolver = "3"
+"#,
+        ),
+    )?;
+    fs::write(
+        workspace_dir.join(".cargo/config.toml"),
+        format!(
+            r#"[registries.{registry_name}]
+index = "sparse+{base_url}/index/"
+"#,
+            registry_name = REGISTRY_NAME,
+            base_url = server.base_url(),
+        ),
+    )?;
+    fs::write(
+        selected_member_dir.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "{SCOPED_MEMBER_A}"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{SCOPED_CONFLICT_NAME} = {{ version = "1", registry = "{REGISTRY_NAME}" }}
+"#,
+        ),
+    )?;
+    fs::write(
+        blocking_member_dir.join("Cargo.toml"),
+        format!(
+            r#"[package]
+name = "{SCOPED_MEMBER_B}"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+{SCOPED_CONFLICT_NAME} = {{ version = "={FRESH_VERSION}", registry = "{REGISTRY_NAME}" }}
+"#,
+        ),
+    )?;
+    fs::write(
+        selected_member_dir.join("src/main.rs"),
+        format!(
+            r#"fn main() {{
+    println!("{{}}", {SCOPED_CONFLICT_NAME}::value());
+}}
+"#,
+        ),
+    )?;
+    fs::write(
+        blocking_member_dir.join("src/main.rs"),
+        format!(
+            r#"fn main() {{
+    println!("{{}}", {SCOPED_CONFLICT_NAME}::value());
+}}
+"#,
+        ),
+    )?;
+
+    Ok(())
 }
 
 fn write_cargo_wrapper(

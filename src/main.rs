@@ -8,6 +8,7 @@ mod metadata;
 mod project;
 mod registry;
 mod resolver;
+mod ui;
 
 use std::ffi::OsString;
 use std::io::Write;
@@ -322,7 +323,7 @@ fn main() -> Result<()> {
         }
         CooldownCommand::Cargo(cargo_args) => {
             let project = ProjectContext::discover_for_runtime(&cli.manifest, &cli.workspace)?;
-            let config = config::Config::load(&project);
+            let config = config::Config::load(&project)?;
             init_logging(config.verbose);
 
             let forwarded_args = assemble_cargo_args(&cli, cargo_args);
@@ -349,10 +350,10 @@ fn main() -> Result<()> {
                     ) {
                         Ok(()) => {}
                         Err(err) => match config.mode {
-                            Mode::Warn => {
-                                warn!(error = %err, "cooldown guard failed after cargo update; continuing due to warn mode");
+                            Mode::BestEffort => {
+                                warn!(error = %err, "cooldown guard failed after cargo update; continuing due to best_effort mode");
                             }
-                            Mode::Enforce => {
+                            Mode::Strict => {
                                 return Err(err);
                             }
                             Mode::Off => {}
@@ -372,10 +373,10 @@ fn main() -> Result<()> {
                 ) {
                     Ok(()) => {}
                     Err(err) => match config.mode {
-                        Mode::Warn => {
-                            warn!(error = %err, "cooldown guard failed; continuing due to warn mode");
+                        Mode::BestEffort => {
+                            warn!(error = %err, "cooldown guard failed; continuing due to best_effort mode");
                         }
-                        Mode::Enforce => {
+                        Mode::Strict => {
                             return Err(err);
                         }
                         Mode::Off => {}

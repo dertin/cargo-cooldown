@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use dirs::home_dir;
 use serde::Deserialize;
@@ -11,17 +12,20 @@ use crate::project::ProjectContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    Enforce,
-    Warn,
+    Strict,
+    BestEffort,
     Off,
 }
 
 impl Mode {
-    pub fn from_env(value: Option<&str>) -> Self {
+    pub fn parse(value: &str) -> Result<Self> {
         match value {
-            Some("warn") => Mode::Warn,
-            Some("off") => Mode::Off,
-            _ => Mode::Enforce,
+            "strict" => Ok(Mode::Strict),
+            "best_effort" => Ok(Mode::BestEffort),
+            "off" => Ok(Mode::Off),
+            _ => {
+                bail!("invalid cooldown mode `{value}`; expected one of: strict, best_effort, off")
+            }
         }
     }
 }
@@ -60,18 +64,18 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load(project: &ProjectContext) -> Self {
+    pub fn load(project: &ProjectContext) -> Result<Self> {
         let mut merged = MergedConfig::default();
 
         if let Some(path) = user_config_path() {
-            merged.apply_file(&path);
+            merged.apply_file(&path)?;
         }
-        merged.apply_file(&project.workspace_config_path());
+        merged.apply_file(&project.workspace_config_path())?;
         if let Some(path) = project.member_config_path() {
-            merged.apply_file(&path);
+            merged.apply_file(&path)?;
         }
-        merged.apply_env();
-        merged.finish()
+        merged.apply_env()?;
+        Ok(merged.finish())
     }
 }
 
@@ -115,16 +119,16 @@ struct MergedConfig {
 }
 
 impl MergedConfig {
-    fn apply_file(&mut self, path: &Path) {
+    fn apply_file(&mut self, path: &Path) -> Result<()> {
         let Some(file) = read_file_config(path) else {
-            return;
+            return Ok(());
         };
 
         if let Some(minutes) = file.data.cooldown_minutes {
             self.cooldown_minutes = Some(minutes);
         }
         if let Some(mode) = file.data.mode.as_deref() {
-            self.mode = Some(Mode::from_env(Some(mode)));
+            self.mode = Some(Mode::parse(mode)?);
         }
         if let Some(policy) = file.data.lockfile_policy.as_deref() {
             self.lockfile_policy = Some(LockfilePolicy::from_env(Some(policy)));
@@ -152,9 +156,10 @@ impl MergedConfig {
         self.allowlist.merge_from(&Allowlist {
             allow: file.data.allow.clone(),
         });
+        Ok(())
     }
 
-    fn apply_env(&mut self) {
+    fn apply_env(&mut self) -> Result<()> {
         if let Some(minutes) = env::var("COOLDOWN_MINUTES")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -162,7 +167,7 @@ impl MergedConfig {
             self.cooldown_minutes = Some(minutes);
         }
         if let Ok(value) = env::var("COOLDOWN_MODE") {
-            self.mode = Some(Mode::from_env(Some(&value)));
+            self.mode = Some(Mode::parse(&value)?);
         }
         if let Ok(value) = env::var("COOLDOWN_LOCKFILE_POLICY") {
             self.lockfile_policy = Some(LockfilePolicy::from_env(Some(&value)));
@@ -199,12 +204,13 @@ impl MergedConfig {
         if let Ok(value) = env::var("COOLDOWN_SKIP_REGISTRIES") {
             self.skip_registries = parse_registry_skip_list(&value);
         }
+        Ok(())
     }
 
     fn finish(self) -> Config {
         Config {
             cooldown_minutes: self.cooldown_minutes.unwrap_or(0),
-            mode: self.mode.unwrap_or(Mode::Enforce),
+            mode: self.mode.unwrap_or(Mode::Strict),
             lockfile_policy: self.lockfile_policy.unwrap_or(LockfilePolicy::Changed),
             now_override: self.now_override,
             ttl_seconds: self.ttl_seconds.unwrap_or(86_400),
@@ -384,7 +390,7 @@ mod tests {
             Some("crates-io, sparse+https://codeartifact.example/index , mirror"),
             || {
                 let root = TempDir::new().unwrap();
-                let config = Config::load(&project_fixture(root.path(), None));
+                let config = Config::load(&project_fixture(root.path(), None)).unwrap();
                 assert_eq!(
                     config.skip_registries,
                     vec![
@@ -401,7 +407,7 @@ mod tests {
     fn lockfile_policy_supports_all_env() {
         with_env_var("COOLDOWN_LOCKFILE_POLICY", Some("all"), || {
             let root = TempDir::new().unwrap();
-            let config = Config::load(&project_fixture(root.path(), None));
+            let config = Config::load(&project_fixture(root.path(), None)).unwrap();
             assert_eq!(config.lockfile_policy, LockfilePolicy::All);
         });
     }
@@ -410,7 +416,7 @@ mod tests {
     fn cooldown_now_parses_rfc3339_override() {
         with_env_var("COOLDOWN_NOW", Some("2026-04-03T00:00:00Z"), || {
             let root = TempDir::new().unwrap();
-            let config = Config::load(&project_fixture(root.path(), None));
+            let config = Config::load(&project_fixture(root.path(), None)).unwrap();
             assert_eq!(
                 config.now_override,
                 Some(
@@ -429,7 +435,7 @@ mod tests {
         root.child("cooldown.toml")
             .write_str(
                 r#"cooldown_minutes = 15
-mode = "warn"
+mode = "best_effort"
 lockfile_policy = "all"
 skip_registries = ["crates-io", "mirror"]
 verbose = true
@@ -441,10 +447,10 @@ version = "1.2.3"
             )
             .unwrap();
 
-        let config = Config::load(&project_fixture(root.path(), None));
+        let config = Config::load(&project_fixture(root.path(), None)).unwrap();
 
         assert_eq!(config.cooldown_minutes, 15);
-        assert_eq!(config.mode, Mode::Warn);
+        assert_eq!(config.mode, Mode::BestEffort);
         assert_eq!(config.lockfile_policy, LockfilePolicy::All);
         assert_eq!(
             config.skip_registries,
@@ -477,7 +483,7 @@ http_retries = 3
         unsafe { env::set_var("HOME", fake_home.path()) };
         unsafe { env::set_var("USERPROFILE", fake_home.path()) };
 
-        let config = Config::load(&project_fixture(root.path(), None));
+        let config = Config::load(&project_fixture(root.path(), None)).unwrap();
 
         assert_eq!(config.cooldown_minutes, 5);
         assert_eq!(config.mode, Mode::Off);
@@ -504,7 +510,7 @@ http_retries = 3
         let root = TempDir::new().unwrap();
         root.child("cooldown.toml")
             .write_str(
-                r#"mode = "warn"
+                r#"mode = "best_effort"
 lockfile_policy = "all"
 skip_registries = ["from-file"]
 "#,
@@ -519,7 +525,7 @@ skip_registries = ["from-file"]
         unsafe { env::set_var("COOLDOWN_LOCKFILE_POLICY", "changed") };
         unsafe { env::set_var("COOLDOWN_SKIP_REGISTRIES", "from-env") };
 
-        let config = Config::load(&project_fixture(root.path(), None));
+        let config = Config::load(&project_fixture(root.path(), None)).unwrap();
         assert_eq!(config.mode, Mode::Off);
         assert_eq!(config.lockfile_policy, LockfilePolicy::Changed);
         assert_eq!(config.skip_registries, vec!["from-env".to_string()]);
@@ -539,22 +545,56 @@ skip_registries = ["from-file"]
     }
 
     #[test]
+    fn rejects_legacy_warn_mode_value() {
+        let _guard = env_lock().lock().unwrap();
+        let root = TempDir::new().unwrap();
+        root.child("cooldown.toml")
+            .write_str(r#"mode = "warn""#)
+            .unwrap();
+
+        let err = Config::load(&project_fixture(root.path(), None)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid cooldown mode `warn`"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_enforce_mode_value_from_env() {
+        let _guard = env_lock().lock().unwrap();
+        let root = TempDir::new().unwrap();
+        let original_mode = env::var("COOLDOWN_MODE").ok();
+        unsafe { env::set_var("COOLDOWN_MODE", "enforce") };
+
+        let err = Config::load(&project_fixture(root.path(), None)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid cooldown mode `enforce`"),
+            "{err:#}"
+        );
+
+        match original_mode {
+            Some(val) => unsafe { env::set_var("COOLDOWN_MODE", val) },
+            None => unsafe { env::remove_var("COOLDOWN_MODE") },
+        }
+    }
+
+    #[test]
     fn uppercase_keys_are_supported_for_backwards_compat() {
         let _guard = env_lock().lock().unwrap();
         let root = TempDir::new().unwrap();
         root.child("cooldown.toml")
             .write_str(
                 r#"COOLDOWN_MINUTES = 9
-COOLDOWN_MODE = "warn"
+COOLDOWN_MODE = "best_effort"
 COOLDOWN_LOCKFILE_POLICY = "all"
 COOLDOWN_SKIP_REGISTRIES = "crates-io,mirror"
 "#,
             )
             .unwrap();
 
-        let config = Config::load(&project_fixture(root.path(), None));
+        let config = Config::load(&project_fixture(root.path(), None)).unwrap();
         assert_eq!(config.cooldown_minutes, 9);
-        assert_eq!(config.mode, Mode::Warn);
+        assert_eq!(config.mode, Mode::BestEffort);
         assert_eq!(config.lockfile_policy, LockfilePolicy::All);
         assert_eq!(
             config.skip_registries,
@@ -599,7 +639,7 @@ version = "1.2.3"
             )
             .unwrap();
 
-        let config = Config::load(&project_fixture(root.path(), Some(member_dir.path())));
+        let config = Config::load(&project_fixture(root.path(), Some(member_dir.path()))).unwrap();
 
         assert_eq!(config.cooldown_minutes, 5);
         assert_eq!(

@@ -69,8 +69,11 @@ contain the values that genuinely differ from the workspace defaults.
 `verbose = true` enables `DEBUG` logs for cooldown internals such as release-age
 inspection, candidate selection, and per-pass scan summaries. User-facing
 output stays compact: repeated pin attempts stay in `DEBUG`, and cooldown ends
-with one summary block that lists the versions it cooled plus any fresh
+with one summary block that merges the net `Cargo.lock` changes from `cargo
+update` with any cooldown adjustments in a Cargo-style format, plus any fresh
 versions that had to remain.
+When stderr is an interactive terminal, cooldown also shows a resolver progress
+bar and colored status labels.
 
 `skip_registries` can be written as:
 
@@ -82,6 +85,28 @@ skip_registries = ["crates-io", "sparse+https://example.com/index/"]
 
 ```bash
 COOLDOWN_SKIP_REGISTRIES=crates-io,sparse+https://example.com/index/
+```
+
+## `mode`
+
+`mode` controls the guarantee level of the cooldown run:
+
+- `strict` (default): if cooldown cannot eliminate every fresh version that was
+  newly introduced or updated in this run, it fails and restores the original
+  `Cargo.lock`
+- `best_effort`: cooldown keeps any remaining resolver-constrained fresh
+  versions, writes the resulting lockfile, and prints one final warning listing
+  them
+- `off`: skip cooldown entirely
+
+Examples:
+
+```toml
+mode = "strict"
+```
+
+```bash
+COOLDOWN_MODE=best_effort cargo cooldown update
 ```
 
 ## Allow rules
@@ -185,8 +210,8 @@ COOLDOWN_LOCKFILE_POLICY=all cargo cooldown check
   valid pin target even if it is still inside the cooldown window
 - if cooling one of those newly updated versions would require degrading
   baseline-protected, already exhausted earlier in the run, or otherwise
-  cooldown-exempt dependencies, cooldown keeps the fresh version, warns, and
-  continues best-effort on the rest of the graph
+  cooldown-exempt dependencies, `best_effort` keeps the fresh version and warns
+  at the end, while `strict` fails and restores the original lockfile
 
 For `build`, `check`, `test`, or `run`, Cargo usually reuses the existing
 lockfile. Those commands do not proactively refresh dependencies on their own.

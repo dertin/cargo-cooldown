@@ -9,7 +9,7 @@ The authoritative automated suite lives in `./tests`.
 - default baseline behavior for unchanged lockfile entries
 - opt-in `lockfile_policy = "all"` behavior
 - fail-closed behavior for registries without release-time metadata
-- `warn` mode behavior for the same condition
+- `best_effort` mode behavior for the same condition
 - `skip_registries` by name and by URL
 
 ## How the deterministic suite works

@@ -39,7 +39,7 @@ flowchart TD
     Applied -->|Yes| Metadata
     Applied -->|No, blockers found| Requeue[Requeue blockers]
     Requeue --> PinLoop
-    Applied -->|No, no candidate| Fail([Fail or warn by mode])
+    Applied -->|No, no candidate| Fail([Fail by policy])
 ```
 
 ## 1. Execution boundary
@@ -87,7 +87,7 @@ That means `cargo cooldown update` has this exact shape:
 5. pin only the newly introduced or version-changed fresh entries, but allow
    them to return to an exact version from the original snapshot even if that
    baseline version is still fresher than the cutoff;
-6. if the cooldown step fails in `enforce` mode, restore the original lockfile.
+6. if the cooldown step fails in `strict` mode, restore the original lockfile.
 
 ## 2. Graph scan and release-age inspection
 
@@ -123,8 +123,8 @@ The age inspection itself works like this:
    re-inspected after later pins.
 
 If a package is not skipped and still lacks a usable timestamp after local
-index plus fallback, the cooldown step fails in `enforce` mode and becomes a
-warning in `warn` mode.
+index plus fallback, the cooldown step fails in `strict` mode and becomes a
+warning in `best_effort` mode.
 
 ## 3. Candidate selection and pin loop
 
@@ -177,13 +177,22 @@ result. This helps for tightly coupled stacks such as `js-sys` /
 progress from the current lockfile but a coordinated older bundle is still
 valid.
 
-At the end of the run, cooldown emits one user-facing summary block. It lists
-the versions that were actually cooled during the run, and if fresh versions
-still remain it also distinguishes between:
+At the end of the run, cooldown emits one user-facing summary block. For cooled
+packages, it renders Cargo-style lines from the initial `Cargo.lock` version to
+the final frozen version, and appends `(latest: ...)` when the run first moved
+through a fresher version. If fresh versions still remain it also distinguishes
+between:
 
 - versions that were already present in the initial `Cargo.lock` baseline; and
 - versions that the resolver had to keep fresh because no further compatible
   cooldown pin was possible in this run.
+
+That final distinction also drives the mode policy:
+
+- `strict` fails if any resolver-constrained fresh versions remain and restores
+  the original lockfile
+- `best_effort` keeps the resulting lockfile and prints one warning block with
+  those remaining fresh versions
 
 That is the main remaining cost today: the resolved graph is still rebuilt after
 each successful pin, even though the registry timelines and many locked-version

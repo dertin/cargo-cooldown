@@ -76,10 +76,17 @@ and discovers the fallback HTTP API from that registry index.
 
 `COOLDOWN_OFFLINE_OK` no longer exists.
 
-If you want cooldown failures to be downgraded to warnings, use:
+`mode` now accepts only:
+
+- `strict`
+- `best_effort`
+- `off`
+
+If you want cooldown failures to be downgraded to warnings and keep a
+best-effort lockfile, use:
 
 ```bash
-COOLDOWN_MODE=warn
+COOLDOWN_MODE=best_effort
 ```
 
 If you want a registry to be excluded from cooldown entirely, use
@@ -98,7 +105,7 @@ If you want a registry to be excluded from cooldown entirely, use
 5. Move allow rules into `cooldown.toml`.
 6. Add `skip_registries` or `COOLDOWN_SKIP_REGISTRIES` for any registry that
    should not participate in cooldown.
-7. If you relied on best-effort behavior, switch to `COOLDOWN_MODE=warn`.
+7. If you relied on best-effort behavior, switch to `COOLDOWN_MODE=best_effort`.
 
 ## Internal registries
 
@@ -110,8 +117,8 @@ per-crate HTTP only when `pubtime` is missing.
 
 If an internal registry still cannot provide timestamps:
 
-- `enforce` mode fails closed;
-- `warn` mode emits a warning and continues;
+- `strict` mode fails closed;
+- `best_effort` mode emits a warning and continues;
 - `off` mode disables cooldown entirely.
 
 For registries such as CodeArtifact, the practical migration path is usually:
@@ -147,4 +154,4 @@ See also:
 - no `cooldown-allowlist.toml`, `allowlist_path`, or
   `COOLDOWN_ALLOWLIST_PATH` references remain;
 - registries that should be excluded are listed in `skip_registries`;
-- flows that expect best-effort behavior use `COOLDOWN_MODE=warn`.
+- flows that expect best-effort behavior use `COOLDOWN_MODE=best_effort`.

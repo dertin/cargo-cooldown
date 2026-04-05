@@ -38,8 +38,8 @@ Migration guide:
   member overrides only for uniquely targeted workspace members
 - repeated outer-loop scans now reuse in-memory registry timelines and locked
   version age inspections within one cooldown execution
-- missing release-time metadata is fail-closed in `enforce` mode and downgraded
-  to warnings only in `warn` mode
+- missing release-time metadata is fail-closed in `strict` mode and downgraded
+  to warnings only in `best_effort` mode
 - `verbose = true` / `COOLDOWN_VERBOSE=true` now surfaces cooldown internals as
   `DEBUG` logs while keeping user-facing `INFO`/`WARN` output compact
 
@@ -52,6 +52,7 @@ Migration guide:
   `COOLDOWN_ALLOWLIST_PATH` were removed in favor of one `cooldown.toml`
 - default cooldown behavior now respects the initial `Cargo.lock` baseline
   unless `lockfile_policy = "all"` is enabled
+- `mode` now accepts only `strict`, `best_effort`, or `off`
 
 ### Fixed
 
@@ -68,7 +69,9 @@ Migration guide:
   exhausted earlier in the run as best-effort skips instead of failing
   later with a generic fixed-point error
 - cooldown now emits a single final warning when fresh versions remain,
-  distinguishing baseline-carried versions from resolver-constrained ones
+  distinguishing baseline-carried versions from resolver-constrained ones, and
+  `strict` now turns remaining resolver-constrained fresh versions into a
+  rollback error instead of allowing them through
 - cooldown now makes one bounded coordinated bundle attempt for small
   resolver-constrained groups, which helps cool tightly coupled crates such as
   `js-sys` / `wasm-bindgen*` / `web-sys` when individual pins cannot progress

@@ -80,7 +80,10 @@ Supported `cooldown.toml` keys:
 
 Set `verbose = true` when you want `DEBUG` logs for cooldown internals. Normal
 user-facing output stays compact: cooldown prints one final summary block with
-cooled versions and any fresh versions that had to remain.
+Cargo-style version lines that merge the net `Cargo.lock` changes from `cargo
+update` with any cooldown adjustments, plus any fresh versions that had to
+remain. On interactive terminals, cooldown also shows a resolver progress bar
+and colored Cargo-style status labels.
 
 Define allow rules in `cooldown.toml`:
 
@@ -128,8 +131,20 @@ Those packages are left untouched, but they still contribute semver constraints
 to the overall graph.
 
 If a registry is not skipped and `cargo-cooldown` cannot determine release age
-from the local index or the registry API, the cooldown step fails in `enforce`
-mode and becomes a warning in `warn` mode.
+from the local index or the registry API, the cooldown step fails in `strict`
+mode and becomes a warning in `best_effort` mode.
+
+`mode` accepts exactly these values:
+
+- `strict`
+  requires the final lockfile to satisfy cooldown for every newly introduced or
+  updated registry version; if resolver-constrained fresh versions remain,
+  cooldown fails and restores the original `Cargo.lock`
+- `best_effort`
+  cools as much of the graph as possible, keeps any remaining
+  resolver-constrained fresh versions, and reports them at the end
+- `off`
+  disables cooldown entirely
 
 `cargo-cooldown` supports two different workflows:
 

@@ -20,7 +20,7 @@ fn init_creates_cooldown_toml_for_crate_root() {
     let config = fs::read_to_string(temp_dir.path().join("cooldown.toml"))
         .expect("init should create cooldown.toml");
     assert!(config.contains("cooldown_minutes = 1440"));
-    assert!(config.contains("mode = \"enforce\""));
+    assert!(config.contains("mode = \"strict\""));
     assert!(config.contains("lockfile_policy = \"changed\""));
     assert!(config.contains("[allow.global]"));
 }
@@ -77,7 +77,7 @@ fn init_refuses_to_overwrite_existing_config() {
     let temp_dir = tempdir().expect("tempdir should be creatable");
     write_crate_fixture(temp_dir.path());
     let config_path = temp_dir.path().join("cooldown.toml");
-    fs::write(&config_path, "mode = \"warn\"\n").expect("fixture config should be writable");
+    fs::write(&config_path, "mode = \"best_effort\"\n").expect("fixture config should be writable");
 
     let output = run_init(temp_dir.path(), "\n\n\n\n\n\n");
     assert!(
@@ -91,7 +91,7 @@ fn init_refuses_to_overwrite_existing_config() {
     );
     assert_eq!(
         fs::read_to_string(&config_path).expect("existing config should still exist"),
-        "mode = \"warn\"\n"
+        "mode = \"best_effort\"\n"
     );
 }
 

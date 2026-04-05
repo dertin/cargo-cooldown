@@ -130,7 +130,7 @@ fn build_workspace_plan(project: &ProjectContext) -> Result<InitPlan> {
 
 fn prompt_base_template() -> Result<ConfigTemplate> {
     let cooldown_minutes = prompt_u64("Cooldown minutes", 1440)?;
-    let mode = select_mode("Mode", "enforce")?;
+    let mode = select_mode("Mode", "strict")?;
     let lockfile_policy = select_lockfile_policy("Lockfile policy", "changed")?;
     let skip_registries =
         prompt_registry_list("Registries to skip (comma-separated, leave blank for none)")?;
@@ -419,7 +419,7 @@ fn prompt_multi_select(prompt: &str, options: &[ProjectMember]) -> Result<Vec<Pr
 }
 
 fn select_mode(prompt: &str, default: &str) -> Result<String> {
-    let options = ["enforce", "warn", "off"];
+    let options = ["strict", "best_effort", "off"];
     let default_index = options
         .iter()
         .position(|value| *value == default)
@@ -434,8 +434,10 @@ fn select_optional_mode(prompt: &str) -> Result<Option<String>> {
             return Ok(None);
         }
         match input.as_str() {
-            "enforce" | "warn" | "off" => return Ok(Some(input)),
-            _ => eprintln!("Please enter one of: enforce, warn, off, or leave the field blank."),
+            "strict" | "best_effort" | "off" => return Ok(Some(input)),
+            _ => eprintln!(
+                "Please enter one of: strict, best_effort, off, or leave the field blank."
+            ),
         }
     }
 }
@@ -493,7 +495,7 @@ mod tests {
         let rendered = render_config_file(
             &ConfigTemplate {
                 cooldown_minutes: Some(1440),
-                mode: Some("enforce".to_string()),
+                mode: Some("strict".to_string()),
                 lockfile_policy: Some("changed".to_string()),
                 skip_registries: vec!["crates-io".to_string()],
                 include_allow_examples: true,

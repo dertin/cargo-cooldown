@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -75,6 +75,19 @@ impl LockfileBaseline {
         self.packages
             .contains(&LockfilePackageKey::new(name, registry, version))
     }
+
+    pub fn version_inventory(&self) -> BTreeMap<(String, String), Vec<String>> {
+        let mut inventory = BTreeMap::new();
+
+        for package in &self.packages {
+            inventory
+                .entry((package.name.clone(), package.registry.clone()))
+                .or_insert_with(Vec::new)
+                .push(package.version.clone());
+        }
+
+        inventory
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -119,7 +132,7 @@ mod tests {
     fn config_fixture() -> Config {
         Config {
             cooldown_minutes: 60,
-            mode: Mode::Enforce,
+            mode: Mode::Strict,
             lockfile_policy: LockfilePolicy::Changed,
             now_override: None,
             ttl_seconds: 60,

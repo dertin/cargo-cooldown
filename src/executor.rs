@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,7 +10,7 @@ use chrono::{DateTime, Utc};
 use semver::{Op, Version, VersionReq};
 use tracing::debug;
 
-use crate::config::Config;
+use crate::config::{Config, Mode};
 use crate::lockfile::LockfileSnapshot;
 use crate::metadata::{read_metadata, read_metadata_locked};
 use crate::registry::{
@@ -19,6 +20,7 @@ use crate::registry::{
 use crate::resolver::{
     PinOutcome, cutoff_time, is_release_fresh, select_candidate, select_candidates, try_pin_precise,
 };
+use crate::ui::{StatusKind, UserOutput, format_status_line};
 use clap_cargo::{Features, Manifest, Workspace};
 
 const MAX_COORDINATED_COMPONENT_SIZE: usize = 8;
@@ -63,6 +65,7 @@ pub fn run_pinning_flow_with_snapshot(
     let global_minutes = allowlist.global_minutes();
     let mut registry_store = RegistryStore::new(config)?;
     let lockfile_path = workspace_lockfile_path(manifest)?;
+    let mut ui = UserOutput::new(config.verbose);
     let result = (|| {
         // Missing lockfiles are created only after the initial snapshot exists, so the
         // default policy always compares against the pre-run lockfile state.
@@ -72,9 +75,12 @@ pub fn run_pinning_flow_with_snapshot(
         let mut best_effort_skips: HashMap<String, String> = HashMap::new();
         let mut constraint_edges: HashMap<String, HashSet<String>> = HashMap::new();
         let mut inspection_cache: HashMap<ReleaseInspectionKey, ReleaseInspection> = HashMap::new();
-        let mut cooldown_start_inventory: Option<VersionInventory> = None;
+        let cooldown_start_lockfile =
+            LockfileSnapshot::capture(&lockfile_path, &mut registry_store)?;
+        let mut pass = 0usize;
 
         'outer: loop {
+            pass += 1;
             // After each successful pin we rebuild cargo metadata from scratch so every
             // decision in this pass reflects the current lockfile and resolved graph.
             let metadata = read_metadata(manifest, features)?;
@@ -82,7 +88,7 @@ pub fn run_pinning_flow_with_snapshot(
                 .resolve
                 .clone()
                 .context("cargo metadata output did not include a resolved dependency graph")?;
-            // When the user targets a package/workspace subset, only enforce cooldown on
+            // When the user targets a package/workspace subset, only apply cooldown to
             // the dependency closure reachable from those selected roots.
             let selected_root_ids = selected_package_ids(&metadata, workspace);
             let reachable_ids = reachable_package_ids(&resolve, &selected_root_ids);
@@ -162,8 +168,6 @@ pub fn run_pinning_flow_with_snapshot(
                 let state = CrateState {
                     name: pkg.name.to_string(),
                     source_id: source.repr.clone(),
-                    registry_id: context.effective_index_url.clone(),
-                    registry_name: context.logical_name.clone(),
                     current_version: current_version.clone(),
                     minimum_minutes,
                     exact_allowed,
@@ -242,10 +246,6 @@ pub fn run_pinning_flow_with_snapshot(
                 }
             }
 
-            if cooldown_start_inventory.is_none() {
-                cooldown_start_inventory = Some(collect_version_inventory(&crate_states));
-            }
-
             // Keep best-effort decisions only for crate versions that are still fresh in the
             // current lockfile. If a successful pin changes a crate version, the next pass
             // should reconsider the new version instead of inheriting stale skip state.
@@ -262,6 +262,12 @@ pub fn run_pinning_flow_with_snapshot(
                 scan_summary.skipped,
                 scan_summary.exact_allowed,
                 scan_summary.zero_minutes,
+            );
+            ui.update_resolver_progress(
+                pass,
+                scan_summary.registry_packages,
+                scan_summary.inspected,
+                scan_summary.fresh + scan_summary.best_effort_skipped,
             );
 
             if fresh_entries.is_empty() {
@@ -284,17 +290,22 @@ pub fn run_pinning_flow_with_snapshot(
                 {
                     continue 'outer;
                 }
+                ui.finish_progress();
+                let final_lockfile =
+                    LockfileSnapshot::capture(&lockfile_path, &mut registry_store)?;
                 emit_final_run_summary(
-                    cooldown_start_inventory
-                        .as_ref()
-                        .expect("cooldown start inventory should be captured on the first pass"),
+                    &ui,
+                    config,
+                    &initial_lockfile,
+                    &cooldown_start_lockfile,
+                    &final_lockfile,
                     &crate_states,
                     &mut registry_store,
                     &mut inspection_cache,
                     &best_effort_skips,
                     now,
                     success_message,
-                );
+                )?;
                 break;
             }
 
@@ -575,6 +586,8 @@ pub fn run_pinning_flow_with_snapshot(
         Ok(())
     })();
 
+    ui.finish_progress();
+
     if let Err(err) = result {
         if let Err(restore_err) = initial_lockfile.restore(&lockfile_path) {
             return Err(restore_err.context(format!("original cooldown error: {err:#}")));
@@ -615,10 +628,34 @@ struct FreshVersionNotice {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct CooledVersionNotice {
+    action: CooledVersionAction,
     name: String,
-    from_version: String,
-    to_version: String,
+    from_version: Option<String>,
+    to_version: Option<String>,
+    latest_version: Option<String>,
     registry: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum CooledVersionAction {
+    Adding,
+    Cooling,
+    Downgrading,
+    Keeping,
+    Removing,
+    Updating,
+}
+
+impl CooledVersionAction {
+    fn status_kind(&self) -> StatusKind {
+        match self {
+            Self::Adding => StatusKind::Adding,
+            Self::Cooling | Self::Updating => StatusKind::Updating,
+            Self::Downgrading => StatusKind::Downgrading,
+            Self::Keeping => StatusKind::Keeping,
+            Self::Removing => StatusKind::Removing,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -637,17 +674,25 @@ struct FinalFreshReport {
 }
 
 fn emit_final_run_summary(
-    cooldown_start_inventory: &VersionInventory,
+    ui: &UserOutput,
+    config: &Config,
+    initial_lockfile: &LockfileSnapshot,
+    cooldown_start_lockfile: &LockfileSnapshot,
+    final_lockfile: &LockfileSnapshot,
     crate_states: &HashMap<PackageId, CrateState>,
     registry_store: &mut RegistryStore,
     inspection_cache: &mut HashMap<ReleaseInspectionKey, ReleaseInspection>,
     best_effort_skips: &HashMap<String, String>,
     now: DateTime<Utc>,
     success_message: &str,
-) {
+) -> Result<()> {
+    let baseline_inventory = collect_snapshot_inventory(initial_lockfile);
+    let cooldown_start_inventory = collect_snapshot_inventory(cooldown_start_lockfile);
+    let final_inventory = collect_snapshot_inventory(final_lockfile);
     let cooled_versions = collect_cooled_versions(
-        cooldown_start_inventory,
-        &collect_version_inventory(crate_states),
+        &baseline_inventory,
+        &cooldown_start_inventory,
+        &final_inventory,
     );
     let mut report = FinalFreshReport::default();
     let mut baseline_seen = HashSet::new();
@@ -713,17 +758,33 @@ fn emit_final_run_summary(
 
     report.baseline_fresh.sort();
     report.resolver_constrained_fresh.sort();
-    emit_final_summary(&cooled_versions, &report, success_message);
+
+    enforce_final_report_policy(config.mode, &report)?;
+
+    emit_final_summary(ui, &cooled_versions, &report, success_message);
+    Ok(())
+}
+
+fn enforce_final_report_policy(mode: Mode, report: &FinalFreshReport) -> Result<()> {
+    if matches!(mode, Mode::Strict) && !report.resolver_constrained_fresh.is_empty() {
+        bail!(
+            "strict mode blocked fresh versions that could not be cooled further:\n{}",
+            format_fresh_notice_list(&report.resolver_constrained_fresh).join("\n")
+        );
+    }
+
+    Ok(())
 }
 
 fn emit_final_summary(
+    ui: &UserOutput,
     cooled_versions: &[CooledVersionNotice],
     report: &FinalFreshReport,
     success_message: &str,
 ) {
     eprintln!(
         "{}",
-        format_final_user_summary(cooled_versions, report, success_message)
+        format_final_user_summary(cooled_versions, report, success_message, ui.use_color())
     );
 }
 
@@ -731,43 +792,43 @@ fn format_final_user_summary(
     cooled_versions: &[CooledVersionNotice],
     report: &FinalFreshReport,
     success_message: &str,
+    use_color: bool,
 ) -> String {
     let mut lines = Vec::new();
 
     if !cooled_versions.is_empty() {
-        lines.push("cooled versions:".to_string());
-        lines.extend(cooled_versions.iter().map(|entry| {
-            format!(
-                "  - {} {} -> {} @ {}",
-                entry.name, entry.from_version, entry.to_version, entry.registry
-            )
-        }));
+        lines.extend(
+            cooled_versions
+                .iter()
+                .map(|entry| format_cooled_version_notice(entry, use_color)),
+        );
     }
 
-    lines.extend(format_final_fresh_warning(report));
-    lines.push(success_message.to_string());
+    lines.extend(format_final_fresh_warning(report, use_color));
+    lines.push(format_status_line(
+        StatusKind::Finished,
+        success_message,
+        use_color,
+    ));
     lines.join("\n")
 }
 
-fn format_final_fresh_warning(report: &FinalFreshReport) -> Vec<String> {
-    if report.baseline_fresh.is_empty() && report.resolver_constrained_fresh.is_empty() {
+fn format_final_fresh_warning(report: &FinalFreshReport, use_color: bool) -> Vec<String> {
+    if report.resolver_constrained_fresh.is_empty() {
         return Vec::new();
     }
 
-    let mut lines = vec!["cooldown finished with fresh versions remaining.".to_string()];
+    let mut lines = vec![format_status_line(
+        StatusKind::Warning,
+        "cooldown finished with fresh versions remaining.",
+        use_color,
+    )];
 
-    if !report.baseline_fresh.is_empty() {
-        lines.push("initial Cargo.lock baseline (already installed, lower risk):".to_string());
-        lines.extend(format_fresh_notice_list(&report.baseline_fresh));
-    }
-
-    if !report.resolver_constrained_fresh.is_empty() {
-        lines.push(
-            "resolver-constrained versions that could not be cooled further (review these):"
-                .to_string(),
-        );
-        lines.extend(format_fresh_notice_list(&report.resolver_constrained_fresh));
-    }
+    lines.push(
+        "resolver-constrained versions that could not be cooled further (review these):"
+            .to_string(),
+    );
+    lines.extend(format_fresh_notice_list(&report.resolver_constrained_fresh));
 
     lines
 }
@@ -775,39 +836,45 @@ fn format_final_fresh_warning(report: &FinalFreshReport) -> Vec<String> {
 fn format_fresh_notice_list(entries: &[FreshVersionNotice]) -> Vec<String> {
     entries
         .iter()
-        .map(|entry| format!("{} {} @ {}", entry.name, entry.version, entry.registry))
-        .map(|entry| format!("  - {entry}"))
+        .map(|entry| {
+            format!(
+                "{} {}{}",
+                entry.name,
+                entry.version,
+                registry_suffix(&entry.registry)
+            )
+        })
+        .map(|entry| format!("      - {entry}"))
         .collect()
 }
 
-fn collect_version_inventory(crate_states: &HashMap<PackageId, CrateState>) -> VersionInventory {
+fn collect_snapshot_inventory(snapshot: &LockfileSnapshot) -> VersionInventory {
     let mut inventory = VersionInventory::new();
 
-    for state in crate_states.values() {
-        inventory
-            .entry(InventoryKey {
-                name: state.name.clone(),
-                registry_id: state.registry_id.clone(),
-                registry: state.registry_name.clone(),
-            })
-            .or_default()
-            .push(state.current_version.clone());
-    }
-
-    for versions in inventory.values_mut() {
+    for ((name, registry_id), mut versions) in snapshot.baseline().version_inventory() {
         versions.sort_by(compare_versions_desc);
+        inventory.insert(
+            InventoryKey {
+                name,
+                registry: default_registry_display_name(&registry_id),
+                registry_id,
+            },
+            versions,
+        );
     }
 
     inventory
 }
 
 fn collect_cooled_versions(
+    baseline_inventory: &VersionInventory,
     start_inventory: &VersionInventory,
     end_inventory: &VersionInventory,
 ) -> Vec<CooledVersionNotice> {
     let mut notices = Vec::new();
-    let mut keys = start_inventory
+    let mut keys = baseline_inventory
         .keys()
+        .chain(start_inventory.keys())
         .chain(end_inventory.keys())
         .cloned()
         .collect::<Vec<_>>();
@@ -815,24 +882,257 @@ fn collect_cooled_versions(
     keys.dedup();
 
     for key in keys {
-        let mut removed = inventory_difference(start_inventory.get(&key), end_inventory.get(&key));
-        let mut added = inventory_difference(end_inventory.get(&key), start_inventory.get(&key));
+        let baseline_versions = baseline_inventory.get(&key);
+        let start_versions = start_inventory.get(&key);
+        let end_versions = end_inventory.get(&key);
 
-        removed.sort_by(compare_versions_desc);
-        added.sort_by(compare_versions_desc);
+        if inventory_has_multiple_versions(baseline_versions)
+            || inventory_has_multiple_versions(start_versions)
+            || inventory_has_multiple_versions(end_versions)
+        {
+            notices.extend(collect_multi_version_notices(
+                &key,
+                baseline_versions,
+                start_versions,
+                end_versions,
+            ));
+            continue;
+        }
 
-        for (from_version, to_version) in removed.into_iter().zip(added.into_iter()) {
-            notices.push(CooledVersionNotice {
+        let baseline_version = singleton_inventory_version(baseline_versions);
+        let start_version = singleton_inventory_version(start_versions);
+        let end_version = singleton_inventory_version(end_versions);
+
+        match (baseline_version, end_version) {
+            (Some(from_version), Some(to_version)) => {
+                let latest_annotation = start_version.filter(|version| version != &to_version);
+                let action = classify_cooled_version_action(&from_version, &to_version);
+                if action == CooledVersionAction::Keeping && latest_annotation.is_none() {
+                    continue;
+                }
+                notices.push(CooledVersionNotice {
+                    action,
+                    name: key.name.clone(),
+                    from_version: Some(from_version),
+                    to_version: Some(to_version),
+                    latest_version: latest_annotation,
+                    registry: key.registry.clone(),
+                });
+            }
+            (None, Some(to_version)) => notices.push(CooledVersionNotice {
+                action: CooledVersionAction::Adding,
                 name: key.name.clone(),
-                from_version,
-                to_version,
+                from_version: None,
+                to_version: Some(to_version.clone()),
+                latest_version: start_version.filter(|version| version != &to_version),
+                registry: key.registry.clone(),
+            }),
+            (Some(from_version), None) => notices.push(CooledVersionNotice {
+                action: CooledVersionAction::Removing,
+                name: key.name.clone(),
+                from_version: Some(from_version),
+                to_version: None,
+                latest_version: None,
+                registry: key.registry.clone(),
+            }),
+            (None, None) => {}
+        }
+    }
+
+    notices.sort_by(compare_cooled_version_notice);
+    notices
+}
+
+fn format_cooled_version_notice(entry: &CooledVersionNotice, use_color: bool) -> String {
+    let mut line = match entry.action {
+        CooledVersionAction::Adding => format!(
+            "{} {}",
+            entry.name,
+            prefixed_version(
+                entry
+                    .to_version
+                    .as_deref()
+                    .expect("adding notice should include a target version"),
+            )
+        ),
+        CooledVersionAction::Keeping => format!(
+            "{} {}",
+            entry.name,
+            entry
+                .to_version
+                .as_deref()
+                .expect("keeping notice should include a target version")
+        ),
+        CooledVersionAction::Removing => format!(
+            "{} {}",
+            entry.name,
+            prefixed_version(
+                entry
+                    .from_version
+                    .as_deref()
+                    .expect("removing notice should include a source version"),
+            )
+        ),
+        _ => format!(
+            "{} {} -> {}",
+            entry.name,
+            prefixed_version(
+                entry
+                    .from_version
+                    .as_deref()
+                    .expect("changing notice should include a source version"),
+            ),
+            prefixed_version(
+                entry
+                    .to_version
+                    .as_deref()
+                    .expect("changing notice should include a target version"),
+            )
+        ),
+    };
+
+    if let Some(latest_version) = &entry.latest_version {
+        let _ = write!(line, " (latest: {})", prefixed_version(latest_version));
+    }
+
+    line.push_str(&registry_suffix(&entry.registry));
+    format_status_line(entry.action.status_kind(), &line, use_color)
+}
+
+fn collect_multi_version_notices(
+    key: &InventoryKey,
+    baseline_inventory: Option<&Vec<String>>,
+    start_inventory: Option<&Vec<String>>,
+    end_inventory: Option<&Vec<String>>,
+) -> Vec<CooledVersionNotice> {
+    let mut notices = Vec::new();
+
+    let mut removed = inventory_difference(baseline_inventory, end_inventory);
+    removed.sort_by(compare_versions_asc);
+    notices.extend(removed.into_iter().map(|from_version| CooledVersionNotice {
+        action: CooledVersionAction::Removing,
+        name: key.name.clone(),
+        from_version: Some(from_version),
+        to_version: None,
+        latest_version: None,
+        registry: key.registry.clone(),
+    }));
+
+    let mut added = inventory_difference(end_inventory, baseline_inventory);
+    added.sort_by(compare_versions_asc);
+    notices.extend(added.into_iter().map(|to_version| CooledVersionNotice {
+        action: CooledVersionAction::Adding,
+        name: key.name.clone(),
+        from_version: None,
+        to_version: Some(to_version),
+        latest_version: None,
+        registry: key.registry.clone(),
+    }));
+
+    let mut latest_removed = inventory_difference(start_inventory, end_inventory);
+    latest_removed.sort_by(compare_versions_asc);
+    let mut latest_by_lane: BTreeMap<(u64, u64, u64), VecDeque<String>> = BTreeMap::new();
+    for version in latest_removed {
+        if let Some(lane) = parsed_version_lane(&version) {
+            latest_by_lane.entry(lane).or_default().push_back(version);
+        }
+    }
+
+    let mut preserved = inventory_preserved_counts(baseline_inventory, end_inventory);
+    let mut preserved_versions = end_inventory
+        .into_iter()
+        .flatten()
+        .filter_map(|version| take_preserved_version(&mut preserved, version))
+        .collect::<Vec<_>>();
+    preserved_versions.sort_by(compare_versions_asc);
+
+    for to_version in preserved_versions {
+        let Some(lane) = parsed_version_lane(&to_version) else {
+            continue;
+        };
+        let latest_version = latest_by_lane
+            .get_mut(&lane)
+            .and_then(VecDeque::pop_front)
+            .filter(|version| version != &to_version);
+        if let Some(latest_version) = latest_version {
+            notices.push(CooledVersionNotice {
+                action: CooledVersionAction::Keeping,
+                name: key.name.clone(),
+                from_version: Some(to_version.clone()),
+                to_version: Some(to_version),
+                latest_version: Some(latest_version),
                 registry: key.registry.clone(),
             });
         }
     }
 
-    notices.sort();
     notices
+}
+
+fn parsed_version_lane(version: &str) -> Option<(u64, u64, u64)> {
+    let parsed = Version::parse(version).ok()?;
+    Some(version_lane_key(&parsed))
+}
+
+fn singleton_inventory_version(inventory: Option<&Vec<String>>) -> Option<String> {
+    let mut iter = inventory.into_iter().flatten();
+    let version = iter.next()?.clone();
+    if iter.next().is_some() {
+        return None;
+    }
+    Some(version)
+}
+
+fn inventory_has_multiple_versions(inventory: Option<&Vec<String>>) -> bool {
+    inventory.is_some_and(|versions| versions.len() > 1)
+}
+
+fn version_lane_key(version: &Version) -> (u64, u64, u64) {
+    match (version.major, version.minor) {
+        (major, _) if major > 0 => (major, 0, 0),
+        (0, minor) if minor > 0 => (0, minor, 0),
+        (0, 0) => (0, 0, version.patch),
+        _ => (version.major, version.minor, version.patch),
+    }
+}
+
+fn inventory_preserved_counts(
+    left: Option<&Vec<String>>,
+    right: Option<&Vec<String>>,
+) -> HashMap<String, usize> {
+    let mut left_counts = HashMap::new();
+    for version in left.into_iter().flatten() {
+        *left_counts.entry(version.clone()).or_insert(0) += 1;
+    }
+
+    let mut right_counts = HashMap::new();
+    for version in right.into_iter().flatten() {
+        *right_counts.entry(version.clone()).or_insert(0) += 1;
+    }
+
+    let mut preserved = HashMap::new();
+    for (version, left_count) in left_counts {
+        if let Some(right_count) = right_counts.get(&version) {
+            let count = left_count.min(*right_count);
+            if count > 0 {
+                preserved.insert(version, count);
+            }
+        }
+    }
+
+    preserved
+}
+
+fn take_preserved_version(
+    preserved_counts: &mut HashMap<String, usize>,
+    version: &str,
+) -> Option<String> {
+    let remaining = preserved_counts.get_mut(version)?;
+    if *remaining == 0 {
+        return None;
+    }
+    *remaining -= 1;
+    Some(version.to_string())
 }
 
 fn inventory_difference(primary: Option<&Vec<String>>, other: Option<&Vec<String>>) -> Vec<String> {
@@ -854,10 +1154,87 @@ fn inventory_difference(primary: Option<&Vec<String>>, other: Option<&Vec<String
     difference
 }
 
+fn classify_cooled_version_action(from_version: &str, to_version: &str) -> CooledVersionAction {
+    if from_version == to_version {
+        return CooledVersionAction::Keeping;
+    }
+
+    match (Version::parse(from_version), Version::parse(to_version)) {
+        (Ok(from_version), Ok(to_version)) if to_version > from_version => {
+            CooledVersionAction::Updating
+        }
+        (Ok(_), Ok(_)) => CooledVersionAction::Downgrading,
+        _ => CooledVersionAction::Cooling,
+    }
+}
+
+fn default_registry_display_name(registry_id: &str) -> String {
+    if registry_id.contains("crates.io-index") || registry_id.contains("index.crates.io") {
+        "crates-io".to_string()
+    } else {
+        registry_id.to_string()
+    }
+}
+
+fn registry_suffix(registry: &str) -> String {
+    if registry == "crates-io" {
+        String::new()
+    } else {
+        format!(" @ {registry}")
+    }
+}
+
 fn compare_versions_desc(left: &String, right: &String) -> std::cmp::Ordering {
     match (Version::parse(left), Version::parse(right)) {
         (Ok(left), Ok(right)) => right.cmp(&left),
         _ => right.cmp(left),
+    }
+}
+
+fn compare_versions_asc(left: &String, right: &String) -> std::cmp::Ordering {
+    match (Version::parse(left), Version::parse(right)) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
+}
+
+fn prefixed_version(version: &str) -> String {
+    format!("v{version}")
+}
+
+fn compare_cooled_version_notice(
+    left: &CooledVersionNotice,
+    right: &CooledVersionNotice,
+) -> std::cmp::Ordering {
+    left.name
+        .cmp(&right.name)
+        .then_with(|| left.registry.cmp(&right.registry))
+        .then_with(|| {
+            cooled_version_action_rank(&left.action).cmp(&cooled_version_action_rank(&right.action))
+        })
+        .then_with(|| {
+            let left_version = left
+                .from_version
+                .as_ref()
+                .or(left.to_version.as_ref())
+                .expect("summary notices should always contain a version");
+            let right_version = right
+                .from_version
+                .as_ref()
+                .or(right.to_version.as_ref())
+                .expect("summary notices should always contain a version");
+            compare_versions_asc(left_version, right_version)
+        })
+}
+
+fn cooled_version_action_rank(action: &CooledVersionAction) -> u8 {
+    match action {
+        CooledVersionAction::Removing => 0,
+        CooledVersionAction::Adding => 1,
+        CooledVersionAction::Updating => 2,
+        CooledVersionAction::Downgrading => 3,
+        CooledVersionAction::Cooling => 4,
+        CooledVersionAction::Keeping => 5,
     }
 }
 
@@ -965,8 +1342,6 @@ struct FreshCrate {
 struct CrateState {
     name: String,
     source_id: String,
-    registry_id: String,
-    registry_name: String,
     current_version: String,
     minimum_minutes: u64,
     exact_allowed: bool,
@@ -2130,8 +2505,6 @@ mod tests {
         let unchanged = CrateState {
             name: "demo".to_string(),
             source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
-            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
-            registry_name: "crates-io".to_string(),
             current_version: "1.0.0".to_string(),
             minimum_minutes: 60,
             exact_allowed: false,
@@ -2166,8 +2539,6 @@ mod tests {
         let blocker_state = CrateState {
             name: "blocker".to_string(),
             source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
-            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
-            registry_name: "crates-io".to_string(),
             current_version: "1.2.3".to_string(),
             minimum_minutes: 60,
             exact_allowed: false,
@@ -2212,8 +2583,6 @@ mod tests {
         let blocker_state = CrateState {
             name: "blocker".to_string(),
             source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
-            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
-            registry_name: "crates-io".to_string(),
             current_version: "1.2.3".to_string(),
             minimum_minutes: 60,
             exact_allowed: false,
@@ -2265,8 +2634,37 @@ mod tests {
     }
 
     #[test]
-    fn format_final_fresh_warning_groups_baseline_and_resolver_versions() {
-        let warning = format_final_fresh_warning(&FinalFreshReport {
+    fn format_final_fresh_warning_only_reports_resolver_constrained_versions() {
+        let warning = format_final_fresh_warning(
+            &FinalFreshReport {
+                baseline_fresh: vec![FreshVersionNotice {
+                    name: "serde".to_string(),
+                    version: "1.0.218".to_string(),
+                    registry: "crates-io".to_string(),
+                }],
+                resolver_constrained_fresh: vec![FreshVersionNotice {
+                    name: "web-sys".to_string(),
+                    version: "0.3.94".to_string(),
+                    registry: "crates-io".to_string(),
+                }],
+            },
+            false,
+        );
+
+        assert_eq!(
+            warning,
+            vec![
+                "     Warning cooldown finished with fresh versions remaining.".to_string(),
+                "resolver-constrained versions that could not be cooled further (review these):"
+                    .to_string(),
+                "      - web-sys 0.3.94".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn strict_mode_rejects_remaining_resolver_constrained_versions() {
+        let report = FinalFreshReport {
             baseline_fresh: vec![FreshVersionNotice {
                 name: "serde".to_string(),
                 version: "1.0.218".to_string(),
@@ -2277,28 +2675,41 @@ mod tests {
                 version: "0.3.94".to_string(),
                 registry: "crates-io".to_string(),
             }],
-        });
+        };
 
-        assert_eq!(
-            warning,
-            vec![
-                "cooldown finished with fresh versions remaining.".to_string(),
-                "initial Cargo.lock baseline (already installed, lower risk):".to_string(),
-                "  - serde 1.0.218 @ crates-io".to_string(),
-                "resolver-constrained versions that could not be cooled further (review these):"
-                    .to_string(),
-                "  - web-sys 0.3.94 @ crates-io".to_string(),
-            ]
+        let err = enforce_final_report_policy(Mode::Strict, &report).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("strict mode blocked fresh versions"),
+            "{message}"
         );
+        assert!(message.contains("web-sys 0.3.94"), "{message}");
+        assert!(!message.contains("serde 1.0.218"), "{message}");
+    }
+
+    #[test]
+    fn best_effort_mode_allows_remaining_resolver_constrained_versions() {
+        let report = FinalFreshReport {
+            baseline_fresh: Vec::new(),
+            resolver_constrained_fresh: vec![FreshVersionNotice {
+                name: "web-sys".to_string(),
+                version: "0.3.94".to_string(),
+                registry: "crates-io".to_string(),
+            }],
+        };
+
+        assert!(enforce_final_report_policy(Mode::BestEffort, &report).is_ok());
     }
 
     #[test]
     fn format_final_user_summary_lists_cooled_versions_and_remaining_fresh_entries() {
         let summary = format_final_user_summary(
             &[CooledVersionNotice {
+                action: CooledVersionAction::Keeping,
                 name: "cooldowndep".to_string(),
-                from_version: "1.0.1".to_string(),
-                to_version: "1.0.0".to_string(),
+                from_version: Some("1.0.0".to_string()),
+                to_version: Some("1.0.0".to_string()),
+                latest_version: Some("1.0.1".to_string()),
                 registry: "cool-reg".to_string(),
             }],
             &FinalFreshReport {
@@ -2310,12 +2721,205 @@ mod tests {
                 resolver_constrained_fresh: Vec::new(),
             },
             "dependency graph updated and cooled down",
+            false,
         );
 
-        assert!(summary.contains("cooled versions:"));
-        assert!(summary.contains("  - cooldowndep 1.0.1 -> 1.0.0 @ cool-reg"));
-        assert!(summary.contains("initial Cargo.lock baseline (already installed, lower risk):"));
-        assert!(summary.ends_with("dependency graph updated and cooled down"));
+        assert!(summary.contains("     Keeping cooldowndep 1.0.0 (latest: v1.0.1) @ cool-reg"));
+        assert!(!summary.contains("cooldown finished with fresh versions remaining."));
+        assert!(summary.ends_with("    Finished dependency graph updated and cooled down"));
+    }
+
+    #[test]
+    fn collect_cooled_versions_includes_plain_update_results() {
+        let key = InventoryKey {
+            name: "demo".to_string(),
+            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            registry: "crates-io".to_string(),
+        };
+        let baseline = BTreeMap::from([(key.clone(), vec!["1.0.0".to_string()])]);
+        let start = BTreeMap::from([(key.clone(), vec!["1.1.0".to_string()])]);
+        let end = BTreeMap::from([(key, vec!["1.1.0".to_string()])]);
+
+        let notices = collect_cooled_versions(&baseline, &start, &end);
+
+        assert_eq!(
+            notices,
+            vec![CooledVersionNotice {
+                action: CooledVersionAction::Updating,
+                name: "demo".to_string(),
+                from_version: Some("1.0.0".to_string()),
+                to_version: Some("1.1.0".to_string()),
+                latest_version: None,
+                registry: "crates-io".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn collect_cooled_versions_reports_multiple_versions_with_adding_and_removing() {
+        let key = InventoryKey {
+            name: "redox_syscall".to_string(),
+            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            registry: "crates-io".to_string(),
+        };
+        let baseline =
+            BTreeMap::from([(key.clone(), vec!["0.7.0".to_string(), "0.5.13".to_string()])]);
+        let start =
+            BTreeMap::from([(key.clone(), vec!["0.7.3".to_string(), "0.5.18".to_string()])]);
+        let end = BTreeMap::from([(key, vec!["0.7.3".to_string(), "0.5.18".to_string()])]);
+
+        let notices = collect_cooled_versions(&baseline, &start, &end);
+
+        assert_eq!(
+            notices,
+            vec![
+                CooledVersionNotice {
+                    action: CooledVersionAction::Removing,
+                    name: "redox_syscall".to_string(),
+                    from_version: Some("0.5.13".to_string()),
+                    to_version: None,
+                    latest_version: None,
+                    registry: "crates-io".to_string(),
+                },
+                CooledVersionNotice {
+                    action: CooledVersionAction::Removing,
+                    name: "redox_syscall".to_string(),
+                    from_version: Some("0.7.0".to_string()),
+                    to_version: None,
+                    latest_version: None,
+                    registry: "crates-io".to_string(),
+                },
+                CooledVersionNotice {
+                    action: CooledVersionAction::Adding,
+                    name: "redox_syscall".to_string(),
+                    from_version: None,
+                    to_version: Some("0.5.18".to_string()),
+                    latest_version: None,
+                    registry: "crates-io".to_string(),
+                },
+                CooledVersionNotice {
+                    action: CooledVersionAction::Adding,
+                    name: "redox_syscall".to_string(),
+                    from_version: None,
+                    to_version: Some("0.7.3".to_string()),
+                    latest_version: None,
+                    registry: "crates-io".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_cooled_versions_matches_plain_update_and_multi_version_changes_together() {
+        let addr2line = InventoryKey {
+            name: "addr2line".to_string(),
+            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            registry: "crates-io".to_string(),
+        };
+        let redox = InventoryKey {
+            name: "redox_syscall".to_string(),
+            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            registry: "crates-io".to_string(),
+        };
+        let baseline = BTreeMap::from([
+            (addr2line.clone(), vec!["0.24.2".to_string()]),
+            (
+                redox.clone(),
+                vec!["0.7.0".to_string(), "0.5.13".to_string()],
+            ),
+        ]);
+        let start = BTreeMap::from([
+            (addr2line.clone(), vec!["0.25.1".to_string()]),
+            (
+                redox.clone(),
+                vec!["0.7.3".to_string(), "0.5.18".to_string()],
+            ),
+        ]);
+        let end = BTreeMap::from([
+            (addr2line, vec!["0.25.1".to_string()]),
+            (redox, vec!["0.7.3".to_string(), "0.5.18".to_string()]),
+        ]);
+
+        let notices = collect_cooled_versions(&baseline, &start, &end);
+        let rendered = notices
+            .iter()
+            .map(|entry| format_cooled_version_notice(entry, false))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "    Updating addr2line v0.24.2 -> v0.25.1".to_string(),
+                "    Removing redox_syscall v0.5.13".to_string(),
+                "    Removing redox_syscall v0.7.0".to_string(),
+                "      Adding redox_syscall v0.5.18".to_string(),
+                "      Adding redox_syscall v0.7.3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_cooled_versions_can_keep_repeated_versions_with_latest_annotation() {
+        let key = InventoryKey {
+            name: "redox_syscall".to_string(),
+            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            registry: "crates-io".to_string(),
+        };
+        let baseline =
+            BTreeMap::from([(key.clone(), vec!["0.7.0".to_string(), "0.5.13".to_string()])]);
+        let start =
+            BTreeMap::from([(key.clone(), vec!["0.7.3".to_string(), "0.5.18".to_string()])]);
+        let end = BTreeMap::from([(key, vec!["0.7.0".to_string(), "0.5.13".to_string()])]);
+
+        let notices = collect_cooled_versions(&baseline, &start, &end);
+
+        assert_eq!(
+            notices,
+            vec![
+                CooledVersionNotice {
+                    action: CooledVersionAction::Keeping,
+                    name: "redox_syscall".to_string(),
+                    from_version: Some("0.5.13".to_string()),
+                    to_version: Some("0.5.13".to_string()),
+                    latest_version: Some("0.5.18".to_string()),
+                    registry: "crates-io".to_string(),
+                },
+                CooledVersionNotice {
+                    action: CooledVersionAction::Keeping,
+                    name: "redox_syscall".to_string(),
+                    from_version: Some("0.7.0".to_string()),
+                    to_version: Some("0.7.0".to_string()),
+                    latest_version: Some("0.7.3".to_string()),
+                    registry: "crates-io".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_cooled_versions_uses_direct_transition_for_single_version_crates() {
+        let key = InventoryKey {
+            name: "demo".to_string(),
+            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            registry: "crates-io".to_string(),
+        };
+        let baseline = BTreeMap::from([(key.clone(), vec!["0.7.0".to_string()])]);
+        let start = BTreeMap::from([(key.clone(), vec!["0.5.18".to_string()])]);
+        let end = BTreeMap::from([(key, vec!["0.5.18".to_string()])]);
+
+        let notices = collect_cooled_versions(&baseline, &start, &end);
+
+        assert_eq!(
+            notices,
+            vec![CooledVersionNotice {
+                action: CooledVersionAction::Downgrading,
+                name: "demo".to_string(),
+                from_version: Some("0.7.0".to_string()),
+                to_version: Some("0.5.18".to_string()),
+                latest_version: None,
+                registry: "crates-io".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -2417,7 +3021,7 @@ mod tests {
     fn config_fixture_remains_constructible_for_executor_tests() {
         let config = Config {
             cooldown_minutes: 60,
-            mode: Mode::Enforce,
+            mode: Mode::Strict,
             lockfile_policy: LockfilePolicy::Changed,
             now_override: None,
             ttl_seconds: 60,

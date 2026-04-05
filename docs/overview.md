@@ -26,6 +26,10 @@ Key behavior:
 - unchanged lockfile entries are skipped by default;
 - `lockfile_policy = "all"` (or `COOLDOWN_LOCKFILE_POLICY=all`) restores the
   previous "cool every eligible locked package" behavior;
+- `mode = "strict"` is fail-closed and restores the original lockfile if any
+  resolver-constrained fresh versions remain;
+- `mode = "best_effort"` keeps the best lockfile it could produce and warns
+  about any remaining resolver-constrained fresh versions;
 - configuration lives in one `cooldown.toml`, including allow rules;
 - workspaces use the workspace root config by default, with optional member
   overrides only for uniquely targeted members;

@@ -11,7 +11,7 @@ Meaning:
 Options:
 
 - add the registry to `skip_registries`;
-- switch to `COOLDOWN_MODE=warn` if you want best-effort behavior;
+- switch to `COOLDOWN_MODE=best_effort` if you want best-effort behavior;
 - ensure the registry exposes either `pubtime` or a usable API.
 
 ## "registry ... does not provide cached metadata"
