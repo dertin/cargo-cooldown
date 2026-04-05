@@ -38,6 +38,13 @@ const CHAIN_B_OLD_VERSION: &str = "2.3.3";
 const CHAIN_B_UPDATED_VERSION: &str = "2.3.4";
 const CHAIN_B_OLD_PUBTIME: &str = "2026-03-01T00:00:00Z";
 const CHAIN_B_UPDATED_PUBTIME: &str = "2026-03-15T00:00:00Z";
+const BUNDLE_A_NAME: &str = "webshim";
+const BUNDLE_B_NAME: &str = "futureshim";
+const BUNDLE_SHARED_NAME: &str = "sharedshim";
+const BUNDLE_OLD_VERSION: &str = "1.0.0";
+const BUNDLE_FRESH_VERSION: &str = "1.1.0";
+const BUNDLE_OLD_PUBTIME: &str = "2026-03-01T00:00:00Z";
+const BUNDLE_FRESH_PUBTIME: &str = "2026-04-02T12:00:00Z";
 
 #[test]
 fn existing_lockfile_fresh_dependency_is_ignored_by_default() {
@@ -386,12 +393,22 @@ fn cooldown_update_repins_new_fresh_versions_against_pre_update_baseline() {
     );
     assert_eq!(harness.locked_version(), OLD_VERSION);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let expected_cooldown_line = format!(
+        "  - cooldowndep 1.0.1 -> 1.0.0 @ sparse+{}/index/",
+        harness.server.base_url()
+    );
     assert!(
         stderr.contains("cooldown: inspected crate=cooldowndep version=1.0.1"),
         "{stderr}"
     );
     assert!(
         stderr.contains("cooldown: scan_summary registry_packages=1 inspected=1 fresh=1"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("cooled versions:"), "{stderr}");
+    assert!(stderr.contains(&expected_cooldown_line), "{stderr}");
+    assert!(
+        stderr.contains("dependency graph updated and cooled down"),
         "{stderr}"
     );
     assert!(
@@ -450,7 +467,7 @@ fn cooldown_update_can_restore_a_fresh_baseline_version() {
         FRESH_VERSION
     );
 
-    write_root_manifest(&workspace_dir, CRATE_NAME, "1").expect("manifest should update");
+    write_root_manifest(&workspace_dir, &[(CRATE_NAME, "1")]).expect("manifest should update");
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
         .arg("update")
         .current_dir(&workspace_dir)
@@ -474,6 +491,40 @@ fn cooldown_update_can_restore_a_fresh_baseline_version() {
         )
         .expect("crate should exist in lockfile"),
         FRESH_VERSION
+    );
+}
+
+#[test]
+fn coordinated_bundle_resolution_cools_exactly_coupled_transitives() {
+    let mut harness = CoordinatedBundleHarness::new().expect("bundle harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version(BUNDLE_A_NAME), BUNDLE_FRESH_VERSION);
+    assert_eq!(harness.locked_version(BUNDLE_B_NAME), BUNDLE_FRESH_VERSION);
+    assert_eq!(
+        harness.locked_version(BUNDLE_SHARED_NAME),
+        BUNDLE_FRESH_VERSION
+    );
+
+    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_VERBOSE", "true")]);
+    assert!(
+        output.status.success(),
+        "coordinated bundle resolution should cool the coupled transitive crates: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(BUNDLE_A_NAME), BUNDLE_OLD_VERSION);
+    assert_eq!(harness.locked_version(BUNDLE_B_NAME), BUNDLE_OLD_VERSION);
+    assert_eq!(
+        harness.locked_version(BUNDLE_SHARED_NAME),
+        BUNDLE_OLD_VERSION
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("coordinated bundle resolution succeeded"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("resolver-constrained versions that could not be cooled further"),
+        "{stderr}"
     );
 }
 
@@ -567,7 +618,7 @@ impl TestHarness {
     }
 
     fn set_dependency_requirement(&self, version_req: &str) {
-        write_root_manifest(&self.workspace_dir, CRATE_NAME, version_req)
+        write_root_manifest(&self.workspace_dir, &[(CRATE_NAME, version_req)])
             .expect("root manifest should be rewritable");
     }
 
@@ -583,6 +634,129 @@ struct DependencyChainHarness {
     cargo_home: PathBuf,
     workspace_dir: PathBuf,
     _server: RegistryServer,
+}
+
+struct CoordinatedBundleHarness {
+    _temp_dir: TempDir,
+    cargo_home: PathBuf,
+    workspace_dir: PathBuf,
+    _server: RegistryServer,
+}
+
+impl CoordinatedBundleHarness {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_root = temp_dir.path().to_path_buf();
+        let cargo_home = temp_root.join("cargo-home");
+        let workspace_dir = temp_root.join("workspace");
+        let server = RegistryServer::with_crates(
+            vec![
+                PublishedCrate::new(
+                    BUNDLE_A_NAME,
+                    vec![
+                        PackageVersion::new(BUNDLE_OLD_VERSION, Some(BUNDLE_OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                BUNDLE_SHARED_NAME,
+                                BUNDLE_OLD_VERSION,
+                            )]),
+                        PackageVersion::new(
+                            BUNDLE_FRESH_VERSION,
+                            Some(BUNDLE_FRESH_PUBTIME),
+                            false,
+                        )
+                        .with_dependencies(vec![
+                            RegistryDependency::exact(BUNDLE_SHARED_NAME, BUNDLE_FRESH_VERSION),
+                        ]),
+                    ],
+                ),
+                PublishedCrate::new(
+                    BUNDLE_B_NAME,
+                    vec![
+                        PackageVersion::new(BUNDLE_OLD_VERSION, Some(BUNDLE_OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                BUNDLE_SHARED_NAME,
+                                BUNDLE_OLD_VERSION,
+                            )]),
+                        PackageVersion::new(
+                            BUNDLE_FRESH_VERSION,
+                            Some(BUNDLE_FRESH_PUBTIME),
+                            false,
+                        )
+                        .with_dependencies(vec![
+                            RegistryDependency::exact(BUNDLE_SHARED_NAME, BUNDLE_FRESH_VERSION),
+                        ]),
+                    ],
+                ),
+                PublishedCrate::new(
+                    BUNDLE_SHARED_NAME,
+                    vec![
+                        PackageVersion::new(BUNDLE_OLD_VERSION, Some(BUNDLE_OLD_PUBTIME), false),
+                        PackageVersion::new(
+                            BUNDLE_FRESH_VERSION,
+                            Some(BUNDLE_FRESH_PUBTIME),
+                            false,
+                        ),
+                    ],
+                ),
+            ],
+            false,
+        )?;
+
+        fs::create_dir_all(&cargo_home)?;
+        create_workspace_with_dependencies(
+            &workspace_dir,
+            &server,
+            &[(BUNDLE_A_NAME, "1"), (BUNDLE_B_NAME, "1")],
+        )?;
+        write_registry_config(&cargo_home, &server)?;
+
+        Ok(Self {
+            _temp_dir: temp_dir,
+            cargo_home,
+            workspace_dir,
+            _server: server,
+        })
+    }
+
+    fn generate_lockfile(&mut self) {
+        let output = Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .output()
+            .expect("cargo generate-lockfile should run");
+
+        assert!(
+            output.status.success(),
+            "lockfile generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_cooldown(&self, extra_env: &[(&str, &str)]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command
+            .arg("check")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .env("COOLDOWN_NOW", NOW)
+            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("COOLDOWN_HTTP_RETRIES", "0");
+
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+
+        command.output().expect("cargo-cooldown should run")
+    }
+
+    fn locked_version(&self, crate_name: &str) -> String {
+        let lockfile = fs::read_to_string(self.workspace_dir.join("Cargo.lock"))
+            .expect("lockfile should be readable");
+        parse_lockfile_version(&lockfile, crate_name).expect("crate should exist in lockfile")
+    }
 }
 
 impl DependencyChainHarness {
@@ -660,7 +834,8 @@ impl DependencyChainHarness {
     }
 
     fn request_exact_version(&self, version: &str) {
-        write_root_manifest(&self.workspace_dir, CHAIN_A_NAME, &format!("={version}"))
+        let requirement = format!("={version}");
+        write_root_manifest(&self.workspace_dir, &[(CHAIN_A_NAME, requirement.as_str())])
             .expect("root manifest should be rewritable");
     }
 
@@ -1011,17 +1186,20 @@ fn create_workspace_with_dependency(
     crate_name: &str,
     version_req: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    create_workspace_with_dependencies(workspace_dir, server, &[(crate_name, version_req)])
+}
+
+fn create_workspace_with_dependencies(
+    workspace_dir: &Path,
+    server: &RegistryServer,
+    dependencies: &[(&str, &str)],
+) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(workspace_dir.join("src"))?;
     fs::create_dir_all(workspace_dir.join(".cargo"))?;
-    write_root_manifest(workspace_dir, crate_name, version_req)?;
+    write_root_manifest(workspace_dir, dependencies)?;
     fs::write(
         workspace_dir.join("src/main.rs"),
-        format!(
-            r#"fn main() {{
-    println!("{{}}", {crate_name}::value());
-}}
-"#
-        ),
+        render_main_file(dependencies),
     )?;
     fs::write(
         workspace_dir.join(".cargo/config.toml"),
@@ -1039,9 +1217,17 @@ index = "sparse+{base_url}/index/"
 
 fn write_root_manifest(
     workspace_dir: &Path,
-    crate_name: &str,
-    version_req: &str,
+    dependencies: &[(&str, &str)],
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let dependency_lines = dependencies
+        .iter()
+        .map(|(crate_name, version_req)| {
+            format!(
+                r#"{crate_name} = {{ version = "{version_req}", registry = "{REGISTRY_NAME}" }}"#
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     fs::write(
         workspace_dir.join("Cargo.toml"),
         format!(
@@ -1051,11 +1237,21 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-{crate_name} = {{ version = "{version_req}", registry = "{REGISTRY_NAME}" }}
+{dependency_lines}
 "#
         ),
     )?;
     Ok(())
+}
+
+fn render_main_file(dependencies: &[(&str, &str)]) -> String {
+    let lines = dependencies
+        .iter()
+        .map(|(crate_name, _)| format!("    println!(\"{{}}\", {crate_name}::value());"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("fn main() {{\n{lines}\n}}\n")
 }
 
 fn create_workspace_member_fixture(

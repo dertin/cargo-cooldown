@@ -1,24 +1,29 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::PackageId;
 use chrono::{DateTime, Utc};
-use semver::{Op, VersionReq};
-use tracing::{debug, info, warn};
+use semver::{Op, Version, VersionReq};
+use tracing::debug;
 
 use crate::config::Config;
 use crate::lockfile::LockfileSnapshot;
-use crate::metadata::read_metadata;
+use crate::metadata::{read_metadata, read_metadata_locked};
 use crate::registry::{
     RegistryContext, RegistryStore, ReleaseSource, assert_has_timestamp, ensure_timeline_available,
     is_registry_source, require_release,
 };
 use crate::resolver::{
-    PinOutcome, cutoff_time, is_release_fresh, select_candidate, try_pin_precise,
+    PinOutcome, cutoff_time, is_release_fresh, select_candidate, select_candidates, try_pin_precise,
 };
 use clap_cargo::{Features, Manifest, Workspace};
+
+const MAX_COORDINATED_COMPONENT_SIZE: usize = 8;
+const MAX_COORDINATED_CANDIDATES: usize = 4;
+const MAX_COORDINATED_ASSIGNMENTS: usize = 64;
 
 pub fn run_pinning_flow(
     config: &Config,
@@ -65,7 +70,9 @@ pub fn run_pinning_flow_with_snapshot(
         let now = config.now_override.unwrap_or_else(Utc::now);
         let mut visited_failures: HashSet<String> = HashSet::new();
         let mut best_effort_skips: HashMap<String, String> = HashMap::new();
+        let mut constraint_edges: HashMap<String, HashSet<String>> = HashMap::new();
         let mut inspection_cache: HashMap<ReleaseInspectionKey, ReleaseInspection> = HashMap::new();
+        let mut cooldown_start_inventory: Option<VersionInventory> = None;
 
         'outer: loop {
             // After each successful pin we rebuild cargo metadata from scratch so every
@@ -108,6 +115,7 @@ pub fn run_pinning_flow_with_snapshot(
             let mut seen: HashSet<PackageId> = HashSet::new();
             let mut scan_summary = ScanSummary::default();
             let mut fresh_keys_present: HashSet<String> = HashSet::new();
+            let mut best_effort_fresh_entries: Vec<FreshCrate> = Vec::new();
 
             for node in &resolve.nodes {
                 if !reachable_ids.contains(&node.id) || !seen.insert(node.id.clone()) {
@@ -154,6 +162,8 @@ pub fn run_pinning_flow_with_snapshot(
                 let state = CrateState {
                     name: pkg.name.to_string(),
                     source_id: source.repr.clone(),
+                    registry_id: context.effective_index_url.clone(),
+                    registry_name: context.logical_name.clone(),
                     current_version: current_version.clone(),
                     minimum_minutes,
                     exact_allowed,
@@ -204,6 +214,13 @@ pub fn run_pinning_flow_with_snapshot(
                     fresh_keys_present.insert(fresh_key.clone());
                     if let Some(reason) = best_effort_skips.get(&fresh_key) {
                         scan_summary.best_effort_skipped += 1;
+                        best_effort_fresh_entries.push(FreshCrate {
+                            package_id: node.id.clone(),
+                            name: pkg.name.to_string(),
+                            source_id: source.repr.clone(),
+                            current_version: current_version.clone(),
+                            minimum_minutes,
+                        });
                         debug!(
                             crate = %pkg.name,
                             version = %current_version,
@@ -225,10 +242,15 @@ pub fn run_pinning_flow_with_snapshot(
                 }
             }
 
+            if cooldown_start_inventory.is_none() {
+                cooldown_start_inventory = Some(collect_version_inventory(&crate_states));
+            }
+
             // Keep best-effort decisions only for crate versions that are still fresh in the
             // current lockfile. If a successful pin changes a crate version, the next pass
             // should reconsider the new version instead of inheriting stale skip state.
             best_effort_skips.retain(|key, _| fresh_keys_present.contains(key));
+            retain_constraint_edges(&mut constraint_edges, &fresh_keys_present);
 
             debug!(
                 "cooldown: scan_summary registry_packages={} inspected={} fresh={} baseline_exempt={} best_effort_skipped={} skipped_registries={} exact_allowed={} zero_minutes={}",
@@ -243,14 +265,36 @@ pub fn run_pinning_flow_with_snapshot(
             );
 
             if fresh_entries.is_empty() {
-                log_final_fresh_report(
+                if !best_effort_fresh_entries.is_empty()
+                    && attempt_coordinated_bundle_resolution(
+                        &CoordinatedResolutionCtx {
+                            manifest,
+                            workspace,
+                            features,
+                            config,
+                            lockfile_path: &lockfile_path,
+                            initial_lockfile: &initial_lockfile,
+                            requirement_origins: &requirement_origins,
+                            now,
+                        },
+                        &mut registry_store,
+                        &best_effort_fresh_entries,
+                        &constraint_edges,
+                    )?
+                {
+                    continue 'outer;
+                }
+                emit_final_run_summary(
+                    cooldown_start_inventory
+                        .as_ref()
+                        .expect("cooldown start inventory should be captured on the first pass"),
+                    &crate_states,
                     &mut registry_store,
                     &mut inspection_cache,
-                    &crate_states,
                     &best_effort_skips,
                     now,
+                    success_message,
                 );
-                info!("{}", success_message);
                 break;
             }
 
@@ -341,6 +385,7 @@ pub fn run_pinning_flow_with_snapshot(
                                     &state.name,
                                     &state.current_version,
                                 );
+                                record_constraint_edge(&mut constraint_edges, &key, &parent_key);
                                 if attempted_in_pass.contains(&parent_key)
                                     || best_effort_skips.contains_key(&parent_key)
                                 {
@@ -456,6 +501,16 @@ pub fn run_pinning_flow_with_snapshot(
 
                             for id in matches {
                                 if let Some(state) = crate_states.get(&id) {
+                                    let blocker_key = crate_failure_key(
+                                        &state.source_id,
+                                        &state.name,
+                                        &state.current_version,
+                                    );
+                                    record_constraint_edge(
+                                        &mut constraint_edges,
+                                        &key,
+                                        &blocker_key,
+                                    );
                                     match blocker_disposition(
                                         &id,
                                         &fresh,
@@ -558,19 +613,42 @@ struct FreshVersionNotice {
     registry: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct CooledVersionNotice {
+    name: String,
+    from_version: String,
+    to_version: String,
+    registry: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct InventoryKey {
+    name: String,
+    registry_id: String,
+    registry: String,
+}
+
+type VersionInventory = BTreeMap<InventoryKey, Vec<String>>;
+
 #[derive(Default)]
 struct FinalFreshReport {
     baseline_fresh: Vec<FreshVersionNotice>,
     resolver_constrained_fresh: Vec<FreshVersionNotice>,
 }
 
-fn log_final_fresh_report(
+fn emit_final_run_summary(
+    cooldown_start_inventory: &VersionInventory,
+    crate_states: &HashMap<PackageId, CrateState>,
     registry_store: &mut RegistryStore,
     inspection_cache: &mut HashMap<ReleaseInspectionKey, ReleaseInspection>,
-    crate_states: &HashMap<PackageId, CrateState>,
     best_effort_skips: &HashMap<String, String>,
     now: DateTime<Utc>,
+    success_message: &str,
 ) {
+    let cooled_versions = collect_cooled_versions(
+        cooldown_start_inventory,
+        &collect_version_inventory(crate_states),
+    );
     let mut report = FinalFreshReport::default();
     let mut baseline_seen = HashSet::new();
     let mut resolver_seen = HashSet::new();
@@ -633,49 +711,153 @@ fn log_final_fresh_report(
         }
     }
 
-    if report.baseline_fresh.is_empty() && report.resolver_constrained_fresh.is_empty() {
-        return;
-    }
-
     report.baseline_fresh.sort();
     report.resolver_constrained_fresh.sort();
-    warn!("{}", format_final_fresh_warning(&report));
+    emit_final_summary(&cooled_versions, &report, success_message);
 }
 
-fn format_final_fresh_warning(report: &FinalFreshReport) -> String {
-    let mut lines = vec!["cooldown finished with fresh versions remaining.".to_string()];
+fn emit_final_summary(
+    cooled_versions: &[CooledVersionNotice],
+    report: &FinalFreshReport,
+    success_message: &str,
+) {
+    eprintln!(
+        "{}",
+        format_final_user_summary(cooled_versions, report, success_message)
+    );
+}
 
-    if !report.baseline_fresh.is_empty() {
-        lines.push(format!(
-            "initial Cargo.lock baseline (already installed, lower risk): {}",
-            format_fresh_notice_list(&report.baseline_fresh)
-        ));
+fn format_final_user_summary(
+    cooled_versions: &[CooledVersionNotice],
+    report: &FinalFreshReport,
+    success_message: &str,
+) -> String {
+    let mut lines = Vec::new();
+
+    if !cooled_versions.is_empty() {
+        lines.push("cooled versions:".to_string());
+        lines.extend(cooled_versions.iter().map(|entry| {
+            format!(
+                "  - {} {} -> {} @ {}",
+                entry.name, entry.from_version, entry.to_version, entry.registry
+            )
+        }));
     }
 
-    if !report.resolver_constrained_fresh.is_empty() {
-        lines.push(format!(
-            "resolver-constrained versions that could not be cooled further (review these): {}",
-            format_fresh_notice_list(&report.resolver_constrained_fresh)
-        ));
-    }
-
+    lines.extend(format_final_fresh_warning(report));
+    lines.push(success_message.to_string());
     lines.join("\n")
 }
 
-fn format_fresh_notice_list(entries: &[FreshVersionNotice]) -> String {
-    const MAX_LISTED: usize = 8;
+fn format_final_fresh_warning(report: &FinalFreshReport) -> Vec<String> {
+    if report.baseline_fresh.is_empty() && report.resolver_constrained_fresh.is_empty() {
+        return Vec::new();
+    }
 
-    let listed = entries
+    let mut lines = vec!["cooldown finished with fresh versions remaining.".to_string()];
+
+    if !report.baseline_fresh.is_empty() {
+        lines.push("initial Cargo.lock baseline (already installed, lower risk):".to_string());
+        lines.extend(format_fresh_notice_list(&report.baseline_fresh));
+    }
+
+    if !report.resolver_constrained_fresh.is_empty() {
+        lines.push(
+            "resolver-constrained versions that could not be cooled further (review these):"
+                .to_string(),
+        );
+        lines.extend(format_fresh_notice_list(&report.resolver_constrained_fresh));
+    }
+
+    lines
+}
+
+fn format_fresh_notice_list(entries: &[FreshVersionNotice]) -> Vec<String> {
+    entries
         .iter()
-        .take(MAX_LISTED)
         .map(|entry| format!("{} {} @ {}", entry.name, entry.version, entry.registry))
-        .collect::<Vec<_>>();
+        .map(|entry| format!("  - {entry}"))
+        .collect()
+}
 
-    let remaining = entries.len().saturating_sub(MAX_LISTED);
-    if remaining == 0 {
-        listed.join(", ")
-    } else {
-        format!("{} (+{} more)", listed.join(", "), remaining)
+fn collect_version_inventory(crate_states: &HashMap<PackageId, CrateState>) -> VersionInventory {
+    let mut inventory = VersionInventory::new();
+
+    for state in crate_states.values() {
+        inventory
+            .entry(InventoryKey {
+                name: state.name.clone(),
+                registry_id: state.registry_id.clone(),
+                registry: state.registry_name.clone(),
+            })
+            .or_default()
+            .push(state.current_version.clone());
+    }
+
+    for versions in inventory.values_mut() {
+        versions.sort_by(compare_versions_desc);
+    }
+
+    inventory
+}
+
+fn collect_cooled_versions(
+    start_inventory: &VersionInventory,
+    end_inventory: &VersionInventory,
+) -> Vec<CooledVersionNotice> {
+    let mut notices = Vec::new();
+    let mut keys = start_inventory
+        .keys()
+        .chain(end_inventory.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+
+    for key in keys {
+        let mut removed = inventory_difference(start_inventory.get(&key), end_inventory.get(&key));
+        let mut added = inventory_difference(end_inventory.get(&key), start_inventory.get(&key));
+
+        removed.sort_by(compare_versions_desc);
+        added.sort_by(compare_versions_desc);
+
+        for (from_version, to_version) in removed.into_iter().zip(added.into_iter()) {
+            notices.push(CooledVersionNotice {
+                name: key.name.clone(),
+                from_version,
+                to_version,
+                registry: key.registry.clone(),
+            });
+        }
+    }
+
+    notices.sort();
+    notices
+}
+
+fn inventory_difference(primary: Option<&Vec<String>>, other: Option<&Vec<String>>) -> Vec<String> {
+    let mut other_counts: HashMap<&str, usize> = HashMap::new();
+    for version in other.into_iter().flatten() {
+        *other_counts.entry(version.as_str()).or_default() += 1;
+    }
+
+    let mut difference = Vec::new();
+    for version in primary.into_iter().flatten() {
+        let remaining = other_counts.entry(version.as_str()).or_default();
+        if *remaining > 0 {
+            *remaining -= 1;
+        } else {
+            difference.push(version.clone());
+        }
+    }
+
+    difference
+}
+
+fn compare_versions_desc(left: &String, right: &String) -> std::cmp::Ordering {
+    match (Version::parse(left), Version::parse(right)) {
+        (Ok(left), Ok(right)) => right.cmp(&left),
+        _ => right.cmp(left),
     }
 }
 
@@ -783,6 +965,8 @@ struct FreshCrate {
 struct CrateState {
     name: String,
     source_id: String,
+    registry_id: String,
+    registry_name: String,
     current_version: String,
     minimum_minutes: u64,
     exact_allowed: bool,
@@ -868,6 +1052,510 @@ fn record_best_effort_skip(
 
     best_effort_skips.insert(key.to_string(), reason);
     true
+}
+
+fn record_constraint_edge(
+    constraint_edges: &mut HashMap<String, HashSet<String>>,
+    left: &str,
+    right: &str,
+) {
+    if left == right {
+        return;
+    }
+
+    constraint_edges
+        .entry(left.to_string())
+        .or_default()
+        .insert(right.to_string());
+    constraint_edges
+        .entry(right.to_string())
+        .or_default()
+        .insert(left.to_string());
+}
+
+fn retain_constraint_edges(
+    constraint_edges: &mut HashMap<String, HashSet<String>>,
+    fresh_keys_present: &HashSet<String>,
+) {
+    constraint_edges.retain(|key, neighbors| {
+        if !fresh_keys_present.contains(key) {
+            return false;
+        }
+        neighbors.retain(|neighbor| fresh_keys_present.contains(neighbor));
+        !neighbors.is_empty()
+    });
+}
+
+#[derive(Clone)]
+struct BundleCandidate {
+    version: String,
+    parsed_version: Version,
+    internal_requirements: BTreeMap<String, VersionReq>,
+}
+
+#[derive(Clone)]
+struct BundleMemberPlan {
+    fresh: FreshCrate,
+    candidates: Vec<BundleCandidate>,
+}
+
+struct CoordinatedResolutionCtx<'a> {
+    manifest: &'a Manifest,
+    workspace: &'a Workspace,
+    features: &'a Features,
+    config: &'a Config,
+    lockfile_path: &'a Path,
+    initial_lockfile: &'a LockfileSnapshot,
+    requirement_origins: &'a HashMap<PackageId, Vec<RequirementOrigin>>,
+    now: DateTime<Utc>,
+}
+
+fn attempt_coordinated_bundle_resolution(
+    ctx: &CoordinatedResolutionCtx<'_>,
+    registry_store: &mut RegistryStore,
+    best_effort_entries: &[FreshCrate],
+    constraint_edges: &HashMap<String, HashSet<String>>,
+) -> Result<bool> {
+    let components = best_effort_components(best_effort_entries, constraint_edges);
+
+    for component in components {
+        if component.len() > MAX_COORDINATED_COMPONENT_SIZE {
+            debug!(
+                component_size = component.len(),
+                "skipping coordinated bundle attempt because the unresolved component is too large"
+            );
+            continue;
+        }
+        if has_duplicate_crate_names(&component) {
+            debug!(
+                component = %format_component(&component),
+                "skipping coordinated bundle attempt because the unresolved component contains duplicate crate names"
+            );
+            continue;
+        }
+
+        let Some(assignment) = find_coordinated_assignment(
+            registry_store,
+            ctx.requirement_origins,
+            ctx.initial_lockfile,
+            ctx.config,
+            &component,
+            ctx.now,
+        )?
+        else {
+            continue;
+        };
+
+        debug!(
+            component = %format_component(&component),
+            assignment = %format_assignment(&assignment),
+            "attempting coordinated bundle resolution for resolver-constrained crates"
+        );
+
+        if apply_coordinated_assignment(
+            ctx.manifest,
+            ctx.workspace,
+            ctx.features,
+            ctx.lockfile_path,
+            registry_store,
+            &component,
+            &assignment,
+        )? {
+            debug!(
+                component = %format_component(&component),
+                assignment = %format_assignment(&assignment),
+                "coordinated bundle resolution succeeded"
+            );
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn best_effort_components(
+    best_effort_entries: &[FreshCrate],
+    constraint_edges: &HashMap<String, HashSet<String>>,
+) -> Vec<Vec<FreshCrate>> {
+    let entries_by_key: HashMap<String, FreshCrate> = best_effort_entries
+        .iter()
+        .cloned()
+        .map(|entry| {
+            (
+                crate_failure_key(&entry.source_id, &entry.name, &entry.current_version),
+                entry,
+            )
+        })
+        .collect();
+    let mut remaining: HashSet<String> = entries_by_key.keys().cloned().collect();
+    let mut components = Vec::new();
+
+    while let Some(start) = remaining.iter().next().cloned() {
+        let mut queue = VecDeque::from([start.clone()]);
+        let mut component_keys = Vec::new();
+
+        while let Some(key) = queue.pop_front() {
+            if !remaining.remove(&key) {
+                continue;
+            }
+            component_keys.push(key.clone());
+            if let Some(neighbors) = constraint_edges.get(&key) {
+                for neighbor in neighbors {
+                    if remaining.contains(neighbor) {
+                        queue.push_back(neighbor.clone());
+                    }
+                }
+            }
+        }
+
+        component_keys.sort();
+        let component = component_keys
+            .into_iter()
+            .filter_map(|key| entries_by_key.get(&key).cloned())
+            .collect::<Vec<_>>();
+        components.push(component);
+    }
+
+    components.sort_by_key(|component| std::cmp::Reverse(component.len()));
+    components
+}
+
+fn has_duplicate_crate_names(component: &[FreshCrate]) -> bool {
+    let mut seen = HashSet::new();
+    component
+        .iter()
+        .any(|entry| !seen.insert(entry.name.clone()))
+}
+
+fn find_coordinated_assignment(
+    registry_store: &mut RegistryStore,
+    requirement_origins: &HashMap<PackageId, Vec<RequirementOrigin>>,
+    initial_lockfile: &LockfileSnapshot,
+    config: &Config,
+    component: &[FreshCrate],
+    now: DateTime<Utc>,
+) -> Result<Option<BTreeMap<String, String>>> {
+    let component_ids: HashSet<PackageId> = component
+        .iter()
+        .map(|entry| entry.package_id.clone())
+        .collect();
+    let component_names: HashSet<String> =
+        component.iter().map(|entry| entry.name.clone()).collect();
+    let mut plans = Vec::with_capacity(component.len());
+
+    for fresh in component {
+        let external_requirements = requirement_origins
+            .get(&fresh.package_id)
+            .map(|origins| {
+                origins
+                    .iter()
+                    .filter(|origin| !component_ids.contains(&origin.parent_id))
+                    .map(|origin| origin.requirement.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let context = registry_store.context_for_source(&fresh.source_id)?.clone();
+        let timeline = registry_store.timeline_for(&fresh.source_id, &fresh.name)?;
+        let candidates = select_candidates(
+            &timeline,
+            &fresh.current_version,
+            &external_requirements,
+            fresh.minimum_minutes,
+            now,
+            |version| {
+                !config.lockfile_policy.applies_to_existing_lockfile()
+                    && initial_lockfile.baseline().contains_registry_version(
+                        &fresh.name,
+                        &context.effective_index_url,
+                        version,
+                    )
+            },
+            MAX_COORDINATED_CANDIDATES,
+        );
+
+        let mut bundle_candidates = Vec::new();
+        for candidate in candidates {
+            let Some(dependencies) = registry_store.local_release_dependencies(
+                &fresh.source_id,
+                &fresh.name,
+                &candidate.version,
+            )?
+            else {
+                return Ok(None);
+            };
+            let internal_requirements = dependencies
+                .into_iter()
+                .filter(|dependency| component_names.contains(&dependency.crate_name))
+                .map(|dependency| (dependency.crate_name, dependency.requirement))
+                .collect::<BTreeMap<_, _>>();
+            let Ok(parsed_version) = Version::parse(&candidate.version) else {
+                continue;
+            };
+            bundle_candidates.push(BundleCandidate {
+                version: candidate.version.clone(),
+                parsed_version,
+                internal_requirements,
+            });
+        }
+
+        if bundle_candidates.is_empty() {
+            return Ok(None);
+        }
+
+        plans.push(BundleMemberPlan {
+            fresh: fresh.clone(),
+            candidates: bundle_candidates,
+        });
+    }
+
+    plans.sort_by_key(|plan| plan.candidates.len());
+    let mut assignment = BTreeMap::new();
+    let mut budget = MAX_COORDINATED_ASSIGNMENTS;
+    if search_coordinated_assignment(&plans, 0, &mut assignment, &mut budget) {
+        return Ok(Some(
+            assignment
+                .into_iter()
+                .map(|(name, candidate)| (name, candidate.version))
+                .collect(),
+        ));
+    }
+
+    Ok(None)
+}
+
+fn search_coordinated_assignment(
+    plans: &[BundleMemberPlan],
+    index: usize,
+    assignment: &mut BTreeMap<String, BundleCandidate>,
+    budget: &mut usize,
+) -> bool {
+    if index >= plans.len() {
+        return true;
+    }
+
+    let plan = &plans[index];
+    for candidate in &plan.candidates {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        if !candidate_matches_assignment(&plan.fresh.name, candidate, assignment) {
+            continue;
+        }
+
+        assignment.insert(plan.fresh.name.clone(), candidate.clone());
+        if search_coordinated_assignment(plans, index + 1, assignment, budget) {
+            return true;
+        }
+        assignment.remove(&plan.fresh.name);
+    }
+
+    false
+}
+
+fn candidate_matches_assignment(
+    crate_name: &str,
+    candidate: &BundleCandidate,
+    assignment: &BTreeMap<String, BundleCandidate>,
+) -> bool {
+    for (dependency_name, requirement) in &candidate.internal_requirements {
+        if let Some(dependency_candidate) = assignment.get(dependency_name)
+            && !requirement.matches(&dependency_candidate.parsed_version)
+        {
+            return false;
+        }
+    }
+
+    for (other_name, other_candidate) in assignment {
+        if let Some(requirement) = other_candidate.internal_requirements.get(crate_name)
+            && !requirement.matches(&candidate.parsed_version)
+        {
+            return false;
+        }
+        if other_name == crate_name {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn apply_coordinated_assignment(
+    manifest: &Manifest,
+    workspace: &Workspace,
+    features: &Features,
+    lockfile_path: &Path,
+    registry_store: &mut RegistryStore,
+    component: &[FreshCrate],
+    assignment: &BTreeMap<String, String>,
+) -> Result<bool> {
+    let lockfile_snapshot = LockfileSnapshot::capture(lockfile_path, registry_store)?;
+    write_coordinated_lockfile_assignment(lockfile_path, registry_store, component, assignment)?;
+
+    if read_metadata(manifest, features).is_err() {
+        lockfile_snapshot.restore(lockfile_path)?;
+        return Ok(false);
+    }
+
+    let Ok(locked_metadata) = read_metadata_locked(manifest, features) else {
+        lockfile_snapshot.restore(lockfile_path)?;
+        return Ok(false);
+    };
+
+    if coordinated_assignment_made_progress(&locked_metadata, workspace, component) {
+        return Ok(true);
+    }
+
+    lockfile_snapshot.restore(lockfile_path)?;
+    Ok(false)
+}
+
+fn write_coordinated_lockfile_assignment(
+    lockfile_path: &Path,
+    registry_store: &mut RegistryStore,
+    component: &[FreshCrate],
+    assignment: &BTreeMap<String, String>,
+) -> Result<()> {
+    // TODO: Replace this lockfile rewrite with a Cargo-native coordinated pin once Cargo exposes a
+    // public API for updating multiple crates in a single resolution.
+    let contents = fs::read_to_string(lockfile_path)
+        .with_context(|| format!("failed to read lockfile {}", lockfile_path.display()))?;
+    let mut document = toml::from_str::<toml::Value>(&contents)
+        .with_context(|| format!("failed to parse lockfile {}", lockfile_path.display()))?;
+    let packages = document
+        .get_mut("package")
+        .and_then(toml::Value::as_array_mut)
+        .context("lockfile package list should be a TOML array")?;
+    let component_by_name = component
+        .iter()
+        .map(|fresh| (fresh.name.clone(), fresh))
+        .collect::<HashMap<_, _>>();
+
+    for package in packages.iter_mut() {
+        let Some(table) = package.as_table_mut() else {
+            continue;
+        };
+        let Some(name) = table.get("name").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        let Some(fresh) = component_by_name.get(name) else {
+            continue;
+        };
+        let Some(version) = table.get("version").and_then(toml::Value::as_str) else {
+            continue;
+        };
+        let source_matches = table
+            .get("source")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|source| source == fresh.source_id);
+        if !source_matches || version != fresh.current_version {
+            continue;
+        }
+
+        let Some(target_version) = assignment.get(name) else {
+            continue;
+        };
+        let Some(checksum) =
+            registry_store.local_release_checksum(&fresh.source_id, &fresh.name, target_version)?
+        else {
+            bail!(
+                "registry {} did not expose a local checksum for coordinated bundle candidate {}@{}",
+                fresh.source_id,
+                fresh.name,
+                target_version
+            );
+        };
+
+        table.insert(
+            "version".to_string(),
+            toml::Value::String(target_version.clone()),
+        );
+        table.insert("checksum".to_string(), toml::Value::String(checksum));
+    }
+
+    let mut seen = HashSet::new();
+    packages.retain(|package| {
+        let Some(table) = package.as_table() else {
+            return true;
+        };
+        let Some(name) = table.get("name").and_then(toml::Value::as_str) else {
+            return true;
+        };
+        let Some(version) = table.get("version").and_then(toml::Value::as_str) else {
+            return true;
+        };
+        let Some(source) = table.get("source").and_then(toml::Value::as_str) else {
+            return true;
+        };
+        seen.insert((name.to_string(), version.to_string(), source.to_string()))
+    });
+
+    fs::write(lockfile_path, toml::to_string(&document)?)
+        .with_context(|| format!("failed to write lockfile {}", lockfile_path.display()))
+}
+
+fn current_component_versions(component: &[FreshCrate]) -> BTreeMap<String, String> {
+    component
+        .iter()
+        .map(|fresh| (fresh.name.clone(), fresh.current_version.clone()))
+        .collect()
+}
+
+fn coordinated_assignment_made_progress(
+    metadata: &cargo_metadata::Metadata,
+    workspace: &Workspace,
+    component: &[FreshCrate],
+) -> bool {
+    let current_versions = current_component_versions(component);
+    component_versions(metadata, workspace, current_versions.keys())
+        .is_some_and(|resolved_versions| resolved_versions != current_versions)
+}
+
+fn component_versions<'a, I>(
+    metadata: &cargo_metadata::Metadata,
+    workspace: &Workspace,
+    crate_names: I,
+) -> Option<BTreeMap<String, String>>
+where
+    I: IntoIterator<Item = &'a String>,
+{
+    let resolve = metadata.resolve.as_ref()?;
+    let requested = crate_names.into_iter().cloned().collect::<HashSet<_>>();
+    let selected_root_ids = selected_package_ids(metadata, workspace);
+    let reachable_ids = reachable_package_ids(resolve, &selected_root_ids);
+    let packages: HashMap<PackageId, &cargo_metadata::Package> = metadata
+        .packages
+        .iter()
+        .map(|package| (package.id.clone(), package))
+        .collect();
+    let mut versions = BTreeMap::new();
+
+    for id in reachable_ids {
+        let Some(package) = packages.get(&id) else {
+            continue;
+        };
+        if requested.contains(package.name.as_ref()) {
+            versions.insert(package.name.to_string(), package.version.to_string());
+        }
+    }
+
+    (versions.len() == requested.len()).then_some(versions)
+}
+
+fn format_component(component: &[FreshCrate]) -> String {
+    component
+        .iter()
+        .map(|entry| format!("{} {}", entry.name, entry.current_version))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_assignment(assignment: &BTreeMap<String, String>) -> String {
+    assignment
+        .iter()
+        .map(|(crate_name, version)| format!("{crate_name} {version}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn inspect_current_release(
@@ -1442,6 +2130,8 @@ mod tests {
         let unchanged = CrateState {
             name: "demo".to_string(),
             source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            registry_name: "crates-io".to_string(),
             current_version: "1.0.0".to_string(),
             minimum_minutes: 60,
             exact_allowed: false,
@@ -1476,6 +2166,8 @@ mod tests {
         let blocker_state = CrateState {
             name: "blocker".to_string(),
             source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            registry_name: "crates-io".to_string(),
             current_version: "1.2.3".to_string(),
             minimum_minutes: 60,
             exact_allowed: false,
@@ -1520,6 +2212,8 @@ mod tests {
         let blocker_state = CrateState {
             name: "blocker".to_string(),
             source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            registry_name: "crates-io".to_string(),
             current_version: "1.2.3".to_string(),
             minimum_minutes: 60,
             exact_allowed: false,
@@ -1585,13 +2279,138 @@ mod tests {
             }],
         });
 
-        assert!(warning.contains("cooldown finished with fresh versions remaining."));
-        assert!(warning.contains(
-            "initial Cargo.lock baseline (already installed, lower risk): serde 1.0.218 @ crates-io"
+        assert_eq!(
+            warning,
+            vec![
+                "cooldown finished with fresh versions remaining.".to_string(),
+                "initial Cargo.lock baseline (already installed, lower risk):".to_string(),
+                "  - serde 1.0.218 @ crates-io".to_string(),
+                "resolver-constrained versions that could not be cooled further (review these):"
+                    .to_string(),
+                "  - web-sys 0.3.94 @ crates-io".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_final_user_summary_lists_cooled_versions_and_remaining_fresh_entries() {
+        let summary = format_final_user_summary(
+            &[CooledVersionNotice {
+                name: "cooldowndep".to_string(),
+                from_version: "1.0.1".to_string(),
+                to_version: "1.0.0".to_string(),
+                registry: "cool-reg".to_string(),
+            }],
+            &FinalFreshReport {
+                baseline_fresh: vec![FreshVersionNotice {
+                    name: "serde".to_string(),
+                    version: "1.0.218".to_string(),
+                    registry: "crates-io".to_string(),
+                }],
+                resolver_constrained_fresh: Vec::new(),
+            },
+            "dependency graph updated and cooled down",
+        );
+
+        assert!(summary.contains("cooled versions:"));
+        assert!(summary.contains("  - cooldowndep 1.0.1 -> 1.0.0 @ cool-reg"));
+        assert!(summary.contains("initial Cargo.lock baseline (already installed, lower risk):"));
+        assert!(summary.ends_with("dependency graph updated and cooled down"));
+    }
+
+    #[test]
+    fn search_coordinated_assignment_picks_a_consistent_bundle() {
+        let shared_id: PackageId = serde_json::from_value(json!(
+            "registry+https://github.com/rust-lang/crates.io-index#sharedshim@1.1.0"
+        ))
+        .unwrap();
+        let web_id: PackageId = serde_json::from_value(json!(
+            "registry+https://github.com/rust-lang/crates.io-index#webshim@1.1.0"
+        ))
+        .unwrap();
+        let future_id: PackageId = serde_json::from_value(json!(
+            "registry+https://github.com/rust-lang/crates.io-index#futureshim@1.1.0"
+        ))
+        .unwrap();
+        let plans = vec![
+            BundleMemberPlan {
+                fresh: FreshCrate {
+                    package_id: web_id,
+                    name: "webshim".to_string(),
+                    source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+                    current_version: "1.1.0".to_string(),
+                    minimum_minutes: 60,
+                },
+                candidates: vec![
+                    BundleCandidate {
+                        version: "1.0.0".to_string(),
+                        parsed_version: Version::parse("1.0.0").unwrap(),
+                        internal_requirements: BTreeMap::from([(
+                            "sharedshim".to_string(),
+                            VersionReq::parse("=1.0.0").unwrap(),
+                        )]),
+                    },
+                    BundleCandidate {
+                        version: "1.0.1".to_string(),
+                        parsed_version: Version::parse("1.0.1").unwrap(),
+                        internal_requirements: BTreeMap::from([(
+                            "sharedshim".to_string(),
+                            VersionReq::parse("=1.0.1").unwrap(),
+                        )]),
+                    },
+                ],
+            },
+            BundleMemberPlan {
+                fresh: FreshCrate {
+                    package_id: future_id,
+                    name: "futureshim".to_string(),
+                    source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+                    current_version: "1.1.0".to_string(),
+                    minimum_minutes: 60,
+                },
+                candidates: vec![BundleCandidate {
+                    version: "1.0.0".to_string(),
+                    parsed_version: Version::parse("1.0.0").unwrap(),
+                    internal_requirements: BTreeMap::from([(
+                        "sharedshim".to_string(),
+                        VersionReq::parse("=1.0.0").unwrap(),
+                    )]),
+                }],
+            },
+            BundleMemberPlan {
+                fresh: FreshCrate {
+                    package_id: shared_id,
+                    name: "sharedshim".to_string(),
+                    source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+                    current_version: "1.1.0".to_string(),
+                    minimum_minutes: 60,
+                },
+                candidates: vec![
+                    BundleCandidate {
+                        version: "1.0.0".to_string(),
+                        parsed_version: Version::parse("1.0.0").unwrap(),
+                        internal_requirements: BTreeMap::new(),
+                    },
+                    BundleCandidate {
+                        version: "1.0.1".to_string(),
+                        parsed_version: Version::parse("1.0.1").unwrap(),
+                        internal_requirements: BTreeMap::new(),
+                    },
+                ],
+            },
+        ];
+        let mut assignment = BTreeMap::new();
+        let mut budget = MAX_COORDINATED_ASSIGNMENTS;
+
+        assert!(search_coordinated_assignment(
+            &plans,
+            0,
+            &mut assignment,
+            &mut budget
         ));
-        assert!(warning.contains(
-            "resolver-constrained versions that could not be cooled further (review these): web-sys 0.3.94 @ crates-io"
-        ));
+        assert_eq!(assignment["webshim"].version, "1.0.0");
+        assert_eq!(assignment["futureshim"].version, "1.0.0");
+        assert_eq!(assignment["sharedshim"].version, "1.0.0");
     }
 
     #[test]

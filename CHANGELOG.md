@@ -69,6 +69,9 @@ Migration guide:
   later with a generic fixed-point error
 - cooldown now emits a single final warning when fresh versions remain,
   distinguishing baseline-carried versions from resolver-constrained ones
+- cooldown now makes one bounded coordinated bundle attempt for small
+  resolver-constrained groups, which helps cool tightly coupled crates such as
+  `js-sys` / `wasm-bindgen*` / `web-sys` when individual pins cannot progress
 - successful `cargo cooldown update` runs now keep the initial `cargo update`
   chatter hidden, so user-facing output stays focused on cooldown results
 - `--manifest-path` is now honored during both cooldown inspection and

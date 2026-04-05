@@ -167,8 +167,19 @@ resolver also restarts from `cargo metadata` once so those skipped versions are
 left out of the next freshness queue instead of ending in a generic fixed-point
 error immediately.
 
-At the end of the run, cooldown emits a single summary warning if fresh
-versions still remain. That final warning distinguishes between:
+Before giving up on the remaining best-effort set, cooldown now runs one more
+bounded pass for small resolver-constrained bundles. It groups fresh crates that
+kept blocking each other, searches a small set of mutually compatible older
+versions using local index dependency metadata, rewrites that bundle in
+`Cargo.lock` as one coordinated candidate state, and asks Cargo to validate the
+result. This helps for tightly coupled stacks such as `js-sys` /
+`wasm-bindgen*` / `web-sys`, where no single `cargo update --precise` can make
+progress from the current lockfile but a coordinated older bundle is still
+valid.
+
+At the end of the run, cooldown emits one user-facing summary block. It lists
+the versions that were actually cooled during the run, and if fresh versions
+still remain it also distinguishes between:
 
 - versions that were already present in the initial `Cargo.lock` baseline; and
 - versions that the resolver had to keep fresh because no further compatible

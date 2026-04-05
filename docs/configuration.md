@@ -68,9 +68,9 @@ contain the values that genuinely differ from the workspace defaults.
 
 `verbose = true` enables `DEBUG` logs for cooldown internals such as release-age
 inspection, candidate selection, and per-pass scan summaries. User-facing
-`INFO` and `WARN` output stays compact: repeated pin attempts stay in `DEBUG`,
-and any fresh versions that remain after cooldown are summarized once at the
-end.
+output stays compact: repeated pin attempts stay in `DEBUG`, and cooldown ends
+with one summary block that lists the versions it cooled plus any fresh
+versions that had to remain.
 
 `skip_registries` can be written as:
 

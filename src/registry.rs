@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use reqwest::Url;
 use reqwest::blocking::Client;
+use semver::VersionReq;
 use serde::{Deserialize, Serialize};
 use tame_index::index::{FileLock, IndexCache, IndexConfig, IndexLocation, IndexUrl};
 use tame_index::utils::canonicalize_url;
@@ -61,6 +62,18 @@ impl ReleaseTimeline {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseDependency {
+    pub crate_name: String,
+    pub requirement: VersionReq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalReleaseMetadata {
+    pub dependencies: Vec<ReleaseDependency>,
+    pub checksum: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct RegistryContext {
     pub logical_name: String,
@@ -91,6 +104,7 @@ pub struct RegistryStore {
     retries: u32,
     registries: HashMap<String, RegistryContext>,
     timelines: HashMap<(String, String), ReleaseTimeline>,
+    index_krates: HashMap<(String, String), Option<IndexKrate>>,
     skip_registries: Vec<String>,
 }
 
@@ -113,6 +127,7 @@ impl RegistryStore {
             retries: config.http_retries,
             registries: HashMap::new(),
             timelines: HashMap::new(),
+            index_krates: HashMap::new(),
             skip_registries: config.skip_registries.clone(),
         })
     }
@@ -152,6 +167,83 @@ impl RegistryStore {
         let timeline = merge_timelines(local, api);
         self.timelines.insert(cache_key, timeline.clone());
         Ok(timeline)
+    }
+
+    pub fn local_release_dependencies(
+        &mut self,
+        source_id: &str,
+        crate_name: &str,
+        version: &str,
+    ) -> Result<Option<Vec<ReleaseDependency>>> {
+        Ok(self
+            .local_release_metadata(source_id, crate_name, version)?
+            .map(|metadata| metadata.dependencies))
+    }
+
+    pub fn local_release_checksum(
+        &mut self,
+        source_id: &str,
+        crate_name: &str,
+        version: &str,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .local_release_metadata(source_id, crate_name, version)?
+            .map(|metadata| metadata.checksum))
+    }
+
+    fn local_release_metadata(
+        &mut self,
+        source_id: &str,
+        crate_name: &str,
+        version: &str,
+    ) -> Result<Option<LocalReleaseMetadata>> {
+        let cache_key = (source_id.to_string(), crate_name.to_string());
+        if !self.index_krates.contains_key(&cache_key) {
+            let context = self.context_for_source(source_id)?.clone();
+            let krate = load_index_krate(&context, crate_name)?;
+            self.index_krates.insert(cache_key.clone(), krate);
+        }
+
+        let Some(krate) = self
+            .index_krates
+            .get(&cache_key)
+            .and_then(|cached| cached.as_ref())
+        else {
+            return Ok(None);
+        };
+        let Some(release) = krate
+            .versions
+            .iter()
+            .find(|candidate| candidate.version == version)
+        else {
+            return Ok(None);
+        };
+
+        let dependencies = release
+            .dependencies()
+            .iter()
+            .filter(|dependency| !dependency.is_optional() && dependency.target().is_none())
+            .map(|dependency| {
+                let requirement = dependency.req.parse::<VersionReq>().with_context(|| {
+                    format!(
+                        "invalid dependency requirement {} for {}@{} -> {}",
+                        dependency.req,
+                        crate_name,
+                        version,
+                        dependency.crate_name()
+                    )
+                })?;
+                Ok(ReleaseDependency {
+                    crate_name: dependency.crate_name().to_string(),
+                    requirement,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Some(LocalReleaseMetadata {
+            dependencies,
+            checksum: checksum_hex(release.checksum()),
+        }))
     }
 
     fn fetch_api_versions(
@@ -276,13 +368,21 @@ fn load_local_timeline(
     context: &RegistryContext,
     crate_name: &str,
 ) -> Result<Option<ReleaseTimeline>> {
+    let Some(krate) = load_index_krate(context, crate_name)? else {
+        return Ok(None);
+    };
+
+    index_krate_to_timeline(crate_name, &krate).map(Some)
+}
+
+fn load_index_krate(context: &RegistryContext, crate_name: &str) -> Result<Option<IndexKrate>> {
     let cache = IndexCache::at_path(context.index_root.clone());
     let lock = FileLock::unlocked();
     let Some(krate) = cache.cached_krate(crate_name.try_into()?, None, &lock)? else {
         return Ok(None);
     };
 
-    index_krate_to_timeline(crate_name, &krate).map(Some)
+    Ok(Some(krate))
 }
 
 fn index_krate_to_timeline(crate_name: &str, krate: &IndexKrate) -> Result<ReleaseTimeline> {
@@ -465,6 +565,15 @@ fn cargo_config_root() -> Option<TamePathBuf> {
     std::env::current_dir()
         .ok()
         .and_then(|path| TamePathBuf::from_path_buf(path).ok())
+}
+
+fn checksum_hex(bytes: &[u8; 32]) -> String {
+    let mut hex = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    hex
 }
 
 pub fn assert_has_timestamp(

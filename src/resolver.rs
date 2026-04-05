@@ -29,36 +29,71 @@ pub fn select_candidate<'a>(
     now: DateTime<Utc>,
     baseline_allows: impl Fn(&str) -> bool,
 ) -> Option<&'a Release> {
-    let cutoff = cutoff_time(minimum_minutes, now);
-    let current = Version::parse(current_version).ok()?;
+    select_candidates(
+        timeline,
+        current_version,
+        requirements,
+        minimum_minutes,
+        now,
+        baseline_allows,
+        1,
+    )
+    .into_iter()
+    .next()
+}
 
-    timeline
+pub fn select_candidates<'a, F>(
+    timeline: &'a ReleaseTimeline,
+    current_version: &str,
+    requirements: &[VersionReq],
+    minimum_minutes: u64,
+    now: DateTime<Utc>,
+    baseline_allows: F,
+    limit: usize,
+) -> Vec<&'a Release>
+where
+    F: Fn(&str) -> bool,
+{
+    let cutoff = cutoff_time(minimum_minutes, now);
+    let Some(current) = Version::parse(current_version).ok() else {
+        return Vec::new();
+    };
+
+    let mut candidates = Vec::new();
+    for release in timeline
         .releases
         .iter()
         .rev()
         .filter(|release| !release.yanked)
-        .find_map(|release| {
-            let baseline_allowed = baseline_allows(&release.version);
-            if !baseline_allowed {
-                let published_at = release.published_at?;
-                if published_at > cutoff {
-                    return None;
-                }
+    {
+        let baseline_allowed = baseline_allows(&release.version);
+        if !baseline_allowed {
+            let Some(published_at) = release.published_at else {
+                continue;
+            };
+            if published_at > cutoff {
+                continue;
             }
+        }
 
-            let parsed = Version::parse(&release.version).ok()?;
-            if parsed >= current {
-                return None;
+        let Some(parsed) = Version::parse(&release.version).ok() else {
+            continue;
+        };
+        if parsed >= current {
+            continue;
+        }
+        if requirements
+            .iter()
+            .all(|requirement| requirement.matches(&parsed))
+        {
+            candidates.push(release);
+            if candidates.len() >= limit {
+                break;
             }
-            if requirements
-                .iter()
-                .all(|requirement| requirement.matches(&parsed))
-            {
-                Some(release)
-            } else {
-                None
-            }
-        })
+        }
+    }
+
+    candidates
 }
 
 #[derive(Debug)]
@@ -179,6 +214,30 @@ mod tests {
         .expect("baseline version should remain eligible");
 
         assert_eq!(candidate.version, "1.0.0");
+    }
+
+    #[test]
+    fn select_candidates_returns_multiple_options_in_descending_order() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 3, 0, 0, 0).unwrap();
+        let requirements = vec![VersionReq::parse("^1").unwrap()];
+        let timeline = timeline();
+        let candidates = select_candidates(
+            &timeline,
+            "1.2.0",
+            &requirements,
+            14 * 24 * 60,
+            now,
+            |_| false,
+            2,
+        );
+
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|release| release.version.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1.1.0", "1.0.0"]
+        );
     }
 
     #[test]

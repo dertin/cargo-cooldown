@@ -16,7 +16,7 @@ use std::process::{Command, Output};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clap_cargo::{Features, Manifest, Workspace};
-use tracing::{info, warn};
+use tracing::{debug, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Mode;
@@ -295,7 +295,7 @@ fn write_captured_output(output: &Output) {
 }
 
 fn run_initial_cargo_update(forwarded_args: &[OsString]) -> Result<std::process::ExitStatus> {
-    info!("refreshing lockfile via cargo update before applying cooldown");
+    debug!("refreshing lockfile via cargo update before applying cooldown");
     let output = Command::new("cargo").args(forwarded_args).output()?;
     if !output.status.success() {
         write_captured_output(&output);
