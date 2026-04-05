@@ -9,7 +9,10 @@ re-reading the same registry metadata inside one cooldown execution.
 flowchart TD
     Start([Start cargo-cooldown]) --> Config[Load cooldown.toml and embedded allow rules]
     Config --> Baseline[Snapshot initial Cargo.lock]
-    Baseline --> FixedNow[Fix one now for the whole run]
+    Baseline --> Command{Requested command}
+    Command -->|update| Update[Run cargo update]
+    Command -->|build/check/test/run| FixedNow[Fix one now for the whole run]
+    Update --> FixedNow
     FixedNow --> Metadata[cargo metadata]
     Metadata --> Scan[Scan resolved registry packages]
     Scan --> Skip{Skipped or exempt?}
@@ -45,8 +48,19 @@ At the beginning of one `cargo-cooldown` execution, the resolver:
 
 1. loads config and embedded allow rules;
 2. snapshots the initial `Cargo.lock` once;
-3. fixes a single `now` timestamp for the whole run;
-4. creates one registry store that lives across every pin attempt in that run.
+3. if the requested command is `cargo cooldown update`, runs `cargo update`;
+4. fixes a single `now` timestamp for the whole run;
+5. creates one registry store that lives across every pin attempt in that run.
+
+That snapshot is taken before any Cargo command is allowed to rewrite the
+lockfile.
+
+- for `cargo cooldown build|check|test|run`, the snapshot happens before
+  `cargo metadata` and before any fallback `cargo generate-lockfile` when the
+  lockfile is missing;
+- for `cargo cooldown update`, the snapshot happens before `cargo update`, and
+  the later cooldown pass evaluates the post-update lockfile against that
+  pre-update baseline.
 
 That boundary matters because the current implementation already caches:
 
@@ -63,6 +77,16 @@ If any later cooldown step fails after Cargo has already rewritten `Cargo.lock`,
 the resolver restores the exact lockfile contents that were present at process
 start before returning the error.
 
+That means `cargo cooldown update` has this exact shape:
+
+1. read and snapshot the current `Cargo.lock`;
+2. run `cargo update`;
+3. inspect the updated lockfile;
+4. with `lockfile_policy = "changed"`, exempt any `(registry, crate, version)`
+   that was already present in the original snapshot;
+5. pin only the newly introduced or version-changed fresh entries;
+6. if the cooldown step fails in `enforce` mode, restore the original lockfile.
+
 ## 2. Graph scan and release-age inspection
 
 On each outer pass, `cargo-cooldown` runs `cargo metadata` and rebuilds the
@@ -77,6 +101,11 @@ For each registry package in that graph:
    `(registry, crate, version)` was already present in the initial lockfile
    baseline;
 5. inspect the locked version age.
+
+For `cargo cooldown update`, step 4 compares the updated lockfile against the
+pre-update snapshot. So a version that was already in `Cargo.lock` before the
+update remains exempt, while a version introduced by `cargo update` is eligible
+for cooldown.
 
 The age inspection itself works like this:
 

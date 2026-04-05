@@ -689,35 +689,45 @@ fn parse_blockers(stdout: &str, stderr: &str) -> Vec<Blocker> {
     let mut blockers = Vec::new();
     for line in stdout.lines().chain(stderr.lines()) {
         let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("required by package `")
-            && let Some(end) = rest.find('`')
-        {
-            let inner = &rest[..end];
-            if let Some((name, version)) = inner.rsplit_once(' ') {
-                let version = version.trim_start_matches('v').to_string();
-                if !blockers.iter().any(|existing: &Blocker| {
-                    existing.name == name && existing.version.as_deref() == Some(&version)
-                }) {
-                    blockers.push(Blocker {
-                        name: name.to_string(),
-                        version: Some(version),
-                    });
-                }
-            } else if !blockers
+        if let Some(blocker) = parse_blocker_line(trimmed)
+            && !blockers
                 .iter()
-                .any(|existing: &Blocker| existing.name == inner)
-            {
-                blockers.push(Blocker {
-                    name: inner.to_string(),
-                    version: None,
-                });
-            }
+                .any(|existing: &Blocker| existing == &blocker)
+        {
+            blockers.push(blocker);
         }
     }
     blockers
 }
 
-#[derive(Debug)]
+fn parse_blocker_line(line: &str) -> Option<Blocker> {
+    for marker in ["required by package `", "previously selected package `"] {
+        let Some(start) = line.find(marker) else {
+            continue;
+        };
+        let rest = &line[start + marker.len()..];
+        let end = rest.find('`')?;
+        return Some(parse_blocker_inner(&rest[..end]));
+    }
+
+    None
+}
+
+fn parse_blocker_inner(inner: &str) -> Blocker {
+    if let Some((name, version)) = inner.rsplit_once(' ') {
+        Blocker {
+            name: name.to_string(),
+            version: Some(version.trim_start_matches('v').to_string()),
+        }
+    } else {
+        Blocker {
+            name: inner.to_string(),
+            version: None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct Blocker {
     name: String,
     version: Option<String>,
@@ -762,6 +772,26 @@ mod tests {
         assert!(!is_exact_requirement(
             &VersionReq::parse(">=1.2.3, <2.0.0").unwrap()
         ));
+    }
+
+    #[test]
+    fn parse_blockers_handles_cargo_conflict_diagnostics() {
+        let stderr = r#"error: failed to select a version for `js-sys`.
+    ... required by package `web-sys v0.3.94`
+    ... which satisfies dependency `web-sys = "^0.3.66"` (locked to 0.3.94) of package `plotters v0.3.7`
+  previously selected package `js-sys v0.3.92`
+    ... which satisfies dependency `js-sys = "=0.3.92"` of package `wasm-bindgen-futures v0.4.65`"#;
+
+        let blockers = parse_blockers("", stderr);
+
+        assert!(blockers.contains(&Blocker {
+            name: "web-sys".to_string(),
+            version: Some("0.3.94".to_string()),
+        }));
+        assert!(blockers.contains(&Blocker {
+            name: "js-sys".to_string(),
+            version: Some("0.3.92".to_string()),
+        }));
     }
 
     #[test]
