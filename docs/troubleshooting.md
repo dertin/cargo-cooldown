@@ -34,3 +34,12 @@ Possible reasons:
 - the package is allowlisted;
 - the package comes from a skipped registry;
 - Cargo rejected the candidate because of blockers elsewhere in the graph.
+
+## A member-specific config file was ignored
+
+Per-member `cooldown.toml` overrides only apply when the run targets exactly
+one workspace member.
+
+If you run with `--workspace`, multiple `--package` values, or another
+ambiguous workspace selection, `cargo-cooldown` uses only the workspace root
+config.

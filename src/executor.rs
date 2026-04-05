@@ -8,7 +8,6 @@ use chrono::{DateTime, Utc};
 use semver::{Op, VersionReq};
 use tracing::{debug, info};
 
-use crate::allowlist::Allowlist;
 use crate::config::Config;
 use crate::lockfile::LockfileSnapshot;
 use crate::metadata::read_metadata;
@@ -27,7 +26,7 @@ pub fn run_pinning_flow(
     workspace: &Workspace,
     features: &Features,
 ) -> Result<()> {
-    let allowlist = Allowlist::load(config.allowlist_path.clone())?;
+    let allowlist = &config.allowlist;
     let per_crate_minutes = allowlist.per_crate_minutes();
     let global_minutes = allowlist.global_minutes();
     let mut registry_store = RegistryStore::new(config)?;
@@ -675,6 +674,7 @@ impl Blocker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allowlist::Allowlist;
     use crate::config::{Config, LockfilePolicy, Mode};
     use serde_json::json;
 
@@ -1086,11 +1086,11 @@ mod tests {
             lockfile_policy: LockfilePolicy::Changed,
             now_override: None,
             ttl_seconds: 60,
-            allowlist_path: None,
             cache_dir: None,
             http_retries: 0,
             verbose: false,
             skip_registries: Vec::new(),
+            allowlist: Allowlist::default(),
         };
 
         assert_eq!(config.cooldown_minutes, 60);

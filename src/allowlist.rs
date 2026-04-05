@@ -1,17 +1,14 @@
-use serde::Deserialize;
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use serde::Deserialize;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq)]
 pub struct Allowlist {
     #[serde(default)]
     pub allow: AllowSection,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq)]
 pub struct AllowSection {
     #[serde(default)]
     pub exact: Vec<AllowExact>,
@@ -20,14 +17,14 @@ pub struct AllowSection {
     pub global: Option<AllowGlobal>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct AllowExact {
     #[serde(rename = "crate")]
     pub crate_name: String,
     pub version: String,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct AllowPackage {
     #[serde(rename = "crate")]
     pub crate_name: String,
@@ -37,7 +34,7 @@ pub struct AllowPackage {
     pub minutes: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct AllowGlobal {
     #[serde(default)]
     pub minimum_release_age: Option<u64>,
@@ -46,21 +43,15 @@ pub struct AllowGlobal {
 }
 
 impl Allowlist {
-    pub fn load(path: Option<PathBuf>) -> Result<Self> {
-        let path = match path {
-            Some(p) => p,
-            None => PathBuf::from("cooldown-allowlist.toml"),
-        };
+    #[cfg(test)]
+    pub fn merged(base: &Self, overlay: &Self) -> Self {
+        let mut merged = base.clone();
+        merged.merge_from(overlay);
+        merged
+    }
 
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-
-        let contents = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read allowlist at {}", path.display()))?;
-        let allowlist: Allowlist = toml::from_str(&contents)
-            .with_context(|| format!("failed to parse allowlist at {}", path.display()))?;
-        Ok(allowlist)
+    pub fn merge_from(&mut self, overlay: &Self) {
+        self.allow.merge_from(&overlay.allow);
     }
 
     pub fn is_exact_allowed(&self, name: &str, version: &str) -> bool {
@@ -84,6 +75,7 @@ impl Allowlist {
             .as_ref()
             .and_then(AllowGlobal::effective_minutes)
     }
+
     #[cfg(test)]
     pub fn effective_minutes_for(&self, name: &str, default_minutes: u64) -> u64 {
         let mut effective = default_minutes;
@@ -96,6 +88,35 @@ impl Allowlist {
             effective = effective.min(minutes);
         }
         effective
+    }
+}
+
+impl AllowSection {
+    pub fn merge_from(&mut self, overlay: &Self) {
+        if let Some(global) = &overlay.global {
+            self.global = Some(global.clone());
+        }
+
+        for package in &overlay.package {
+            if let Some(existing) = self
+                .package
+                .iter_mut()
+                .find(|existing| existing.crate_name == package.crate_name)
+            {
+                *existing = package.clone();
+            } else {
+                self.package.push(package.clone());
+            }
+        }
+
+        for exact in &overlay.exact {
+            if self.exact.iter().any(|existing| {
+                existing.crate_name == exact.crate_name && existing.version == exact.version
+            }) {
+                continue;
+            }
+            self.exact.push(exact.clone());
+        }
     }
 }
 
@@ -114,26 +135,77 @@ impl AllowGlobal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use tempfile::NamedTempFile;
 
     #[test]
-    fn loads_allowlist_and_respects_exact() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            "[[allow.exact]]\ncrate = \"foo\"\nversion = \"1.2.3\"\n[[allow.package]]\ncrate = \"bar\"\nminimum_release_age = 3\n[allow.global]\nminutes = 5\n"
-        )
-        .unwrap();
+    fn merged_allowlist_deduplicates_exact_and_overrides_package_minutes() {
+        let base = Allowlist {
+            allow: AllowSection {
+                exact: vec![AllowExact {
+                    crate_name: "foo".to_string(),
+                    version: "1.2.3".to_string(),
+                }],
+                package: vec![AllowPackage {
+                    crate_name: "bar".to_string(),
+                    minimum_release_age: Some(10),
+                    minutes: None,
+                }],
+                global: Some(AllowGlobal {
+                    minimum_release_age: Some(60),
+                    minutes: None,
+                }),
+            },
+        };
+        let overlay = Allowlist {
+            allow: AllowSection {
+                exact: vec![
+                    AllowExact {
+                        crate_name: "foo".to_string(),
+                        version: "1.2.3".to_string(),
+                    },
+                    AllowExact {
+                        crate_name: "baz".to_string(),
+                        version: "9.9.9".to_string(),
+                    },
+                ],
+                package: vec![AllowPackage {
+                    crate_name: "bar".to_string(),
+                    minimum_release_age: Some(5),
+                    minutes: None,
+                }],
+                global: Some(AllowGlobal {
+                    minimum_release_age: Some(30),
+                    minutes: None,
+                }),
+            },
+        };
 
-        let allowlist = Allowlist::load(Some(file.path().to_path_buf())).unwrap();
-        assert!(allowlist.is_exact_allowed("foo", "1.2.3"));
-        assert!(!allowlist.is_exact_allowed("foo", "1.2.4"));
+        let merged = Allowlist::merged(&base, &overlay);
 
-        let per_crate = allowlist.per_crate_minutes();
-        assert_eq!(per_crate.get("bar"), Some(&3));
-        assert_eq!(allowlist.global_minutes(), Some(5));
-        assert_eq!(allowlist.effective_minutes_for("bar", 7), 3);
-        assert_eq!(allowlist.effective_minutes_for("baz", 7), 5);
+        assert!(merged.is_exact_allowed("foo", "1.2.3"));
+        assert!(merged.is_exact_allowed("baz", "9.9.9"));
+        assert_eq!(merged.allow.exact.len(), 2);
+        assert_eq!(merged.effective_minutes_for("bar", 90), 5);
+        assert_eq!(merged.global_minutes(), Some(30));
+    }
+
+    #[test]
+    fn package_rule_can_disable_cooldown_for_one_crate() {
+        let allowlist = Allowlist {
+            allow: AllowSection {
+                exact: Vec::new(),
+                package: vec![AllowPackage {
+                    crate_name: "tokio".to_string(),
+                    minimum_release_age: None,
+                    minutes: Some(0),
+                }],
+                global: Some(AllowGlobal {
+                    minimum_release_age: Some(1440),
+                    minutes: None,
+                }),
+            },
+        };
+
+        assert_eq!(allowlist.effective_minutes_for("tokio", 1440), 0);
+        assert_eq!(allowlist.effective_minutes_for("serde", 1440), 1440);
     }
 }

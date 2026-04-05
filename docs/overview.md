@@ -22,6 +22,10 @@ Key behavior:
 - unchanged lockfile entries are skipped by default;
 - `lockfile_policy = "all"` (or `COOLDOWN_LOCKFILE_POLICY=all`) restores the
   previous "cool every eligible locked package" behavior;
+- configuration lives in one `cooldown.toml`, including allow rules;
+- workspaces use the workspace root config by default, with optional member
+  overrides only for uniquely targeted members;
+- `cargo cooldown init` scaffolds the recommended layout interactively;
 - packages from `skip_registries` never participate in cooldown.
 
 More detailed reference docs:

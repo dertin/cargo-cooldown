@@ -31,6 +31,15 @@ Run a command through the cooldown guard:
 COOLDOWN_MINUTES=1440 cargo cooldown check
 ```
 
+Initialize `cooldown.toml` in the current project root:
+
+```bash
+cargo cooldown init
+```
+
+`cargo cooldown init` is the cooldown configuration wizard. To create a new
+Cargo package, use plain `cargo init`.
+
 Skip a registry completely:
 
 ```bash
@@ -43,8 +52,8 @@ Supported environment variables:
 
 - `COOLDOWN_MINUTES`
 - `COOLDOWN_MODE`
+- `COOLDOWN_LOCKFILE_POLICY`
 - `COOLDOWN_NOW`
-- `COOLDOWN_ALLOWLIST_PATH`
 - `COOLDOWN_TTL_SECONDS`
 - `COOLDOWN_CACHE_DIR`
 - `COOLDOWN_HTTP_RETRIES`
@@ -55,13 +64,54 @@ Supported `cooldown.toml` keys:
 
 - `cooldown_minutes`
 - `mode`
+- `lockfile_policy`
 - `now`
-- `allowlist_path`
 - `ttl_seconds`
 - `cache_dir`
 - `http_retries`
 - `verbose`
 - `skip_registries`
+
+Define allow rules in `cooldown.toml`:
+
+```toml
+[allow.global]
+minutes = 1440
+
+[[allow.exact]]
+crate = "serde"
+version = "1.0.218"
+
+[[allow.exact]]
+crate = "serde_json"
+version = "1.0.145"
+
+[[allow.package]]
+crate = "tokio"
+minutes = 60
+
+[[allow.package]]
+crate = "openssl"
+minutes = 0
+```
+
+Rule semantics:
+
+- `[allow.global]` sets a default cooldown override for every registry crate
+- each `[[allow.package]]` entry applies to one crate name, and you can define
+  many different crates with different cooldowns
+- `allow.global` and `allow.package` only reduce the effective cooldown window;
+  they do not increase it above `cooldown_minutes`
+- `minutes = 0` in `[[allow.package]]` excludes that crate from cooldown
+- each `[[allow.exact]]` entry allows one exact `(crate, version)` pair, and
+  you can list as many pairs as you need
+
+Configuration is resolved in this order:
+
+1. environment variables
+2. `cooldown.toml` in the active member, when the run targets a unique member
+3. `cooldown.toml` in the workspace root or crate root
+4. `$CARGO_HOME/cooldown.toml`
 
 `skip_registries` means "do not process these registries for cooldown at all".
 Those packages are left untouched, but they still contribute semver constraints
@@ -70,6 +120,17 @@ to the overall graph.
 If a registry is not skipped and `cargo-cooldown` cannot determine release age
 from the local index or the registry API, the cooldown step fails in `enforce`
 mode and becomes a warning in `warn` mode.
+
+`cargo-cooldown` is intended for commands such as `build`, `check`, `test`, and
+`run`. It intentionally does not wrap `cargo update`, and `cargo cooldown init`
+is reserved for the cooldown configuration wizard rather than forwarding to
+Cargo's own `init`.
+
+In a workspace, the recommended layout is:
+
+- one shared `cooldown.toml` at the workspace root
+- optional `member/cooldown.toml` overrides only for runs that target that
+  member uniquely
 
 ## Docs
 

@@ -42,6 +42,29 @@ or:
 COOLDOWN_LOCKFILE_POLICY=all
 ```
 
+### Allow rules are embedded in `cooldown.toml`
+
+`cooldown-allowlist.toml`, `allowlist_path`, and `COOLDOWN_ALLOWLIST_PATH` no
+longer exist.
+
+Move allow rules into `cooldown.toml`:
+
+```toml
+[[allow.exact]]
+crate = "serde"
+version = "1.0.218"
+
+[[allow.package]]
+crate = "tokio"
+minutes = 60
+
+[allow.global]
+minutes = 1440
+```
+
+For workspaces, put shared rules in the workspace root file and use
+member-local `cooldown.toml` overrides only for uniquely targeted member runs.
+
 ### Registry API routing is discovered automatically
 
 The resolver reads the active registry configuration that Cargo is already using
@@ -70,9 +93,12 @@ If you want a registry to be excluded from cooldown entirely, use
    files.
 3. Remove `COOLDOWN_OFFLINE_OK` from your environment and `cooldown.toml`
    files.
-4. Add `skip_registries` or `COOLDOWN_SKIP_REGISTRIES` for any registry that
+4. Remove `cooldown-allowlist.toml`, `allowlist_path`, and
+   `COOLDOWN_ALLOWLIST_PATH`.
+5. Move allow rules into `cooldown.toml`.
+6. Add `skip_registries` or `COOLDOWN_SKIP_REGISTRIES` for any registry that
    should not participate in cooldown.
-5. If you relied on best-effort behavior, switch to `COOLDOWN_MODE=warn`.
+7. If you relied on best-effort behavior, switch to `COOLDOWN_MODE=warn`.
 
 ## Internal registries
 
@@ -105,6 +131,9 @@ See also:
   dependency closure;
 - unchanged lockfile entries are skipped by default unless
   `lockfile_policy = "all"` is enabled;
+- configuration discovery now starts from the effective Cargo root instead of
+  implicitly following the current directory;
+- allow rules now live inside `cooldown.toml`;
 - `--manifest-path` is honored during both cooldown inspection and
   `cargo update --precise` pinning;
 - Cargo-style selectors such as `--manifest-path`, `--package`, `--workspace`,
@@ -115,5 +144,7 @@ See also:
 
 - no old `COOLDOWN_REGISTRY_*` variables remain in your environment;
 - no `COOLDOWN_OFFLINE_OK` references remain in scripts or docs;
+- no `cooldown-allowlist.toml`, `allowlist_path`, or
+  `COOLDOWN_ALLOWLIST_PATH` references remain;
 - registries that should be excluded are listed in `skip_registries`;
 - flows that expect best-effort behavior use `COOLDOWN_MODE=warn`.

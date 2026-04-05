@@ -327,18 +327,16 @@ fn workspace_member_manifest_generates_workspace_root_lockfile_when_missing() {
 fn exact_allowlist_keeps_fresh_version_pinned() {
     let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
     harness.generate_lockfile();
-    let allowlist = harness.workspace_dir.join("cooldown-allowlist.toml");
+    let config = harness.workspace_dir.join("cooldown.toml");
     fs::write(
-        &allowlist,
-        format!("[[allow.exact]]\ncrate = \"{CRATE_NAME}\"\nversion = \"{FRESH_VERSION}\"\n"),
+        &config,
+        format!(
+            "cooldown_minutes = 1440\nlockfile_policy = \"all\"\n\n[[allow.exact]]\ncrate = \"{CRATE_NAME}\"\nversion = \"{FRESH_VERSION}\"\n"
+        ),
     )
-    .expect("allowlist should be writable");
+    .expect("config should be writable");
 
-    let allowlist_path = allowlist.to_string_lossy().to_string();
-    let output = harness.run_cooldown(&[
-        LOCKFILE_POLICY_ALL,
-        ("COOLDOWN_ALLOWLIST_PATH", allowlist_path.as_str()),
-    ]);
+    let output = harness.run_cooldown(&[]);
     assert!(
         output.status.success(),
         "exact allowlist should bypass cooldown for the pinned version: {}",

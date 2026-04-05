@@ -2,8 +2,10 @@ mod allowlist;
 mod cache;
 mod config;
 mod executor;
+mod init;
 mod lockfile;
 mod metadata;
+mod project;
 mod registry;
 mod resolver;
 
@@ -12,12 +14,13 @@ use std::io::Write;
 use std::process::Command;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use clap_cargo::{Features, Manifest, Workspace};
 use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, Mode};
+use crate::config::Mode;
+use crate::project::ProjectContext;
 
 #[derive(Debug, Parser)]
 #[command(bin_name = "cargo")]
@@ -40,14 +43,18 @@ struct Cli {
     workspace: Workspace,
     #[command(flatten)]
     features: Features,
-    #[arg(
-        value_name = "CARGO_ARG",
-        trailing_var_arg = true,
-        num_args = 1..,
-        allow_hyphen_values = true,
-        help = "Cargo subcommand and params to forward after cooldown checks (build/check/test/run; avoid `cargo update`)."
-    )]
-    cargo_args: Vec<OsString>,
+    #[command(subcommand)]
+    command: CooldownCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CooldownCommand {
+    /// Initialize cooldown.toml in the current project root.
+    ///
+    /// This is cargo-cooldown's setup wizard, not Cargo's `cargo init`.
+    Init,
+    #[command(external_subcommand)]
+    Cargo(Vec<OsString>),
 }
 
 fn init_logging(verbose: bool) {
@@ -67,9 +74,27 @@ fn init_logging(verbose: bool) {
 }
 
 fn parse_cli(raw_args: &[OsString]) -> Cli {
+    let user_args = raw_user_args(raw_args);
+    let (_, cargo_args) = hoist_cargo_selectors(user_args);
+    if init_looks_like_forwarded_cargo_init(&cargo_args) {
+        eprintln!(
+            "`cargo cooldown init` is cargo-cooldown's configuration wizard, not Cargo's project generator.\n\
+             Use plain `cargo init ...` to create a new package, then run `cargo cooldown init` from the project root."
+        );
+        exit_with(2);
+    }
+
     match CargoCli::try_parse_from(normalize_cli_args(raw_args)) {
         Ok(CargoCli::Cooldown(cli)) => cli,
         Err(err) => err.exit(),
+    }
+}
+
+fn raw_user_args(raw_args: &[OsString]) -> &[OsString] {
+    if raw_args.get(1).is_some_and(|arg| arg == "cooldown") {
+        &raw_args[2..]
+    } else {
+        &raw_args[1..]
     }
 }
 
@@ -78,11 +103,7 @@ fn normalize_cli_args(raw_args: &[OsString]) -> Vec<OsString> {
         return Vec::new();
     };
 
-    let user_args = if raw_args.get(1).is_some_and(|arg| arg == "cooldown") {
-        &raw_args[2..]
-    } else {
-        &raw_args[1..]
-    };
+    let user_args = raw_user_args(raw_args);
     let (selectors, cargo_args) = hoist_cargo_selectors(user_args);
 
     let mut normalized = Vec::with_capacity(raw_args.len() + 1);
@@ -150,6 +171,16 @@ fn is_top_level_help_flag(value: &str) -> bool {
     matches!(value, "-h" | "--help")
 }
 
+fn init_looks_like_forwarded_cargo_init(cargo_args: &[OsString]) -> bool {
+    matches!(
+        cargo_args.first().and_then(|value| value.to_str()),
+        Some("init")
+    ) && cargo_args
+        .iter()
+        .skip(1)
+        .any(|arg| !matches!(arg.to_str(), Some("-h" | "--help")))
+}
+
 fn selector_width(value: &str) -> Option<usize> {
     match value {
         "--manifest-path" | "--package" | "-p" | "--exclude" | "--features" | "-F" => Some(2),
@@ -167,12 +198,23 @@ fn selector_width(value: &str) -> Option<usize> {
     }
 }
 
+fn init_uses_runtime_selectors(cli: &Cli) -> bool {
+    cli.manifest.manifest_path.is_some()
+        || !cli.workspace.package.is_empty()
+        || cli.workspace.workspace
+        || cli.workspace.all
+        || !cli.workspace.exclude.is_empty()
+        || cli.features.all_features
+        || cli.features.no_default_features
+        || !cli.features.features.is_empty()
+}
+
 /// Canonicalize the Cargo invocation so the subcommand leads and the selectors
 /// parsed by clap-cargo (`--manifest-path`, `--package`, feature flags, etc.)
 /// are re-applied in the order that upstream `cargo` expects.
-fn assemble_cargo_args(cli: &Cli) -> Vec<OsString> {
+fn assemble_cargo_args(cli: &Cli, cargo_args: &[OsString]) -> Vec<OsString> {
     let mut args = Vec::new();
-    let mut cargo_iter = cli.cargo_args.iter();
+    let mut cargo_iter = cargo_args.iter();
     let command = cargo_iter.next().cloned().expect("cargo command required");
 
     args.push(command);
@@ -241,50 +283,75 @@ fn exit_with(code: i32) -> ! {
 fn main() -> Result<()> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = parse_cli(&raw_args);
-    let config = Config::from_env();
-    init_logging(config.verbose);
 
-    let forwarded_args = assemble_cargo_args(&cli);
+    match &cli.command {
+        CooldownCommand::Init => {
+            if init_uses_runtime_selectors(&cli) {
+                eprintln!(
+                    "`cargo cooldown init` only works from the current project root and does not accept Cargo selection flags."
+                );
+                exit_with(2);
+            }
 
-    if forwarded_args.is_empty() {
-        eprintln!("Usage: cargo cooldown <cargo-command> [args...]");
-        exit_with(2);
-    }
+            let project = ProjectContext::discover_for_init()?;
+            init::run(&project)?;
+            Ok(())
+        }
+        CooldownCommand::Cargo(cargo_args) => {
+            let project = ProjectContext::discover_for_runtime(&cli.manifest, &cli.workspace)?;
+            let config = config::Config::load(&project);
+            init_logging(config.verbose);
 
-    if matches!(
-        cli.cargo_args.first().and_then(|value| value.to_str()),
-        Some("update")
-    ) {
-        eprintln!(
-            "cargo-cooldown is designed for commands like build, check, test, or run.\n\
-             Running it with `cargo update` would replace the lockfile you just cooled down.\n\
-             Invoke `cargo update` directly instead if you truly intend to refresh dependency versions."
-        );
-        exit_with(2);
-    }
+            let forwarded_args = assemble_cargo_args(&cli, cargo_args);
+            if forwarded_args.is_empty() {
+                eprintln!("Usage: cargo cooldown <cargo-command> [args...]");
+                exit_with(2);
+            }
 
-    if config.mode != Mode::Off && config.cooldown_minutes > 0 {
-        match executor::run_pinning_flow(&config, &cli.manifest, &cli.workspace, &cli.features) {
-            Ok(()) => {}
-            Err(err) => match config.mode {
-                Mode::Warn => {
-                    warn!(error = %err, "cooldown guard failed; continuing due to warn mode");
+            if matches!(
+                cargo_args.first().and_then(|value| value.to_str()),
+                Some("update")
+            ) {
+                eprintln!(
+                    "cargo-cooldown is designed for commands like build, check, test, or run.\n\
+                     Running it with `cargo update` would replace the lockfile you just cooled down.\n\
+                     Invoke `cargo update` directly instead if you truly intend to refresh dependency versions."
+                );
+                exit_with(2);
+            }
+
+            if config.mode != Mode::Off && config.cooldown_minutes > 0 {
+                match executor::run_pinning_flow(
+                    &config,
+                    &cli.manifest,
+                    &cli.workspace,
+                    &cli.features,
+                ) {
+                    Ok(()) => {}
+                    Err(err) => match config.mode {
+                        Mode::Warn => {
+                            warn!(error = %err, "cooldown guard failed; continuing due to warn mode");
+                        }
+                        Mode::Enforce => {
+                            return Err(err);
+                        }
+                        Mode::Off => {}
+                    },
                 }
-                Mode::Enforce => {
-                    return Err(err);
-                }
-                Mode::Off => {}
-            },
+            }
+
+            let status = Command::new("cargo").args(&forwarded_args).status()?;
+            exit_with(status.code().unwrap_or(1));
         }
     }
-
-    let status = Command::new("cargo").args(&forwarded_args).status()?;
-    exit_with(status.code().unwrap_or(1));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{assemble_cargo_args, parse_cli, split_features};
+    use super::{
+        CooldownCommand, assemble_cargo_args, init_looks_like_forwarded_cargo_init,
+        init_uses_runtime_selectors, parse_cli, split_features,
+    };
     use std::ffi::OsString;
     use std::path::PathBuf;
 
@@ -298,11 +365,18 @@ mod tests {
             .collect()
     }
 
+    fn cargo_args(cli: &super::Cli) -> Vec<OsString> {
+        match &cli.command {
+            CooldownCommand::Cargo(args) => args.clone(),
+            CooldownCommand::Init => Vec::new(),
+        }
+    }
+
     #[test]
     fn assemble_drops_leading_cooldown_token() {
         let raw = to_os_vec(&["cargo-cooldown", "cooldown", "build", "--release"]);
         let cli = parse_cli(&raw);
-        let forwarded = assemble_cargo_args(&cli);
+        let forwarded = assemble_cargo_args(&cli, &cargo_args(&cli));
         assert_eq!(to_string_vec(&forwarded), vec!["build", "--release"]);
     }
 
@@ -310,7 +384,7 @@ mod tests {
     fn assemble_supports_direct_invocation() {
         let raw = to_os_vec(&["cargo-cooldown", "build", "--release"]);
         let cli = parse_cli(&raw);
-        let forwarded = assemble_cargo_args(&cli);
+        let forwarded = assemble_cargo_args(&cli, &cargo_args(&cli));
         assert_eq!(to_string_vec(&forwarded), vec!["build", "--release"]);
     }
 
@@ -330,7 +404,7 @@ mod tests {
             Some(PathBuf::from("examples/demo/Cargo.toml"))
         );
 
-        let forwarded = assemble_cargo_args(&cli);
+        let forwarded = assemble_cargo_args(&cli, &cargo_args(&cli));
         assert_eq!(
             to_string_vec(&forwarded),
             vec!["build", "--manifest-path", "examples/demo/Cargo.toml"]
@@ -349,9 +423,31 @@ mod tests {
 
         let cli = parse_cli(&raw);
         assert_eq!(
-            cli.cargo_args.first().and_then(|arg| arg.to_str()).unwrap(),
+            cargo_args(&cli)
+                .first()
+                .and_then(|arg| arg.to_str())
+                .unwrap(),
             "update"
         );
+    }
+
+    #[test]
+    fn parse_detects_init_subcommand() {
+        let raw = to_os_vec(&["cargo-cooldown", "cooldown", "init"]);
+        let cli = parse_cli(&raw);
+        assert!(matches!(cli.command, CooldownCommand::Init));
+    }
+
+    #[test]
+    fn detects_forwarded_cargo_init_arguments_as_collision() {
+        let args = to_os_vec(&["init", "--bin"]);
+        assert!(init_looks_like_forwarded_cargo_init(&args));
+    }
+
+    #[test]
+    fn allows_init_help_without_triggering_collision() {
+        let args = to_os_vec(&["init", "--help"]);
+        assert!(!init_looks_like_forwarded_cargo_init(&args));
     }
 
     #[test]
@@ -367,7 +463,7 @@ mod tests {
         ]);
 
         let cli = parse_cli(&raw);
-        let forwarded = assemble_cargo_args(&cli);
+        let forwarded = assemble_cargo_args(&cli, &cargo_args(&cli));
         assert_eq!(
             to_string_vec(&forwarded),
             vec!["test", "--features", "foo,bar", "--", "--nocapture"]
@@ -403,7 +499,7 @@ mod tests {
         ]);
 
         let cli = parse_cli(&raw);
-        let forwarded = assemble_cargo_args(&cli);
+        let forwarded = assemble_cargo_args(&cli, &cargo_args(&cli));
         assert_eq!(
             to_string_vec(&forwarded),
             vec![
@@ -439,7 +535,7 @@ mod tests {
             Some(PathBuf::from("examples/demo/Cargo.toml"))
         );
         assert_eq!(
-            to_string_vec(&assemble_cargo_args(&cli)),
+            to_string_vec(&assemble_cargo_args(&cli, &cargo_args(&cli))),
             vec!["check", "--manifest-path", "examples/demo/Cargo.toml",]
         );
     }
@@ -469,7 +565,7 @@ mod tests {
         assert!(cli.features.no_default_features);
         assert_eq!(cli.features.features, vec!["foo", "bar,baz"]);
         assert_eq!(
-            to_string_vec(&assemble_cargo_args(&cli)),
+            to_string_vec(&assemble_cargo_args(&cli, &cargo_args(&cli))),
             vec![
                 "check",
                 "--package",
@@ -484,5 +580,20 @@ mod tests {
                 "--quiet",
             ]
         );
+    }
+
+    #[test]
+    fn init_rejects_runtime_selectors() {
+        let raw = to_os_vec(&[
+            "cargo-cooldown",
+            "cooldown",
+            "--manifest-path",
+            "examples/demo/Cargo.toml",
+            "init",
+        ]);
+
+        let cli = parse_cli(&raw);
+
+        assert!(init_uses_runtime_selectors(&cli));
     }
 }

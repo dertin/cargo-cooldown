@@ -4,3 +4,22 @@ mode = "enforce"
 ttl_seconds = 86400
 http_retries = 2
 verbose = true
+
+# Example allow rules for manual smoke tests:
+#
+# [[allow.package]]
+# crate = "chrono"
+# minutes = 60
+#
+# [[allow.package]]
+# crate = "serde_json"
+# minutes = 0
+#
+# [[allow.exact]]
+# crate = "serde"
+# version = "1.0.228"
+#
+# `allow.package` can be repeated for as many crates as needed.
+# Use `minutes = 0` to exclude one crate from cooldown entirely.
+# `allow.exact` applies to one exact `(crate, version)` pair; update the
+# version to match something currently present in Cargo.lock when testing it.

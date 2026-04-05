@@ -6,6 +6,9 @@ use chrono::{DateTime, Utc};
 use dirs::home_dir;
 use serde::Deserialize;
 
+use crate::allowlist::{AllowSection, Allowlist};
+use crate::project::ProjectContext;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Enforce,
@@ -49,131 +52,169 @@ pub struct Config {
     pub lockfile_policy: LockfilePolicy,
     pub now_override: Option<DateTime<Utc>>,
     pub ttl_seconds: u64,
-    pub allowlist_path: Option<PathBuf>,
     pub cache_dir: Option<PathBuf>,
     pub http_retries: u32,
     pub verbose: bool,
     pub skip_registries: Vec<String>,
+    pub allowlist: Allowlist,
 }
 
 impl Config {
-    pub fn from_env() -> Self {
-        let file_config = load_file_config();
+    pub fn load(project: &ProjectContext) -> Self {
+        let mut merged = MergedConfig::default();
 
-        let cooldown_minutes = env::var("COOLDOWN_MINUTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .and_then(|cfg| cfg.data.cooldown_minutes)
-            })
-            .unwrap_or(0);
-
-        let mode = Mode::from_env(env::var("COOLDOWN_MODE").ok().as_deref().or_else(|| {
-            file_config
-                .as_ref()
-                .and_then(|cfg| cfg.data.mode.as_deref())
-        }));
-        let lockfile_policy = LockfilePolicy::from_env(
-            env::var("COOLDOWN_LOCKFILE_POLICY")
-                .ok()
-                .as_deref()
-                .or_else(|| {
-                    file_config
-                        .as_ref()
-                        .and_then(|cfg| cfg.data.lockfile_policy.as_deref())
-                }),
-        );
-
-        let now_override = env::var("COOLDOWN_NOW")
-            .ok()
-            .and_then(|value| parse_datetime(&value))
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .and_then(|cfg| cfg.data.now.clone())
-                    .and_then(|value| parse_datetime(&value))
-            });
-
-        let ttl_seconds = env::var("COOLDOWN_TTL_SECONDS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or_else(|| file_config.as_ref().and_then(|cfg| cfg.data.ttl_seconds))
-            .unwrap_or(86_400);
-
-        let allowlist_path = env::var_os("COOLDOWN_ALLOWLIST_PATH")
-            .map(PathBuf::from)
-            .or_else(|| file_config.as_ref().and_then(FileConfig::allowlist_path))
-            .filter(|path| !path.as_os_str().is_empty());
-
-        let cache_dir = env::var_os("COOLDOWN_CACHE_DIR")
-            .map(PathBuf::from)
-            .or_else(|| file_config.as_ref().and_then(FileConfig::cache_dir))
-            .filter(|path| !path.as_os_str().is_empty());
-
-        let http_retries = env::var("COOLDOWN_HTTP_RETRIES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&v| v <= 8)
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .and_then(|cfg| cfg.data.http_retries)
-                    .filter(|&v| v <= 8)
-            })
-            .unwrap_or(2);
-
-        let verbose = match env::var("COOLDOWN_VERBOSE") {
-            Ok(value) => parse_bool(&value),
-            Err(_) => file_config
-                .as_ref()
-                .and_then(|cfg| cfg.data.verbose)
-                .unwrap_or(false),
-        };
-
-        let skip_registries = env::var("COOLDOWN_SKIP_REGISTRIES")
-            .ok()
-            .map(|value| parse_registry_skip_list(&value))
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .and_then(|cfg| cfg.data.skip_registries.clone())
-                    .map(StringList::into_vec)
-            })
-            .unwrap_or_default();
-
-        Self {
-            cooldown_minutes,
-            mode,
-            lockfile_policy,
-            now_override,
-            ttl_seconds,
-            allowlist_path,
-            cache_dir,
-            http_retries,
-            verbose,
-            skip_registries,
+        if let Some(path) = user_config_path() {
+            merged.apply_file(&path);
         }
+        merged.apply_file(&project.workspace_config_path());
+        if let Some(path) = project.member_config_path() {
+            merged.apply_file(&path);
+        }
+        merged.apply_env();
+        merged.finish()
     }
 }
 
-fn parse_registry_skip_list(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct CooldownFile {
+    #[serde(alias = "COOLDOWN_MINUTES")]
+    cooldown_minutes: Option<u64>,
+    #[serde(alias = "COOLDOWN_MODE")]
+    mode: Option<String>,
+    #[serde(alias = "COOLDOWN_LOCKFILE_POLICY")]
+    lockfile_policy: Option<String>,
+    #[serde(alias = "COOLDOWN_NOW")]
+    now: Option<String>,
+    #[serde(alias = "COOLDOWN_TTL_SECONDS")]
+    ttl_seconds: Option<u64>,
+    #[serde(alias = "COOLDOWN_CACHE_DIR")]
+    cache_dir: Option<PathBuf>,
+    #[serde(alias = "COOLDOWN_HTTP_RETRIES")]
+    http_retries: Option<u32>,
+    #[serde(alias = "COOLDOWN_VERBOSE")]
+    verbose: Option<bool>,
+    #[serde(alias = "COOLDOWN_SKIP_REGISTRIES")]
+    skip_registries: Option<StringList>,
+    #[serde(default)]
+    allow: AllowSection,
 }
 
-fn parse_bool(value: &str) -> bool {
-    value == "1" || value.eq_ignore_ascii_case("true")
+#[derive(Debug, Default)]
+struct MergedConfig {
+    cooldown_minutes: Option<u64>,
+    mode: Option<Mode>,
+    lockfile_policy: Option<LockfilePolicy>,
+    now_override: Option<DateTime<Utc>>,
+    ttl_seconds: Option<u64>,
+    cache_dir: Option<PathBuf>,
+    http_retries: Option<u32>,
+    verbose: Option<bool>,
+    skip_registries: Vec<String>,
+    allowlist: Allowlist,
 }
 
-fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|parsed| parsed.with_timezone(&Utc))
+impl MergedConfig {
+    fn apply_file(&mut self, path: &Path) {
+        let Some(file) = read_file_config(path) else {
+            return;
+        };
+
+        if let Some(minutes) = file.data.cooldown_minutes {
+            self.cooldown_minutes = Some(minutes);
+        }
+        if let Some(mode) = file.data.mode.as_deref() {
+            self.mode = Some(Mode::from_env(Some(mode)));
+        }
+        if let Some(policy) = file.data.lockfile_policy.as_deref() {
+            self.lockfile_policy = Some(LockfilePolicy::from_env(Some(policy)));
+        }
+        if let Some(now) = file.data.now.as_deref().and_then(parse_datetime) {
+            self.now_override = Some(now);
+        }
+        if let Some(ttl_seconds) = file.data.ttl_seconds {
+            self.ttl_seconds = Some(ttl_seconds);
+        }
+        if let Some(cache_dir) = file.data.cache_dir.as_ref() {
+            self.cache_dir = Some(file.resolve_path(cache_dir));
+        }
+        if let Some(http_retries) = file.data.http_retries.filter(|&value| value <= 8) {
+            self.http_retries = Some(http_retries);
+        }
+        if let Some(verbose) = file.data.verbose {
+            self.verbose = Some(verbose);
+        }
+        if let Some(skip_registries) = file.data.skip_registries.clone() {
+            self.skip_registries =
+                merge_registry_skip_lists(&self.skip_registries, &skip_registries.into_vec());
+        }
+
+        self.allowlist.merge_from(&Allowlist {
+            allow: file.data.allow.clone(),
+        });
+    }
+
+    fn apply_env(&mut self) {
+        if let Some(minutes) = env::var("COOLDOWN_MINUTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            self.cooldown_minutes = Some(minutes);
+        }
+        if let Ok(value) = env::var("COOLDOWN_MODE") {
+            self.mode = Some(Mode::from_env(Some(&value)));
+        }
+        if let Ok(value) = env::var("COOLDOWN_LOCKFILE_POLICY") {
+            self.lockfile_policy = Some(LockfilePolicy::from_env(Some(&value)));
+        }
+        if let Some(now) = env::var("COOLDOWN_NOW")
+            .ok()
+            .as_deref()
+            .and_then(parse_datetime)
+        {
+            self.now_override = Some(now);
+        }
+        if let Some(ttl_seconds) = env::var("COOLDOWN_TTL_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+        {
+            self.ttl_seconds = Some(ttl_seconds);
+        }
+        if let Some(cache_dir) = env::var_os("COOLDOWN_CACHE_DIR")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+        {
+            self.cache_dir = Some(cache_dir);
+        }
+        if let Some(http_retries) = env::var("COOLDOWN_HTTP_RETRIES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&value| value <= 8)
+        {
+            self.http_retries = Some(http_retries);
+        }
+        if let Ok(value) = env::var("COOLDOWN_VERBOSE") {
+            self.verbose = Some(parse_bool(&value));
+        }
+        if let Ok(value) = env::var("COOLDOWN_SKIP_REGISTRIES") {
+            self.skip_registries = parse_registry_skip_list(&value);
+        }
+    }
+
+    fn finish(self) -> Config {
+        Config {
+            cooldown_minutes: self.cooldown_minutes.unwrap_or(0),
+            mode: self.mode.unwrap_or(Mode::Enforce),
+            lockfile_policy: self.lockfile_policy.unwrap_or(LockfilePolicy::Changed),
+            now_override: self.now_override,
+            ttl_seconds: self.ttl_seconds.unwrap_or(86_400),
+            cache_dir: self.cache_dir,
+            http_retries: self.http_retries.unwrap_or(2),
+            verbose: self.verbose.unwrap_or(false),
+            skip_registries: self.skip_registries,
+            allowlist: self.allowlist,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -196,35 +237,10 @@ impl StringList {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-struct RawFileConfig {
-    #[serde(alias = "COOLDOWN_MINUTES")]
-    cooldown_minutes: Option<u64>,
-    #[serde(alias = "COOLDOWN_MODE")]
-    mode: Option<String>,
-    #[serde(alias = "COOLDOWN_LOCKFILE_POLICY")]
-    lockfile_policy: Option<String>,
-    #[serde(alias = "COOLDOWN_NOW")]
-    now: Option<String>,
-    #[serde(alias = "COOLDOWN_ALLOWLIST_PATH")]
-    allowlist_path: Option<PathBuf>,
-    #[serde(alias = "COOLDOWN_TTL_SECONDS")]
-    ttl_seconds: Option<u64>,
-    #[serde(alias = "COOLDOWN_CACHE_DIR")]
-    cache_dir: Option<PathBuf>,
-    #[serde(alias = "COOLDOWN_HTTP_RETRIES")]
-    http_retries: Option<u32>,
-    #[serde(alias = "COOLDOWN_VERBOSE")]
-    verbose: Option<bool>,
-    #[serde(alias = "COOLDOWN_SKIP_REGISTRIES")]
-    skip_registries: Option<StringList>,
-}
-
 #[derive(Debug, Clone)]
 struct FileConfig {
     path: PathBuf,
-    data: RawFileConfig,
+    data: CooldownFile,
 }
 
 impl FileConfig {
@@ -234,47 +250,67 @@ impl FileConfig {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
     }
 
-    fn resolve_path(&self, candidate: &PathBuf) -> PathBuf {
+    fn resolve_path(&self, candidate: &Path) -> PathBuf {
         if candidate.is_absolute() {
-            candidate.clone()
+            candidate.to_path_buf()
         } else {
             self.base_dir().join(candidate)
         }
     }
-
-    fn allowlist_path(&self) -> Option<PathBuf> {
-        self.data
-            .allowlist_path
-            .as_ref()
-            .map(|path| self.resolve_path(path))
-    }
-
-    fn cache_dir(&self) -> Option<PathBuf> {
-        self.data
-            .cache_dir
-            .as_ref()
-            .map(|path| self.resolve_path(path))
-    }
 }
 
-fn load_file_config() -> Option<FileConfig> {
-    if let Some(path) = workspace_config_path() {
-        return read_file_config(&path);
+fn merge_registry_skip_lists(base: &[String], overlay: &[String]) -> Vec<String> {
+    let mut merged = base.to_vec();
+    for entry in overlay {
+        if merged.iter().any(|existing| existing == entry) {
+            continue;
+        }
+        merged.push(entry.clone());
     }
-
-    if let Some(path) = user_config_path() {
-        return read_file_config(&path);
-    }
-
-    None
+    merged
 }
 
-fn workspace_config_path() -> Option<PathBuf> {
-    let Ok(current_dir) = env::current_dir() else {
+fn parse_registry_skip_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn parse_bool(value: &str) -> bool {
+    value == "1" || value.eq_ignore_ascii_case("true")
+}
+
+fn parse_datetime(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|parsed| parsed.with_timezone(&Utc))
+}
+
+fn read_file_config(path: &Path) -> Option<FileConfig> {
+    if !path.exists() {
         return None;
+    }
+
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            eprintln!("Failed to read {}: {err}", path.display());
+            return None;
+        }
     };
-    let path = current_dir.join("cooldown.toml");
-    if path.exists() { Some(path) } else { None }
+
+    match toml::from_str::<CooldownFile>(&contents) {
+        Ok(data) => Some(FileConfig {
+            path: path.to_path_buf(),
+            data,
+        }),
+        Err(err) => {
+            eprintln!("Failed to parse {}: {err}", path.display());
+            None
+        }
+    }
 }
 
 fn user_config_path() -> Option<PathBuf> {
@@ -290,33 +326,15 @@ fn cargo_home_dir() -> Option<PathBuf> {
         .or_else(|| home_dir().map(|home| home.join(".cargo")))
 }
 
-fn read_file_config(path: &Path) -> Option<FileConfig> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(err) => {
-            eprintln!("Failed to read {}: {err}", path.display());
-            return None;
-        }
-    };
-
-    match toml::from_str::<RawFileConfig>(&contents) {
-        Ok(data) => Some(FileConfig {
-            path: path.to_path_buf(),
-            data,
-        }),
-        Err(err) => {
-            eprintln!("Failed to parse {}: {err}", path.display());
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use assert_fs::TempDir;
     use assert_fs::prelude::*;
     use std::sync::{Mutex, OnceLock};
+
+    use crate::project::{ProjectKind, ProjectMember};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -337,13 +355,36 @@ mod tests {
         }
     }
 
+    fn project_fixture(root: &Path, member: Option<&Path>) -> ProjectContext {
+        ProjectContext {
+            cwd: root.to_path_buf(),
+            kind: ProjectKind::Workspace,
+            workspace_root: root.to_path_buf(),
+            members: member
+                .map(|path| {
+                    vec![ProjectMember {
+                        name: "member-a".to_string(),
+                        manifest_path: path.join("Cargo.toml"),
+                        dir: path.to_path_buf(),
+                    }]
+                })
+                .unwrap_or_default(),
+            active_member: member.map(|path| ProjectMember {
+                name: "member-a".to_string(),
+                manifest_path: path.join("Cargo.toml"),
+                dir: path.to_path_buf(),
+            }),
+        }
+    }
+
     #[test]
     fn skip_registries_support_comma_separated_env() {
         with_env_var(
             "COOLDOWN_SKIP_REGISTRIES",
             Some("crates-io, sparse+https://codeartifact.example/index , mirror"),
             || {
-                let config = Config::from_env();
+                let root = TempDir::new().unwrap();
+                let config = Config::load(&project_fixture(root.path(), None));
                 assert_eq!(
                     config.skip_registries,
                     vec![
@@ -359,7 +400,8 @@ mod tests {
     #[test]
     fn lockfile_policy_supports_all_env() {
         with_env_var("COOLDOWN_LOCKFILE_POLICY", Some("all"), || {
-            let config = Config::from_env();
+            let root = TempDir::new().unwrap();
+            let config = Config::load(&project_fixture(root.path(), None));
             assert_eq!(config.lockfile_policy, LockfilePolicy::All);
         });
     }
@@ -367,7 +409,8 @@ mod tests {
     #[test]
     fn cooldown_now_parses_rfc3339_override() {
         with_env_var("COOLDOWN_NOW", Some("2026-04-03T00:00:00Z"), || {
-            let config = Config::from_env();
+            let root = TempDir::new().unwrap();
+            let config = Config::load(&project_fixture(root.path(), None));
             assert_eq!(
                 config.now_override,
                 Some(
@@ -381,85 +424,43 @@ mod tests {
 
     #[test]
     fn loads_workspace_cooldown_file() {
-        let _guard = env_lock().lock().unwrap();
-
-        let workspace = TempDir::new().unwrap();
-        let fake_home = TempDir::new().unwrap();
-        let original_dir = env::current_dir().unwrap();
-        let original_cargo_home = env::var_os("CARGO_HOME");
-        let original_home = env::var("HOME").ok();
-        let original_user = env::var("USERPROFILE").ok();
-
-        unsafe { env::remove_var("CARGO_HOME") };
-        unsafe { env::set_var("HOME", fake_home.path()) };
-        unsafe { env::set_var("USERPROFILE", fake_home.path()) };
-        env::set_current_dir(workspace.path()).unwrap();
-
-        workspace
-            .child("cooldown.toml")
+        let root = TempDir::new().unwrap();
+        root.child("cooldown.toml")
             .write_str(
                 r#"cooldown_minutes = 15
 mode = "warn"
 lockfile_policy = "all"
-allowlist_path = "allow.toml"
 skip_registries = ["crates-io", "mirror"]
 verbose = true
+
+[[allow.exact]]
+crate = "demo"
+version = "1.2.3"
 "#,
             )
             .unwrap();
 
-        let config = Config::from_env();
+        let config = Config::load(&project_fixture(root.path(), None));
 
         assert_eq!(config.cooldown_minutes, 15);
         assert_eq!(config.mode, Mode::Warn);
         assert_eq!(config.lockfile_policy, LockfilePolicy::All);
-        assert!(config.allowlist_path.is_some());
-        assert!(config.allowlist_path.unwrap().ends_with("allow.toml"));
         assert_eq!(
             config.skip_registries,
             vec!["crates-io".to_string(), "mirror".to_string()]
         );
         assert!(config.verbose);
-
-        env::set_current_dir(original_dir).unwrap();
-        match original_cargo_home {
-            Some(val) => unsafe { env::set_var("CARGO_HOME", val) },
-            None => unsafe { env::remove_var("CARGO_HOME") },
-        }
-        match original_home {
-            Some(val) => unsafe { env::set_var("HOME", val) },
-            None => unsafe { env::remove_var("HOME") },
-        }
-        match original_user {
-            Some(val) => unsafe { env::set_var("USERPROFILE", val) },
-            None => unsafe { env::remove_var("USERPROFILE") },
-        }
-
-        workspace.close().unwrap();
-        fake_home.close().unwrap();
+        assert!(config.allowlist.is_exact_allowed("demo", "1.2.3"));
     }
 
     #[test]
     fn loads_user_cargo_cooldown_file_when_workspace_missing() {
         let _guard = env_lock().lock().unwrap();
 
-        let workspace = TempDir::new().unwrap();
+        let root = TempDir::new().unwrap();
         let fake_home = TempDir::new().unwrap();
-        let cargo_dir = fake_home.child(".cargo");
-        cargo_dir.create_dir_all().unwrap();
-
-        let original_dir = env::current_dir().unwrap();
-        let original_cargo_home = env::var_os("CARGO_HOME");
-        let original_home = env::var("HOME").ok();
-        let original_user = env::var("USERPROFILE").ok();
-
-        unsafe { env::remove_var("CARGO_HOME") };
-        unsafe { env::set_var("HOME", fake_home.path()) };
-        unsafe { env::set_var("USERPROFILE", fake_home.path()) };
-        env::set_current_dir(workspace.path()).unwrap();
-
-        cargo_dir
-            .child("cooldown.toml")
+        fake_home
+            .child(".cargo/cooldown.toml")
             .write_str(
                 r#"cooldown_minutes = 5
 mode = "off"
@@ -467,14 +468,20 @@ http_retries = 3
 "#,
             )
             .unwrap();
+        let original_cargo_home = env::var_os("CARGO_HOME");
+        let original_home = env::var("HOME").ok();
+        let original_user = env::var("USERPROFILE").ok();
 
-        let config = Config::from_env();
+        unsafe { env::remove_var("CARGO_HOME") };
+        unsafe { env::set_var("HOME", fake_home.path()) };
+        unsafe { env::set_var("USERPROFILE", fake_home.path()) };
+
+        let config = Config::load(&project_fixture(root.path(), None));
 
         assert_eq!(config.cooldown_minutes, 5);
         assert_eq!(config.mode, Mode::Off);
         assert_eq!(config.http_retries, 3);
 
-        env::set_current_dir(original_dir).unwrap();
         match original_cargo_home {
             Some(val) => unsafe { env::set_var("CARGO_HOME", val) },
             None => unsafe { env::remove_var("CARGO_HOME") },
@@ -487,24 +494,14 @@ http_retries = 3
             Some(val) => unsafe { env::set_var("USERPROFILE", val) },
             None => unsafe { env::remove_var("USERPROFILE") },
         }
-
-        workspace.close().unwrap();
-        fake_home.close().unwrap();
     }
 
     #[test]
     fn environment_overrides_file_configuration() {
         let _guard = env_lock().lock().unwrap();
 
-        let workspace = TempDir::new().unwrap();
-        let original_dir = env::current_dir().unwrap();
-        let original_mode = env::var("COOLDOWN_MODE").ok();
-        let original_lockfile_policy = env::var("COOLDOWN_LOCKFILE_POLICY").ok();
-        let original_skips = env::var("COOLDOWN_SKIP_REGISTRIES").ok();
-
-        env::set_current_dir(workspace.path()).unwrap();
-        workspace
-            .child("cooldown.toml")
+        let root = TempDir::new().unwrap();
+        root.child("cooldown.toml")
             .write_str(
                 r#"mode = "warn"
 lockfile_policy = "all"
@@ -513,16 +510,19 @@ skip_registries = ["from-file"]
             )
             .unwrap();
 
+        let original_mode = env::var("COOLDOWN_MODE").ok();
+        let original_lockfile_policy = env::var("COOLDOWN_LOCKFILE_POLICY").ok();
+        let original_skips = env::var("COOLDOWN_SKIP_REGISTRIES").ok();
+
         unsafe { env::set_var("COOLDOWN_MODE", "off") };
         unsafe { env::set_var("COOLDOWN_LOCKFILE_POLICY", "changed") };
         unsafe { env::set_var("COOLDOWN_SKIP_REGISTRIES", "from-env") };
 
-        let config = Config::from_env();
+        let config = Config::load(&project_fixture(root.path(), None));
         assert_eq!(config.mode, Mode::Off);
         assert_eq!(config.lockfile_policy, LockfilePolicy::Changed);
         assert_eq!(config.skip_registries, vec!["from-env".to_string()]);
 
-        env::set_current_dir(original_dir).unwrap();
         match original_mode {
             Some(val) => unsafe { env::set_var("COOLDOWN_MODE", val) },
             None => unsafe { env::remove_var("COOLDOWN_MODE") },
@@ -535,20 +535,12 @@ skip_registries = ["from-file"]
             Some(val) => unsafe { env::set_var("COOLDOWN_SKIP_REGISTRIES", val) },
             None => unsafe { env::remove_var("COOLDOWN_SKIP_REGISTRIES") },
         }
-
-        workspace.close().unwrap();
     }
 
     #[test]
     fn uppercase_keys_are_supported_for_backwards_compat() {
-        let _guard = env_lock().lock().unwrap();
-
-        let workspace = TempDir::new().unwrap();
-        let original_dir = env::current_dir().unwrap();
-        env::set_current_dir(workspace.path()).unwrap();
-
-        workspace
-            .child("cooldown.toml")
+        let root = TempDir::new().unwrap();
+        root.child("cooldown.toml")
             .write_str(
                 r#"COOLDOWN_MINUTES = 9
 COOLDOWN_MODE = "warn"
@@ -558,7 +550,7 @@ COOLDOWN_SKIP_REGISTRIES = "crates-io,mirror"
             )
             .unwrap();
 
-        let config = Config::from_env();
+        let config = Config::load(&project_fixture(root.path(), None));
         assert_eq!(config.cooldown_minutes, 9);
         assert_eq!(config.mode, Mode::Warn);
         assert_eq!(config.lockfile_policy, LockfilePolicy::All);
@@ -566,8 +558,56 @@ COOLDOWN_SKIP_REGISTRIES = "crates-io,mirror"
             config.skip_registries,
             vec!["crates-io".to_string(), "mirror".to_string()]
         );
+    }
 
-        env::set_current_dir(original_dir).unwrap();
-        workspace.close().unwrap();
+    #[test]
+    fn member_file_overrides_workspace_and_merges_allow_rules() {
+        let root = TempDir::new().unwrap();
+        let member_dir = root.child("member-a");
+        member_dir.create_dir_all().unwrap();
+        root.child("cooldown.toml")
+            .write_str(
+                r#"cooldown_minutes = 30
+skip_registries = ["workspace-registry"]
+
+[[allow.package]]
+crate = "serde"
+minutes = 20
+"#,
+            )
+            .unwrap();
+        member_dir
+            .child("cooldown.toml")
+            .write_str(
+                r#"cooldown_minutes = 5
+skip_registries = ["member-registry"]
+
+[allow.global]
+minutes = 3
+
+[[allow.package]]
+crate = "serde"
+minutes = 1
+
+[[allow.exact]]
+crate = "foo"
+version = "1.2.3"
+"#,
+            )
+            .unwrap();
+
+        let config = Config::load(&project_fixture(root.path(), Some(member_dir.path())));
+
+        assert_eq!(config.cooldown_minutes, 5);
+        assert_eq!(
+            config.skip_registries,
+            vec![
+                "workspace-registry".to_string(),
+                "member-registry".to_string(),
+            ]
+        );
+        assert_eq!(config.allowlist.global_minutes(), Some(3));
+        assert_eq!(config.allowlist.effective_minutes_for("serde", 90), 1);
+        assert!(config.allowlist.is_exact_allowed("foo", "1.2.3"));
     }
 }

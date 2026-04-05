@@ -113,6 +113,7 @@ mod tests {
 
     use tempfile::tempdir;
 
+    use crate::allowlist::Allowlist;
     use crate::config::{Config, LockfilePolicy, Mode};
 
     fn config_fixture() -> Config {
@@ -122,11 +123,11 @@ mod tests {
             lockfile_policy: LockfilePolicy::Changed,
             now_override: None,
             ttl_seconds: 60,
-            allowlist_path: None,
             cache_dir: None,
             http_retries: 0,
             verbose: false,
             skip_registries: Vec::new(),
+            allowlist: Allowlist::default(),
         }
     }
 

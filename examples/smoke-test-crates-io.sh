@@ -50,6 +50,24 @@ run_case() {
   )
 }
 
+run_case_with_appended_config() {
+  local name=$1
+  local description=$2
+  local reset_lock=$3
+  local config_block=$4
+  shift 4
+
+  (
+    local backup_config
+    backup_config=$(mktemp)
+    cp "${CONFIG_FILE}" "${backup_config}"
+    trap 'cp "${backup_config}" "${CONFIG_FILE}"; rm -f "${backup_config}"' EXIT
+
+    printf '\n%s\n' "${config_block}" >> "${CONFIG_FILE}"
+    run_case "${name}" "${description}" "${reset_lock}" "$@"
+  )
+}
+
 usage() {
   cat <<'USAGE'
 Usage: ./smoke-test-crates-io.sh [CASE ...]
@@ -59,8 +77,8 @@ state. This is intentionally non-deterministic and meant only as a quick
 manual check of the public workflow.
 
 Available CASE values:
-  allowlist        Use a long cooldown plus the sample allowlist to force
-                   multiple downgrade decisions and blocker resolution.
+  allow-rules      Append package-scoped allow rules to the demo config for one
+                   run, showing mixed per-crate cooldown overrides.
   warn-mode        Keep cooldown enabled, but continue the Cargo command if
                    cooldown resolution fails.
   skip-crates-io   Skip crates.io entirely through COOLDOWN_SKIP_REGISTRIES
@@ -90,20 +108,20 @@ if [[ ! -f "${CONFIG_FILE}" ]]; then
   exit 1
 fi
 
-SELECTED=("allowlist" "warn-mode" "skip-crates-io" "aggressive-ttl")
+SELECTED=("allow-rules" "warn-mode" "skip-crates-io" "aggressive-ttl")
 if [[ $# -gt 0 ]]; then
   SELECTED=("$@")
 fi
 
 for case_name in "${SELECTED[@]}"; do
   case "${case_name}" in
-    allowlist)
-      run_case \
-        "allowlist" \
-        "Long cooldown plus allowlist. This is the heavy scenario: it tends to trigger real downgrade/pinning work and blocker propagation." \
+    allow-rules)
+      run_case_with_appended_config \
+        "allow-rules" \
+        "Temporarily appends allow.package rules so one dependency gets a shorter cooldown and another is excluded entirely." \
         yes \
-        COOLDOWN_MINUTES=131401 \
-        COOLDOWN_ALLOWLIST_PATH="${ROOT_DIR}/cooldown-allowlist.toml"
+        $'[[allow.package]]\ncrate = "chrono"\nminutes = 60\n\n[[allow.package]]\ncrate = "serde_json"\nminutes = 0' \
+        COOLDOWN_MINUTES=131401
       ;;
     warn-mode)
       run_case \

@@ -7,7 +7,7 @@ re-reading the same registry metadata inside one cooldown execution.
 
 ```mermaid
 flowchart TD
-    Start([Start cargo-cooldown]) --> Config[Load config and allowlist]
+    Start([Start cargo-cooldown]) --> Config[Load cooldown.toml and embedded allow rules]
     Config --> Baseline[Snapshot initial Cargo.lock]
     Baseline --> FixedNow[Fix one now for the whole run]
     FixedNow --> Metadata[cargo metadata]
@@ -43,7 +43,7 @@ flowchart TD
 
 At the beginning of one `cargo-cooldown` execution, the resolver:
 
-1. loads config and allowlist rules;
+1. loads config and embedded allow rules;
 2. snapshots the initial `Cargo.lock` once;
 3. fixes a single `now` timestamp for the whole run;
 4. creates one registry store that lives across every pin attempt in that run.
