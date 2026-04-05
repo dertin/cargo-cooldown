@@ -78,6 +78,10 @@ Supported `cooldown.toml` keys:
 - `verbose`
 - `skip_registries`
 
+Set `verbose = true` when you want `DEBUG` logs for cooldown internals. Normal
+`INFO`/`WARN` output stays compact and ends with a single summary if fresh
+versions remain.
+
 Define allow rules in `cooldown.toml`:
 
 ```toml

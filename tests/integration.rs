@@ -20,8 +20,10 @@ use tempfile::{TempDir, tempdir};
 const CRATE_NAME: &str = "cooldowndep";
 const OLD_VERSION: &str = "1.0.0";
 const FRESH_VERSION: &str = "1.0.1";
+const FRESHER_VERSION: &str = "1.0.2";
 const OLD_PUBTIME: &str = "2026-03-01T00:00:00Z";
 const FRESH_PUBTIME: &str = "2026-04-02T12:00:00Z";
+const FRESHER_PUBTIME: &str = "2026-04-02T18:00:00Z";
 const NOW: &str = "2026-04-03T00:00:00Z";
 const COOLDOWN_MINUTES: &str = "1440";
 const REGISTRY_NAME: &str = "cool-reg";
@@ -56,6 +58,10 @@ fn existing_lockfile_fresh_dependency_is_ignored_by_default() {
     assert!(
         !stderr.contains("cooldown: inspected"),
         "default lockfile policy should not inspect unchanged baseline versions: {stderr}"
+    );
+    assert!(
+        stderr.contains("initial Cargo.lock baseline (already installed, lower risk):"),
+        "final warning should summarize remaining baseline-fresh versions: {stderr}"
     );
 }
 
@@ -387,6 +393,87 @@ fn cooldown_update_repins_new_fresh_versions_against_pre_update_baseline() {
     assert!(
         stderr.contains("cooldown: scan_summary registry_packages=1 inspected=1 fresh=1"),
         "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Updating `cool-reg` index"),
+        "the initial cargo update output should stay hidden on success: {stderr}"
+    );
+}
+
+#[test]
+fn cooldown_update_can_restore_a_fresh_baseline_version() {
+    let temp_dir = tempdir().expect("tempdir should build");
+    let temp_root = temp_dir.path().to_path_buf();
+    let cargo_home = temp_root.join("cargo-home");
+    let workspace_dir = temp_root.join("workspace");
+    let server = RegistryServer::with_crates(
+        vec![PublishedCrate::new(
+            CRATE_NAME,
+            vec![
+                PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                PackageVersion::new(FRESHER_VERSION, Some(FRESHER_PUBTIME), false),
+            ],
+        )],
+        false,
+    )
+    .expect("registry should build");
+
+    fs::create_dir_all(&cargo_home).expect("cargo home should exist");
+    create_workspace_with_dependency(
+        &workspace_dir,
+        &server,
+        CRATE_NAME,
+        &format!("={FRESH_VERSION}"),
+    )
+    .expect("workspace should build");
+    write_registry_config(&cargo_home, &server).expect("registry config should write");
+
+    let output = Command::new("cargo")
+        .arg("generate-lockfile")
+        .current_dir(&workspace_dir)
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_TERM_PROGRESS_WHEN", "never")
+        .output()
+        .expect("cargo generate-lockfile should run");
+    assert!(
+        output.status.success(),
+        "lockfile generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        parse_lockfile_version(
+            &fs::read_to_string(workspace_dir.join("Cargo.lock")).expect("lockfile should exist"),
+            CRATE_NAME,
+        )
+        .expect("crate should exist in lockfile"),
+        FRESH_VERSION
+    );
+
+    write_root_manifest(&workspace_dir, CRATE_NAME, "1").expect("manifest should update");
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .arg("update")
+        .current_dir(&workspace_dir)
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_TERM_PROGRESS_WHEN", "never")
+        .env("COOLDOWN_NOW", NOW)
+        .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+        .env("COOLDOWN_HTTP_RETRIES", "0")
+        .output()
+        .expect("cargo-cooldown should run");
+
+    assert!(
+        output.status.success(),
+        "cargo cooldown update should restore the baseline version even when it is still fresh: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        parse_lockfile_version(
+            &fs::read_to_string(workspace_dir.join("Cargo.lock")).expect("lockfile should exist"),
+            CRATE_NAME,
+        )
+        .expect("crate should exist in lockfile"),
+        FRESH_VERSION
     );
 }
 

@@ -107,6 +107,7 @@ pub fn run_pinning_flow_with_snapshot(
             let mut version_requirements: HashMap<PackageId, Vec<VersionReq>> = HashMap::new();
             let mut seen: HashSet<PackageId> = HashSet::new();
             let mut scan_summary = ScanSummary::default();
+            let mut fresh_keys_present: HashSet<String> = HashSet::new();
 
             for node in &resolve.nodes {
                 if !reachable_ids.contains(&node.id) || !seen.insert(node.id.clone()) {
@@ -185,23 +186,22 @@ pub fn run_pinning_flow_with_snapshot(
                     registry = %context.effective_index_url,
                     "evaluated release age for locked dependency"
                 );
-                if config.verbose {
-                    eprintln!(
-                        "cooldown: {} crate={} version={} registry={} published_at={} cutoff={} release_time_source={} cache={}",
-                        if cache_hit { "reused" } else { "inspected" },
-                        pkg.name,
-                        current_version,
-                        context.effective_index_url,
-                        inspection.published_at,
-                        cutoff,
-                        inspection.release_time_source.log_label(),
-                        if cache_hit { "hit" } else { "miss" },
-                    );
-                }
+                debug!(
+                    "cooldown: {} crate={} version={} registry={} published_at={} cutoff={} release_time_source={} cache={}",
+                    if cache_hit { "reused" } else { "inspected" },
+                    pkg.name,
+                    current_version,
+                    context.effective_index_url,
+                    inspection.published_at,
+                    cutoff,
+                    inspection.release_time_source.log_label(),
+                    if cache_hit { "hit" } else { "miss" },
+                );
 
                 if inspection.fresh {
                     let fresh_key =
                         crate_failure_key(&source.repr, pkg.name.as_str(), &current_version);
+                    fresh_keys_present.insert(fresh_key.clone());
                     if let Some(reason) = best_effort_skips.get(&fresh_key) {
                         scan_summary.best_effort_skipped += 1;
                         debug!(
@@ -225,21 +225,31 @@ pub fn run_pinning_flow_with_snapshot(
                 }
             }
 
-            if config.verbose {
-                eprintln!(
-                    "cooldown: scan_summary registry_packages={} inspected={} fresh={} baseline_exempt={} best_effort_skipped={} skipped_registries={} exact_allowed={} zero_minutes={}",
-                    scan_summary.registry_packages,
-                    scan_summary.inspected,
-                    scan_summary.fresh,
-                    scan_summary.baseline_exempt,
-                    scan_summary.best_effort_skipped,
-                    scan_summary.skipped,
-                    scan_summary.exact_allowed,
-                    scan_summary.zero_minutes,
-                );
-            }
+            // Keep best-effort decisions only for crate versions that are still fresh in the
+            // current lockfile. If a successful pin changes a crate version, the next pass
+            // should reconsider the new version instead of inheriting stale skip state.
+            best_effort_skips.retain(|key, _| fresh_keys_present.contains(key));
+
+            debug!(
+                "cooldown: scan_summary registry_packages={} inspected={} fresh={} baseline_exempt={} best_effort_skipped={} skipped_registries={} exact_allowed={} zero_minutes={}",
+                scan_summary.registry_packages,
+                scan_summary.inspected,
+                scan_summary.fresh,
+                scan_summary.baseline_exempt,
+                scan_summary.best_effort_skipped,
+                scan_summary.skipped,
+                scan_summary.exact_allowed,
+                scan_summary.zero_minutes,
+            );
 
             if fresh_entries.is_empty() {
+                log_final_fresh_report(
+                    &mut registry_store,
+                    &mut inspection_cache,
+                    &crate_states,
+                    &best_effort_skips,
+                    now,
+                );
                 info!("{}", success_message);
                 break;
             }
@@ -263,6 +273,7 @@ pub fn run_pinning_flow_with_snapshot(
 
             let mut queue: VecDeque<FreshCrate> = fresh_entries.into();
             let mut attempted_in_pass: HashSet<String> = HashSet::new();
+            let mut best_effort_added_in_pass = false;
 
             'queue_loop: while let Some(fresh) = queue.pop_front() {
                 // Each queue entry represents one currently locked crate/version pair that
@@ -300,15 +311,40 @@ pub fn run_pinning_flow_with_snapshot(
                     &requirements,
                     fresh.minimum_minutes,
                     now,
+                    |version| {
+                        !config.lockfile_policy.applies_to_existing_lockfile()
+                            && initial_lockfile.baseline().contains_registry_version(
+                                &fresh.name,
+                                &context.effective_index_url,
+                                version,
+                            )
+                    },
                 ) else {
                     // No older compatible version exists for this crate as-is. Requeue any
                     // parent that constrained it so we can try to cool down the parent first
                     // and potentially relax the version chosen for this dependency.
                     let mut queued_parent = false;
+                    let mut blocked_by_exhausted_parent = false;
+                    let mut parent_descriptions = Vec::new();
                     if let Some(origins) = requirement_origins.get(&fresh.package_id) {
                         for origin in origins {
                             if let Some(state) = crate_states.get(&origin.parent_id) {
                                 if state.is_cooldown_exempt() {
+                                    continue;
+                                }
+                                parent_descriptions.push(format!(
+                                    "{} {}",
+                                    origin.parent_name, state.current_version
+                                ));
+                                let parent_key = crate_failure_key(
+                                    &state.source_id,
+                                    &state.name,
+                                    &state.current_version,
+                                );
+                                if attempted_in_pass.contains(&parent_key)
+                                    || best_effort_skips.contains_key(&parent_key)
+                                {
+                                    blocked_by_exhausted_parent = true;
                                     continue;
                                 }
                                 queue.push_front(FreshCrate {
@@ -326,6 +362,22 @@ pub fn run_pinning_flow_with_snapshot(
                         queue.push_back(fresh.clone());
                         continue 'queue_loop;
                     }
+                    if blocked_by_exhausted_parent {
+                        let reason = format!(
+                            "no older compatible version unless already-exhausted parents are cooled first: {}",
+                            parent_descriptions.join(", ")
+                        );
+                        best_effort_added_in_pass |=
+                            record_best_effort_skip(&mut best_effort_skips, &key, reason.clone());
+                        debug!(
+                            crate = %fresh.name,
+                            registry = %context.effective_index_url,
+                            current = %fresh.current_version,
+                            parents = %parent_descriptions.join(", "),
+                            "skipping pin because only already-exhausted parents could relax the semver constraints in this run"
+                        );
+                        continue;
+                    }
 
                     visited_failures.insert(key);
                     bail!(
@@ -336,7 +388,7 @@ pub fn run_pinning_flow_with_snapshot(
                     );
                 };
 
-                info!(
+                debug!(
                     crate = %fresh.name,
                     registry = %context.effective_index_url,
                     current = %fresh.current_version,
@@ -353,8 +405,7 @@ pub fn run_pinning_flow_with_snapshot(
                     PinOutcome::Applied => {
                         // A successful pin changes the lockfile, so restart from the top and
                         // recompute metadata instead of trying to patch our in-memory graph.
-                        best_effort_skips.clear();
-                        info!(
+                        debug!(
                             crate = %fresh.name,
                             registry = %context.effective_index_url,
                             pinned = %candidate.version,
@@ -381,6 +432,7 @@ pub fn run_pinning_flow_with_snapshot(
                             blockers.iter().map(Blocker::label).collect::<Vec<_>>();
                         let mut queued_blocker = false;
                         let mut matched_self = false;
+                        let mut blocked_by_exhausted = false;
                         let mut queued_ids: HashSet<PackageId> = HashSet::new();
                         for blocker in blockers {
                             let matches = blocker
@@ -403,23 +455,27 @@ pub fn run_pinning_flow_with_snapshot(
                                 .unwrap_or_default();
 
                             for id in matches {
-                                if id == fresh.package_id {
-                                    matched_self = true;
-                                    continue;
-                                }
                                 if let Some(state) = crate_states.get(&id) {
-                                    if state.is_cooldown_exempt() || !queued_ids.insert(id.clone())
-                                    {
-                                        continue;
+                                    match blocker_disposition(
+                                        &id,
+                                        &fresh,
+                                        state,
+                                        &mut queued_ids,
+                                        &attempted_in_pass,
+                                        &best_effort_skips,
+                                    ) {
+                                        BlockerDisposition::Queue(blocker_fresh) => {
+                                            queue.push_front(blocker_fresh);
+                                            queued_blocker = true;
+                                        }
+                                        BlockerDisposition::SelfBlocker => {
+                                            matched_self = true;
+                                        }
+                                        BlockerDisposition::AlreadyExhausted => {
+                                            blocked_by_exhausted = true;
+                                        }
+                                        BlockerDisposition::Skip => {}
                                     }
-                                    queue.push_front(FreshCrate {
-                                        package_id: id,
-                                        name: state.name.clone(),
-                                        source_id: state.source_id.clone(),
-                                        current_version: state.current_version.clone(),
-                                        minimum_minutes: state.minimum_minutes,
-                                    });
-                                    queued_blocker = true;
                                 }
                             }
                         }
@@ -429,15 +485,20 @@ pub fn run_pinning_flow_with_snapshot(
                                 "blockers could not be cooled in this run: {}",
                                 blocker_descriptions.join(", ")
                             );
-                            best_effort_skips.insert(key, reason.clone());
-                            warn!(
+                            best_effort_added_in_pass |= record_best_effort_skip(
+                                &mut best_effort_skips,
+                                &key,
+                                reason.clone(),
+                            );
+                            debug!(
                                 crate = %fresh.name,
                                 registry = %context.effective_index_url,
                                 current = %fresh.current_version,
                                 candidate = %candidate.version,
                                 blockers = %blocker_descriptions.join(", "),
                                 self_blocker = matched_self,
-                                "skipping pin because remaining blockers are cooldown-exempt, outside scope, or require the currently locked version"
+                                already_exhausted = blocked_by_exhausted,
+                                "skipping pin because remaining blockers are cooldown-exempt, outside scope, already exhausted in this run, or require the currently locked version"
                             );
                             continue;
                         }
@@ -445,6 +506,10 @@ pub fn run_pinning_flow_with_snapshot(
                         queue.push_back(fresh.clone());
                     }
                 }
+            }
+
+            if best_effort_added_in_pass {
+                continue 'outer;
             }
 
             bail!(
@@ -483,6 +548,134 @@ impl ScanSummary {
         self.skipped += usize::from(state.skipped);
         self.exact_allowed += usize::from(state.exact_allowed);
         self.zero_minutes += usize::from(state.minimum_minutes == 0);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct FreshVersionNotice {
+    name: String,
+    version: String,
+    registry: String,
+}
+
+#[derive(Default)]
+struct FinalFreshReport {
+    baseline_fresh: Vec<FreshVersionNotice>,
+    resolver_constrained_fresh: Vec<FreshVersionNotice>,
+}
+
+fn log_final_fresh_report(
+    registry_store: &mut RegistryStore,
+    inspection_cache: &mut HashMap<ReleaseInspectionKey, ReleaseInspection>,
+    crate_states: &HashMap<PackageId, CrateState>,
+    best_effort_skips: &HashMap<String, String>,
+    now: DateTime<Utc>,
+) {
+    let mut report = FinalFreshReport::default();
+    let mut baseline_seen = HashSet::new();
+    let mut resolver_seen = HashSet::new();
+
+    for state in crate_states.values() {
+        let key = crate_failure_key(&state.source_id, &state.name, &state.current_version);
+        let baseline_candidate = state.baseline_exempt;
+        let resolver_candidate = best_effort_skips.contains_key(&key);
+        if !baseline_candidate && !resolver_candidate {
+            continue;
+        }
+
+        let context = match registry_store.context_for_source(&state.source_id) {
+            Ok(context) => context.clone(),
+            Err(err) => {
+                debug!(
+                    crate = %state.name,
+                    version = %state.current_version,
+                    registry = %state.source_id,
+                    error = %err,
+                    "skipping final fresh-version classification because registry context could not be resolved"
+                );
+                continue;
+            }
+        };
+        let (inspection, _) = match inspect_current_release(
+            registry_store,
+            inspection_cache,
+            &context,
+            state,
+            now,
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                debug!(
+                    crate = %state.name,
+                    version = %state.current_version,
+                    registry = %context.effective_index_url,
+                    error = %err,
+                    "skipping final fresh-version classification because release metadata could not be inspected"
+                );
+                continue;
+            }
+        };
+        if !inspection.fresh {
+            continue;
+        }
+
+        let notice = FreshVersionNotice {
+            name: state.name.clone(),
+            version: state.current_version.clone(),
+            registry: context.logical_name,
+        };
+
+        if baseline_candidate && baseline_seen.insert(notice.clone()) {
+            report.baseline_fresh.push(notice.clone());
+        }
+        if resolver_candidate && resolver_seen.insert(notice.clone()) {
+            report.resolver_constrained_fresh.push(notice);
+        }
+    }
+
+    if report.baseline_fresh.is_empty() && report.resolver_constrained_fresh.is_empty() {
+        return;
+    }
+
+    report.baseline_fresh.sort();
+    report.resolver_constrained_fresh.sort();
+    warn!("{}", format_final_fresh_warning(&report));
+}
+
+fn format_final_fresh_warning(report: &FinalFreshReport) -> String {
+    let mut lines = vec!["cooldown finished with fresh versions remaining.".to_string()];
+
+    if !report.baseline_fresh.is_empty() {
+        lines.push(format!(
+            "initial Cargo.lock baseline (already installed, lower risk): {}",
+            format_fresh_notice_list(&report.baseline_fresh)
+        ));
+    }
+
+    if !report.resolver_constrained_fresh.is_empty() {
+        lines.push(format!(
+            "resolver-constrained versions that could not be cooled further (review these): {}",
+            format_fresh_notice_list(&report.resolver_constrained_fresh)
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn format_fresh_notice_list(entries: &[FreshVersionNotice]) -> String {
+    const MAX_LISTED: usize = 8;
+
+    let listed = entries
+        .iter()
+        .take(MAX_LISTED)
+        .map(|entry| format!("{} {} @ {}", entry.name, entry.version, entry.registry))
+        .collect::<Vec<_>>();
+
+    let remaining = entries.len().saturating_sub(MAX_LISTED);
+    if remaining == 0 {
+        listed.join(", ")
+    } else {
+        format!("{} (+{} more)", listed.join(", "), remaining)
     }
 }
 
@@ -623,6 +816,58 @@ struct RequirementOrigin {
     parent_id: PackageId,
     parent_name: String,
     requirement: VersionReq,
+}
+
+enum BlockerDisposition {
+    Queue(FreshCrate),
+    SelfBlocker,
+    AlreadyExhausted,
+    Skip,
+}
+
+fn blocker_disposition(
+    blocker_id: &PackageId,
+    fresh: &FreshCrate,
+    state: &CrateState,
+    queued_ids: &mut HashSet<PackageId>,
+    attempted_in_pass: &HashSet<String>,
+    best_effort_skips: &HashMap<String, String>,
+) -> BlockerDisposition {
+    if blocker_id == &fresh.package_id {
+        return BlockerDisposition::SelfBlocker;
+    }
+    if state.is_cooldown_exempt() || !queued_ids.insert(blocker_id.clone()) {
+        return BlockerDisposition::Skip;
+    }
+
+    let blocker_key = crate_failure_key(&state.source_id, &state.name, &state.current_version);
+    if attempted_in_pass.contains(&blocker_key) || best_effort_skips.contains_key(&blocker_key) {
+        return BlockerDisposition::AlreadyExhausted;
+    }
+
+    BlockerDisposition::Queue(FreshCrate {
+        package_id: blocker_id.clone(),
+        name: state.name.clone(),
+        source_id: state.source_id.clone(),
+        current_version: state.current_version.clone(),
+        minimum_minutes: state.minimum_minutes,
+    })
+}
+
+fn record_best_effort_skip(
+    best_effort_skips: &mut HashMap<String, String>,
+    key: &str,
+    reason: String,
+) -> bool {
+    if best_effort_skips
+        .get(key)
+        .is_some_and(|existing| existing == &reason)
+    {
+        return false;
+    }
+
+    best_effort_skips.insert(key.to_string(), reason);
+    true
 }
 
 fn inspect_current_release(
@@ -1210,6 +1455,143 @@ mod tests {
 
         assert!(unchanged.is_cooldown_exempt());
         assert!(!changed.is_cooldown_exempt());
+    }
+
+    #[test]
+    fn blocker_disposition_skips_blockers_already_attempted_in_same_pass() {
+        let fresh = FreshCrate {
+            package_id: serde_json::from_value(json!(
+                "registry+https://github.com/rust-lang/crates.io-index#demo@1.0.1"
+            ))
+            .unwrap(),
+            name: "demo".to_string(),
+            source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+            current_version: "1.0.1".to_string(),
+            minimum_minutes: 60,
+        };
+        let blocker_id: PackageId = serde_json::from_value(json!(
+            "registry+https://github.com/rust-lang/crates.io-index#blocker@1.2.3"
+        ))
+        .unwrap();
+        let blocker_state = CrateState {
+            name: "blocker".to_string(),
+            source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+            current_version: "1.2.3".to_string(),
+            minimum_minutes: 60,
+            exact_allowed: false,
+            skipped: false,
+            baseline_exempt: false,
+        };
+        let attempted = HashSet::from([crate_failure_key(
+            &blocker_state.source_id,
+            &blocker_state.name,
+            &blocker_state.current_version,
+        )]);
+        let mut queued_ids = HashSet::new();
+
+        let disposition = blocker_disposition(
+            &blocker_id,
+            &fresh,
+            &blocker_state,
+            &mut queued_ids,
+            &attempted,
+            &HashMap::new(),
+        );
+
+        assert!(matches!(disposition, BlockerDisposition::AlreadyExhausted));
+    }
+
+    #[test]
+    fn blocker_disposition_skips_blockers_marked_best_effort_earlier_in_run() {
+        let fresh = FreshCrate {
+            package_id: serde_json::from_value(json!(
+                "registry+https://github.com/rust-lang/crates.io-index#demo@1.0.1"
+            ))
+            .unwrap(),
+            name: "demo".to_string(),
+            source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+            current_version: "1.0.1".to_string(),
+            minimum_minutes: 60,
+        };
+        let blocker_id: PackageId = serde_json::from_value(json!(
+            "registry+https://github.com/rust-lang/crates.io-index#blocker@1.2.3"
+        ))
+        .unwrap();
+        let blocker_state = CrateState {
+            name: "blocker".to_string(),
+            source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+            current_version: "1.2.3".to_string(),
+            minimum_minutes: 60,
+            exact_allowed: false,
+            skipped: false,
+            baseline_exempt: false,
+        };
+        let mut queued_ids = HashSet::new();
+        let best_effort_skips = HashMap::from([(
+            crate_failure_key(
+                &blocker_state.source_id,
+                &blocker_state.name,
+                &blocker_state.current_version,
+            ),
+            "already skipped".to_string(),
+        )]);
+
+        let disposition = blocker_disposition(
+            &blocker_id,
+            &fresh,
+            &blocker_state,
+            &mut queued_ids,
+            &HashSet::new(),
+            &best_effort_skips,
+        );
+
+        assert!(matches!(disposition, BlockerDisposition::AlreadyExhausted));
+    }
+
+    #[test]
+    fn record_best_effort_skip_only_reports_new_entries() {
+        let mut best_effort_skips = HashMap::new();
+        let key = "registry+https://github.com/rust-lang/crates.io-index::demo@1.0.1";
+
+        assert!(record_best_effort_skip(
+            &mut best_effort_skips,
+            key,
+            "reason".to_string()
+        ));
+        assert!(!record_best_effort_skip(
+            &mut best_effort_skips,
+            key,
+            "reason".to_string()
+        ));
+        assert!(record_best_effort_skip(
+            &mut best_effort_skips,
+            key,
+            "different reason".to_string()
+        ));
+    }
+
+    #[test]
+    fn format_final_fresh_warning_groups_baseline_and_resolver_versions() {
+        let warning = format_final_fresh_warning(&FinalFreshReport {
+            baseline_fresh: vec![FreshVersionNotice {
+                name: "serde".to_string(),
+                version: "1.0.218".to_string(),
+                registry: "crates-io".to_string(),
+            }],
+            resolver_constrained_fresh: vec![FreshVersionNotice {
+                name: "web-sys".to_string(),
+                version: "0.3.94".to_string(),
+                registry: "crates-io".to_string(),
+            }],
+        });
+
+        assert!(warning.contains("cooldown finished with fresh versions remaining."));
+        assert!(warning.contains(
+            "initial Cargo.lock baseline (already installed, lower risk): serde 1.0.218 @ crates-io"
+        ));
+        assert!(warning.contains(
+            "resolver-constrained versions that could not be cooled further (review these): web-sys 0.3.94 @ crates-io"
+        ));
     }
 
     #[test]

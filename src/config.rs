@@ -424,6 +424,7 @@ mod tests {
 
     #[test]
     fn loads_workspace_cooldown_file() {
+        let _guard = env_lock().lock().unwrap();
         let root = TempDir::new().unwrap();
         root.child("cooldown.toml")
             .write_str(
@@ -539,6 +540,7 @@ skip_registries = ["from-file"]
 
     #[test]
     fn uppercase_keys_are_supported_for_backwards_compat() {
+        let _guard = env_lock().lock().unwrap();
         let root = TempDir::new().unwrap();
         root.child("cooldown.toml")
             .write_str(
@@ -562,6 +564,7 @@ COOLDOWN_SKIP_REGISTRIES = "crates-io,mirror"
 
     #[test]
     fn member_file_overrides_workspace_and_merges_allow_rules() {
+        let _guard = env_lock().lock().unwrap();
         let root = TempDir::new().unwrap();
         let member_dir = root.child("member-a");
         member_dir.create_dir_all().unwrap();

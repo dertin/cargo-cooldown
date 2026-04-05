@@ -29,11 +29,12 @@ It synthesizes the registry, tarballs, cacheable index responses, and workspace
 at runtime inside a temp directory. That keeps the test inputs aligned with the
 current resolver instead of preserving legacy lockfile snapshots.
 
-When `COOLDOWN_VERBOSE=true`, the binary emits a direct stderr line for each
-inspected crate:
+When `COOLDOWN_VERBOSE=true`, the binary emits `DEBUG` logs for each inspected
+crate and for the per-pass scan summary:
 
 - `release_time_source=index_pubtime`
 - `release_time_source=registry_api_fallback`
+- `cooldown: scan_summary ...`
 
 The deterministic integration tests assert those markers in the `pubtime` and
 fallback scenarios so the timestamp source stays observable when cooldown

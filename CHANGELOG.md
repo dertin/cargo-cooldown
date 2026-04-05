@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 - 2026-04-04
+## 0.3.0 - 2026-04-05
 
 This is an intentionally breaking release.
 
@@ -40,6 +40,8 @@ Migration guide:
   version age inspections within one cooldown execution
 - missing release-time metadata is fail-closed in `enforce` mode and downgraded
   to warnings only in `warn` mode
+- `verbose = true` / `COOLDOWN_VERBOSE=true` now surfaces cooldown internals as
+  `DEBUG` logs while keeping user-facing `INFO`/`WARN` output compact
 
 ### Breaking changes
 
@@ -59,6 +61,16 @@ Migration guide:
   fail because metadata is incomplete
 - cooldown now restores the original `Cargo.lock` if Cargo re-resolves during
   inspection and the cooldown run ultimately fails
+- `lockfile_policy = "changed"` now allows `cargo cooldown update` to pin a
+  freshly updated crate back to an exact version from the initial baseline,
+  even when that baseline version is still inside the cooldown window
+- cooldown now treats blockers or parent constraints that were already
+  exhausted earlier in the run as best-effort skips instead of failing
+  later with a generic fixed-point error
+- cooldown now emits a single final warning when fresh versions remain,
+  distinguishing baseline-carried versions from resolver-constrained ones
+- successful `cargo cooldown update` runs now keep the initial `cargo update`
+  chatter hidden, so user-facing output stays focused on cooldown results
 - `--manifest-path` is now honored during both cooldown inspection and
   `cargo update --precise` pinning, including runs started from another cwd
 - Cargo-style selectors such as `--manifest-path`, `--package`, `--workspace`,

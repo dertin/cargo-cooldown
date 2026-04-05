@@ -11,12 +11,12 @@ mod resolver;
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::process::Command;
+use std::process::{Command, Output};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clap_cargo::{Features, Manifest, Workspace};
-use tracing::warn;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Mode;
@@ -59,13 +59,10 @@ enum CooldownCommand {
 }
 
 fn init_logging(verbose: bool) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if verbose {
-            EnvFilter::new("cargo_cooldown=debug,info")
-        } else {
-            EnvFilter::new("info")
-        }
-    });
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    if verbose {
+        filter = filter.add_directive("cargo_cooldown=debug".parse().expect("valid directive"));
+    }
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -288,6 +285,24 @@ fn exit_with(code: i32) -> ! {
     std::process::exit(code);
 }
 
+fn write_captured_output(output: &Output) {
+    if !output.stdout.is_empty() {
+        let _ = std::io::stdout().write_all(&output.stdout);
+    }
+    if !output.stderr.is_empty() {
+        let _ = std::io::stderr().write_all(&output.stderr);
+    }
+}
+
+fn run_initial_cargo_update(forwarded_args: &[OsString]) -> Result<std::process::ExitStatus> {
+    info!("refreshing lockfile via cargo update before applying cooldown");
+    let output = Command::new("cargo").args(forwarded_args).output()?;
+    if !output.status.success() {
+        write_captured_output(&output);
+    }
+    Ok(output.status)
+}
+
 fn main() -> Result<()> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = parse_cli(&raw_args);
@@ -318,7 +333,7 @@ fn main() -> Result<()> {
 
             if is_update_command(cargo_args) {
                 let initial_lockfile = executor::capture_initial_lockfile(&config, &cli.manifest)?;
-                let status = Command::new("cargo").args(&forwarded_args).status()?;
+                let status = run_initial_cargo_update(&forwarded_args)?;
                 if !status.success() {
                     exit_with(status.code().unwrap_or(1));
                 }

@@ -84,7 +84,9 @@ That means `cargo cooldown update` has this exact shape:
 3. inspect the updated lockfile;
 4. with `lockfile_policy = "changed"`, exempt any `(registry, crate, version)`
    that was already present in the original snapshot;
-5. pin only the newly introduced or version-changed fresh entries;
+5. pin only the newly introduced or version-changed fresh entries, but allow
+   them to return to an exact version from the original snapshot even if that
+   baseline version is still fresher than the cutoff;
 6. if the cooldown step fails in `enforce` mode, restore the original lockfile.
 
 ## 2. Graph scan and release-age inspection
@@ -105,7 +107,9 @@ For each registry package in that graph:
 For `cargo cooldown update`, step 4 compares the updated lockfile against the
 pre-update snapshot. So a version that was already in `Cargo.lock` before the
 update remains exempt, while a version introduced by `cargo update` is eligible
-for cooldown.
+for cooldown. If `cargo update` moves `foo 1.2.3` to `foo 1.2.4`, cooldown may
+pin `foo` back to `1.2.3` even when `1.2.3` is still fresh, because that exact
+version was already part of the baseline snapshot.
 
 The age inspection itself works like this:
 
@@ -131,9 +135,10 @@ cutoff:
 2. walk the timeline from newest to oldest;
 3. pick the first release that:
    - is not yanked;
-   - is older than the cutoff;
    - is lower than the locked version;
-   - satisfies every observed requirement.
+   - satisfies every observed requirement;
+   - and is either older than the cutoff or already present in the initial
+     lockfile baseline when `lockfile_policy = "changed"`.
 
 Fresh packages are queued and pinned one at a time with `cargo update --precise`.
 
@@ -146,15 +151,28 @@ Two details matter here:
   single lockfile pass, because the lockfile has not changed yet and a second
   attempt would be redundant;
 - if the only remaining blockers are outside the selected cooldown scope,
-  protected by the initial lockfile baseline, or otherwise cooldown-exempt, the
-  resolver keeps the currently locked version, emits a warning, and continues
-  cooling the rest of the graph.
+  protected by the initial lockfile baseline, already exhausted earlier in the
+  run, or otherwise cooldown-exempt, the resolver keeps the currently
+  locked version, emits a warning, and continues cooling the rest of the graph.
 
 If a pin succeeds, the resolver restarts from `cargo metadata` so Cargo can
-re-resolve the graph from the new lockfile state. Any best-effort skips are
-reconsidered after that restart. The initial baseline does not change, so any
-package that moves to a version not present in that baseline becomes eligible
-for cooldown on the next pass.
+re-resolve the graph from the new lockfile state. Best-effort skips stay tied
+to the exact `(registry, crate, version)` that was skipped, so the same fresh
+version is not requeued again through blocker propagation after a restart. The
+initial baseline does not change, so any package that moves to a version not
+present in that baseline becomes eligible for cooldown on the next pass.
+
+If a pass makes no successful pins but does record new best-effort skips, the
+resolver also restarts from `cargo metadata` once so those skipped versions are
+left out of the next freshness queue instead of ending in a generic fixed-point
+error immediately.
+
+At the end of the run, cooldown emits a single summary warning if fresh
+versions still remain. That final warning distinguishes between:
+
+- versions that were already present in the initial `Cargo.lock` baseline; and
+- versions that the resolver had to keep fresh because no further compatible
+  cooldown pin was possible in this run.
 
 That is the main remaining cost today: the resolved graph is still rebuilt after
 each successful pin, even though the registry timelines and many locked-version

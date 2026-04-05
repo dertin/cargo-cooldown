@@ -66,6 +66,12 @@ contain the values that genuinely differ from the workspace defaults.
 - `skip_registries`
 - `allow`
 
+`verbose = true` enables `DEBUG` logs for cooldown internals such as release-age
+inspection, candidate selection, and per-pass scan summaries. User-facing
+`INFO` and `WARN` output stays compact: repeated pin attempts stay in `DEBUG`,
+and any fresh versions that remain after cooldown are summarized once at the
+end.
+
 `skip_registries` can be written as:
 
 ```toml
@@ -174,9 +180,13 @@ COOLDOWN_LOCKFILE_POLICY=all cargo cooldown check
 
 - versions already present in the pre-update `Cargo.lock` are left alone
 - versions introduced or changed by that update become eligible for cooldown
+- when a freshly updated package can be pinned back to a version that was
+  already present in the baseline lockfile, that baseline version remains a
+  valid pin target even if it is still inside the cooldown window
 - if cooling one of those newly updated versions would require degrading
-  baseline-protected or otherwise cooldown-exempt dependencies, cooldown keeps
-  the fresh version, warns, and continues best-effort on the rest of the graph
+  baseline-protected, already exhausted earlier in the run, or otherwise
+  cooldown-exempt dependencies, cooldown keeps the fresh version, warns, and
+  continues best-effort on the rest of the graph
 
 For `build`, `check`, `test`, or `run`, Cargo usually reuses the existing
 lockfile. Those commands do not proactively refresh dependencies on their own.
