@@ -31,6 +31,12 @@ Run a command through the cooldown guard:
 COOLDOWN_MINUTES=1440 cargo cooldown check
 ```
 
+Refresh the lockfile under cooldown:
+
+```bash
+cargo cooldown update
+```
+
 Initialize `cooldown.toml` in the current project root:
 
 ```bash
@@ -121,10 +127,18 @@ If a registry is not skipped and `cargo-cooldown` cannot determine release age
 from the local index or the registry API, the cooldown step fails in `enforce`
 mode and becomes a warning in `warn` mode.
 
-`cargo-cooldown` is intended for commands such as `build`, `check`, `test`, and
-`run`. It intentionally does not wrap `cargo update`, and `cargo cooldown init`
-is reserved for the cooldown configuration wizard rather than forwarding to
-Cargo's own `init`.
+`cargo-cooldown` supports two different workflows:
+
+- `cargo cooldown build|check|test|run`
+  uses the current lockfile and cools any newly resolved versions that appear
+  during that command
+- `cargo cooldown update`
+  snapshots the current `Cargo.lock`, runs `cargo update`, and then cools only
+  the versions that are new relative to that pre-update baseline when
+  `lockfile_policy = "changed"`
+
+`cargo cooldown init` is reserved for the cooldown configuration wizard rather
+than forwarding to Cargo's own `init`.
 
 In a workspace, the recommended layout is:
 

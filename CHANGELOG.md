@@ -16,6 +16,8 @@ Migration guide:
 - explicit `skip_registries` / `COOLDOWN_SKIP_REGISTRIES`
 - explicit `lockfile_policy` / `COOLDOWN_LOCKFILE_POLICY` to choose between
   cooling only changed lockfile entries or cooling all eligible entries
+- `cargo cooldown update` to refresh the lockfile first and then cool only the
+  versions that changed relative to the pre-update baseline
 - `cargo cooldown init` to scaffold `cooldown.toml` interactively for crates
   and workspaces
 - new integration tests in `./tests`

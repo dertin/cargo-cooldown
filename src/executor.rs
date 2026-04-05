@@ -26,15 +26,38 @@ pub fn run_pinning_flow(
     workspace: &Workspace,
     features: &Features,
 ) -> Result<()> {
+    let initial_lockfile = capture_initial_lockfile(config, manifest)?;
+    run_pinning_flow_with_snapshot(
+        config,
+        manifest,
+        workspace,
+        features,
+        initial_lockfile,
+        "dependency graph cooled down; continuing with Cargo command",
+    )
+}
+
+pub fn capture_initial_lockfile(config: &Config, manifest: &Manifest) -> Result<LockfileSnapshot> {
+    let mut registry_store = RegistryStore::new(config)?;
+    let lockfile_path = workspace_lockfile_path(manifest)?;
+    // Capture the user-visible starting lockfile before any Cargo command is allowed
+    // to generate or rewrite it during this cooldown run.
+    LockfileSnapshot::capture(&lockfile_path, &mut registry_store)
+}
+
+pub fn run_pinning_flow_with_snapshot(
+    config: &Config,
+    manifest: &Manifest,
+    workspace: &Workspace,
+    features: &Features,
+    initial_lockfile: LockfileSnapshot,
+    success_message: &str,
+) -> Result<()> {
     let allowlist = &config.allowlist;
     let per_crate_minutes = allowlist.per_crate_minutes();
     let global_minutes = allowlist.global_minutes();
     let mut registry_store = RegistryStore::new(config)?;
     let lockfile_path = workspace_lockfile_path(manifest)?;
-    // Capture the user-visible starting lockfile before any Cargo command is allowed
-    // to generate or rewrite it during this cooldown run.
-    let initial_lockfile = LockfileSnapshot::capture(&lockfile_path, &mut registry_store)?;
-
     let result = (|| {
         // Missing lockfiles are created only after the initial snapshot exists, so the
         // default policy always compares against the pre-run lockfile state.
@@ -82,6 +105,7 @@ pub fn run_pinning_flow(
                 HashMap::new();
             let mut version_requirements: HashMap<PackageId, Vec<VersionReq>> = HashMap::new();
             let mut seen: HashSet<PackageId> = HashSet::new();
+            let mut scan_summary = ScanSummary::default();
 
             for node in &resolve.nodes {
                 if !reachable_ids.contains(&node.id) || !seen.insert(node.id.clone()) {
@@ -107,6 +131,7 @@ pub fn run_pinning_flow(
                     continue;
                 }
 
+                scan_summary.registry_packages += 1;
                 let context = registry_store.context_for_source(&source.repr)?.clone();
                 let current_version = pkg.version.to_string();
                 let mut minimum_minutes = config.cooldown_minutes;
@@ -134,11 +159,13 @@ pub fn run_pinning_flow(
                     baseline_exempt,
                 };
                 crate_states.insert(node.id.clone(), state.clone());
+                scan_summary.observe(&state);
 
                 if state.is_cooldown_exempt() {
                     continue;
                 }
 
+                scan_summary.inspected += 1;
                 let (inspection, cache_hit) = inspect_current_release(
                     &mut registry_store,
                     &mut inspection_cache,
@@ -172,6 +199,7 @@ pub fn run_pinning_flow(
                 }
 
                 if inspection.fresh {
+                    scan_summary.fresh += 1;
                     fresh_entries.push(FreshCrate {
                         package_id: node.id.clone(),
                         name: pkg.name.to_string(),
@@ -182,8 +210,21 @@ pub fn run_pinning_flow(
                 }
             }
 
+            if config.verbose {
+                eprintln!(
+                    "cooldown: scan_summary registry_packages={} inspected={} fresh={} baseline_exempt={} skipped_registries={} exact_allowed={} zero_minutes={}",
+                    scan_summary.registry_packages,
+                    scan_summary.inspected,
+                    scan_summary.fresh,
+                    scan_summary.baseline_exempt,
+                    scan_summary.skipped,
+                    scan_summary.exact_allowed,
+                    scan_summary.zero_minutes,
+                );
+            }
+
             if fresh_entries.is_empty() {
-                info!("dependency graph cooled down; continuing with Cargo command");
+                info!("{}", success_message);
                 break;
             }
 
@@ -384,6 +425,26 @@ pub fn run_pinning_flow(
     }
 
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct ScanSummary {
+    registry_packages: usize,
+    inspected: usize,
+    fresh: usize,
+    baseline_exempt: usize,
+    skipped: usize,
+    exact_allowed: usize,
+    zero_minutes: usize,
+}
+
+impl ScanSummary {
+    fn observe(&mut self, state: &CrateState) {
+        self.baseline_exempt += usize::from(state.baseline_exempt);
+        self.skipped += usize::from(state.skipped);
+        self.exact_allowed += usize::from(state.exact_allowed);
+        self.zero_minutes += usize::from(state.minimum_minutes == 0);
+    }
 }
 
 fn selected_package_ids(

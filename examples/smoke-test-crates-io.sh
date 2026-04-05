@@ -94,7 +94,7 @@ if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
 fi
 
 if [[ ${CARGO_SUBCOMMAND} == "update" ]]; then
-  echo "This demo is intended for build/check/run style commands. Running cargo-cooldown with 'cargo update' would overwrite the cooled lockfile directly." >&2
+  echo "This smoke script focuses on build/check-style scenarios. For lockfile refreshes under cooldown, run 'cargo cooldown update' directly in the demo workspace instead." >&2
   exit 1
 fi
 

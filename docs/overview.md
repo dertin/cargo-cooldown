@@ -14,6 +14,10 @@ At a high level:
    already rewritten it;
 7. run the requested Cargo command once the graph is acceptable.
 
+When the requested command is `cargo cooldown update`, the wrapper snapshots the
+existing lockfile first, runs `cargo update`, and then applies cooldown against
+that pre-update baseline.
+
 Key behavior:
 
 - Cargo's own registry configuration and resolved graph are the source of truth;

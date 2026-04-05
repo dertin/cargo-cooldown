@@ -54,8 +54,8 @@ fn existing_lockfile_fresh_dependency_is_ignored_by_default() {
     assert_eq!(harness.server.api_hits(), 0);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !stderr.contains("cooldown: "),
-        "default lockfile policy should skip inspection for unchanged baseline versions: {stderr}"
+        !stderr.contains("cooldown: inspected"),
+        "default lockfile policy should not inspect unchanged baseline versions: {stderr}"
     );
 }
 
@@ -346,14 +346,46 @@ fn exact_allowlist_keeps_fresh_version_pinned() {
 }
 
 #[test]
-fn rejects_update_subcommand_before_running_cooldown() {
+fn cooldown_update_keeps_existing_baseline_versions_under_changed_policy() {
     let harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
+    let mut harness = harness;
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+
     let output = harness.run_command(&["update"], &[]);
 
-    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.status.success(),
+        "cargo cooldown update should keep unchanged baseline versions: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+}
+
+#[test]
+fn cooldown_update_repins_new_fresh_versions_against_pre_update_baseline() {
+    let mut harness =
+        TestHarness::new_with_dependency_req(RegistryMode::PubtimeOnly, &format!("={OLD_VERSION}"))
+            .expect("harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+    harness.set_dependency_requirement("1");
+
+    let output = harness.run_command(&["update"], &[("COOLDOWN_VERBOSE", "true")]);
+
+    assert!(
+        output.status.success(),
+        "cargo cooldown update should cool the updated lockfile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), OLD_VERSION);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Invoke `cargo update` directly instead"),
+        stderr.contains("cooldown: inspected crate=cooldowndep version=1.0.1"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("cooldown: scan_summary registry_packages=1 inspected=1 fresh=1"),
         "{stderr}"
     );
 }
@@ -368,6 +400,13 @@ struct TestHarness {
 
 impl TestHarness {
     fn new(mode: RegistryMode) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_dependency_req(mode, "1")
+    }
+
+    fn new_with_dependency_req(
+        mode: RegistryMode,
+        version_req: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
         let server = RegistryServer::new(mode)?;
         let temp_root = temp_dir.path().to_path_buf();
@@ -375,7 +414,7 @@ impl TestHarness {
         let workspace_dir = temp_root.join("workspace");
 
         fs::create_dir_all(&cargo_home)?;
-        create_workspace(&workspace_dir, &server)?;
+        create_workspace_with_dependency(&workspace_dir, &server, CRATE_NAME, version_req)?;
         write_registry_config(&cargo_home, &server)?;
 
         Ok(Self {
@@ -438,6 +477,11 @@ impl TestHarness {
         let path = self.temp_root.join("runner");
         fs::create_dir_all(&path).expect("runner dir should be creatable");
         path
+    }
+
+    fn set_dependency_requirement(&self, version_req: &str) {
+        write_root_manifest(&self.workspace_dir, CRATE_NAME, version_req)
+            .expect("root manifest should be rewritable");
     }
 
     fn locked_version(&self) -> String {
@@ -872,13 +916,6 @@ impl RegistryDependency {
             requirement: format!("={version}"),
         }
     }
-}
-
-fn create_workspace(
-    workspace_dir: &Path,
-    server: &RegistryServer,
-) -> Result<(), Box<dyn std::error::Error>> {
-    create_workspace_with_dependency(workspace_dir, server, CRATE_NAME, "1")
 }
 
 fn create_workspace_with_dependency(

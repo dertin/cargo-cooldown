@@ -170,6 +170,14 @@ lockfile_policy = "all"
 COOLDOWN_LOCKFILE_POLICY=all cargo cooldown check
 ```
 
+`lockfile_policy = "changed"` is most visible with `cargo cooldown update`:
+
+- versions already present in the pre-update `Cargo.lock` are left alone
+- versions introduced or changed by that update become eligible for cooldown
+
+For `build`, `check`, `test`, or `run`, Cargo usually reuses the existing
+lockfile. Those commands do not proactively refresh dependencies on their own.
+
 ## `cargo cooldown init`
 
 Use `cargo cooldown init` from the project root to scaffold a `cooldown.toml`

@@ -49,9 +49,10 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CooldownCommand {
-    /// Initialize cooldown.toml in the current project root.
-    ///
-    /// This is cargo-cooldown's setup wizard, not Cargo's `cargo init`.
+    #[command(
+        about = "Initialize cooldown.toml in the current project root.",
+        long_about = "Initialize cooldown.toml in the current project root.\n\nThis is cargo-cooldown's setup wizard, not Cargo's `cargo init`. Use plain `cargo init` to create a new package."
+    )]
     Init,
     #[command(external_subcommand)]
     Cargo(Vec<OsString>),
@@ -209,6 +210,13 @@ fn init_uses_runtime_selectors(cli: &Cli) -> bool {
         || !cli.features.features.is_empty()
 }
 
+fn is_update_command(cargo_args: &[OsString]) -> bool {
+    matches!(
+        cargo_args.first().and_then(|value| value.to_str()),
+        Some("update")
+    )
+}
+
 /// Canonicalize the Cargo invocation so the subcommand leads and the selectors
 /// parsed by clap-cargo (`--manifest-path`, `--package`, feature flags, etc.)
 /// are re-applied in the order that upstream `cargo` expects.
@@ -308,16 +316,36 @@ fn main() -> Result<()> {
                 exit_with(2);
             }
 
-            if matches!(
-                cargo_args.first().and_then(|value| value.to_str()),
-                Some("update")
-            ) {
-                eprintln!(
-                    "cargo-cooldown is designed for commands like build, check, test, or run.\n\
-                     Running it with `cargo update` would replace the lockfile you just cooled down.\n\
-                     Invoke `cargo update` directly instead if you truly intend to refresh dependency versions."
-                );
-                exit_with(2);
+            if is_update_command(cargo_args) {
+                let initial_lockfile = executor::capture_initial_lockfile(&config, &cli.manifest)?;
+                let status = Command::new("cargo").args(&forwarded_args).status()?;
+                if !status.success() {
+                    exit_with(status.code().unwrap_or(1));
+                }
+
+                if config.mode != Mode::Off && config.cooldown_minutes > 0 {
+                    match executor::run_pinning_flow_with_snapshot(
+                        &config,
+                        &cli.manifest,
+                        &cli.workspace,
+                        &cli.features,
+                        initial_lockfile,
+                        "dependency graph updated and cooled down",
+                    ) {
+                        Ok(()) => {}
+                        Err(err) => match config.mode {
+                            Mode::Warn => {
+                                warn!(error = %err, "cooldown guard failed after cargo update; continuing due to warn mode");
+                            }
+                            Mode::Enforce => {
+                                return Err(err);
+                            }
+                            Mode::Off => {}
+                        },
+                    }
+                }
+
+                exit_with(0);
             }
 
             if config.mode != Mode::Off && config.cooldown_minutes > 0 {
@@ -350,7 +378,7 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         CooldownCommand, assemble_cargo_args, init_looks_like_forwarded_cargo_init,
-        init_uses_runtime_selectors, parse_cli, split_features,
+        init_uses_runtime_selectors, is_update_command, parse_cli, split_features,
     };
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -429,6 +457,7 @@ mod tests {
                 .unwrap(),
             "update"
         );
+        assert!(is_update_command(&cargo_args(&cli)));
     }
 
     #[test]
