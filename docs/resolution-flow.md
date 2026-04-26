@@ -37,7 +37,7 @@ flowchart TD
     Index --> Missing{pubtime missing?}
     Missing -->|No| Timeline[Build timeline]
     Missing -->|Yes| Fallback[Optional HTTP fallback]
-    Fallback --> Timeline[Build merged timeline]
+    Fallback --> Timeline
     Timeline --> AgeCache[Cache timeline and age inspection]
     TimelineCache -->|Yes| AgeCache
     AgeCache --> Fresh{Fresh version?}
@@ -149,11 +149,12 @@ initial lockfile baseline after later pins.
 
 If any later cooldown step fails after Cargo has already rewritten the temp
 `Cargo.lock`, the resolver restores the exact temp lockfile contents that were
-present at process start before returning the error, and the real lockfile guard
-restores the original root `Cargo.lock`. Under `cargo_compatible`, a rejected or
-non-interactive unresolved-fresh-version prompt is treated as such a failure;
-other guard failures are downgraded to warnings by that enforcement mode after
-the temp lockfile has already been restored.
+present at process start before returning the error. Under `strict`, or when a
+`cargo_compatible` unresolved-fresh-version prompt is rejected or cannot run
+interactively, the real lockfile guard restores the original root `Cargo.lock`.
+For `cargo cooldown update`, other guard failures downgraded by
+`cargo_compatible` restore and publish Cargo's post-update temp lockfile instead
+of silently leaving the real lockfile unchanged.
 
 That means `cargo cooldown update` has this exact shape:
 

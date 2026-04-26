@@ -6,7 +6,6 @@
 //! and fills missing publish times through the registry API when available.
 
 use std::collections::{BTreeMap, HashMap};
-use std::hash::{Hash, Hasher};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -630,9 +629,12 @@ fn normalize_registry_identifier(raw: &str) -> Result<String> {
 }
 
 fn registry_cache_fingerprint(value: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 fn cargo_config_root() -> Option<TamePathBuf> {
@@ -807,6 +809,14 @@ mod tests {
         assert_eq!(
             normalize_registry_identifier("CrAtEs-IO").unwrap(),
             "crates-io"
+        );
+    }
+
+    #[test]
+    fn registry_cache_fingerprint_uses_stable_hash() {
+        assert_eq!(
+            registry_cache_fingerprint("https://mirror.example/index"),
+            "6575af8469572506"
         );
     }
 

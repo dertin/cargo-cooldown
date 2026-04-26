@@ -69,7 +69,7 @@ impl ProjectContext {
     /// workspace and where files should be created.
     pub fn discover_for_init() -> Result<Self> {
         let context = Self::discover(&RuntimeSelection::default())?;
-        if context.cwd != context.workspace_root {
+        if !same_existing_path(&context.cwd, &context.workspace_root)? {
             bail!(
                 "`cargo cooldown init` must run from the project root. Current directory: {}. Expected root: {}",
                 context.cwd.display(),
@@ -128,6 +128,14 @@ impl ProjectContext {
             (path != self.workspace_config_path()).then_some(path)
         })
     }
+}
+
+fn same_existing_path(left: &Path, right: &Path) -> Result<bool> {
+    let left = fs::canonicalize(left)
+        .with_context(|| format!("failed to canonicalize {}", left.display()))?;
+    let right = fs::canonicalize(right)
+        .with_context(|| format!("failed to canonicalize {}", right.display()))?;
+    Ok(left == right)
 }
 
 fn locate_project(manifest_path: Option<&Path>, workspace: bool) -> Result<PathBuf> {
@@ -343,5 +351,17 @@ mod tests {
         };
 
         assert!(context.member_config_path().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_existing_path_matches_symlinked_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let real_root = temp_dir.path().join("workspace");
+        let link_root = temp_dir.path().join("workspace-link");
+        fs::create_dir(&real_root).unwrap();
+        std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
+
+        assert!(same_existing_path(&link_root, &real_root).unwrap());
     }
 }

@@ -419,6 +419,7 @@ fn run_update_with_cooldown_isolation(
                 status.code().unwrap_or(1),
             ));
         }
+        let post_update_lockfile = executor::capture_initial_lockfile(config, isolated.manifest())?;
 
         if config.enforcement != Enforcement::Off && config.cooldown_minutes > 0 {
             match executor::run_pinning_flow_with_snapshot(
@@ -438,7 +439,10 @@ fn run_update_with_cooldown_isolation(
                     }
                     Enforcement::CargoCompatible => {
                         warn!(error = %err, "cooldown guard failed after cargo update; continuing due to cargo_compatible enforcement");
-                        return Ok(IsolatedUpdateOutcome::Done);
+                        executor::restore_lockfile_snapshot(
+                            &post_update_lockfile,
+                            isolated.manifest(),
+                        )?;
                     }
                     Enforcement::Strict => {
                         return Err(err);

@@ -211,6 +211,32 @@ fn cargo_compatible_enforcement_continues_when_registry_lacks_release_time_metad
 }
 
 #[test]
+fn cargo_compatible_update_keeps_cargo_updated_lockfile_when_metadata_is_missing() {
+    let mut harness = TestHarness::new_with_dependency_req(
+        RegistryMode::MissingPubtimeNoApi,
+        &format!("={OLD_VERSION}"),
+    )
+    .expect("harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+
+    harness.set_dependency_requirement("1");
+    let output = harness.run_command(
+        &["update"],
+        &[
+            ("COOLDOWN_ENFORCEMENT", "cargo_compatible"),
+            ("COOLDOWN_CARGO_COMPATIBLE_ACCEPT", "auto"),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "cargo_compatible update should keep Cargo's updated lockfile when cooldown metadata is missing: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+}
+
+#[test]
 fn skips_registry_from_start_by_name() {
     let mut harness =
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");

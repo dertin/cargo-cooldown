@@ -417,11 +417,9 @@ fn prompt_multi_select(prompt: &str, options: &[ProjectMember]) -> Result<Vec<Pr
         .map(str::trim)
         .filter(|part| !part.is_empty())
     {
-        let index = part
-            .parse::<usize>()
-            .with_context(|| format!("invalid member selection `{part}`"))?;
+        let index = parse_member_selection_index(part, options.len())?;
         let member = options
-            .get(index.saturating_sub(1))
+            .get(index)
             .cloned()
             .with_context(|| format!("member selection `{part}` is out of range"))?;
         if selected
@@ -434,6 +432,19 @@ fn prompt_multi_select(prompt: &str, options: &[ProjectMember]) -> Result<Vec<Pr
     }
 
     Ok(selected)
+}
+
+fn parse_member_selection_index(part: &str, options_len: usize) -> Result<usize> {
+    let index = part
+        .parse::<usize>()
+        .with_context(|| format!("invalid member selection `{part}`"))?;
+    let index = index
+        .checked_sub(1)
+        .with_context(|| format!("member selection `{part}` is out of range"))?;
+    if index >= options_len {
+        bail!("member selection `{part}` is out of range");
+    }
+    Ok(index)
 }
 
 fn select_enforcement(prompt: &str, default: &str) -> Result<String> {
@@ -556,5 +567,12 @@ mod tests {
         );
         let path = context.members[0].dir.join("cooldown.toml");
         assert_eq!(path, Path::new("/tmp/workspace/member-a/cooldown.toml"));
+    }
+
+    #[test]
+    fn member_selection_rejects_zero() {
+        let err = parse_member_selection_index("0", 3).unwrap_err();
+
+        assert!(format!("{err:#}").contains("out of range"));
     }
 }

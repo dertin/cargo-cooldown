@@ -45,7 +45,9 @@ For registries that are not skipped:
 
 - local `pubtime` is preferred;
 - fallback HTTP is attempted only when needed;
-- if neither path yields a usable timestamp, cooldown fails.
+- if neither path yields a usable timestamp, `strict` enforcement fails closed;
+- under `cargo_compatible` enforcement, the missing timestamp is reported as a
+  warning and the run continues.
 
 For registries like CodeArtifact that may not expose the required metadata for
 cooldown, the intended workflow is to list them in `skip_registries`.

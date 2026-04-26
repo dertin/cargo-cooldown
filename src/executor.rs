@@ -68,6 +68,11 @@ pub fn capture_initial_lockfile(config: &Config, manifest: &Manifest) -> Result<
     LockfileSnapshot::capture(&lockfile_path, &mut registry_store)
 }
 
+/// Restore a lockfile snapshot into the active workspace.
+pub fn restore_lockfile_snapshot(snapshot: &LockfileSnapshot, manifest: &Manifest) -> Result<()> {
+    snapshot.restore(&workspace_lockfile_path(manifest)?)
+}
+
 /// Run the full cooldown resolver from an already captured baseline.
 ///
 /// This is the main execution loop. It receives the immutable command context,

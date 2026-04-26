@@ -123,7 +123,8 @@ If you want a registry to be excluded from cooldown entirely, use
 5. Move allow rules into `cooldown.toml`.
 6. Add `skip_registries` or `COOLDOWN_SKIP_REGISTRIES` for any registry that
    should not participate in cooldown.
-7. Replace `mode` with `enforcement` in `cooldown.toml`.
+7. Replace `mode` with `enforcement` in `cooldown.toml`; rename the value
+   `best_effort` to `cargo_compatible`.
 8. Replace `COOLDOWN_MODE` with `COOLDOWN_ENFORCEMENT` in scripts and CI.
 9. If you relied on 0.2.x best-effort behavior, switch to
    `COOLDOWN_ENFORCEMENT=cargo_compatible`.

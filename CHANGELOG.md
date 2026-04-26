@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 - 2026-04-05
+## 0.3.0 - 2026-04-26
 
 This is an intentionally breaking release.
 
