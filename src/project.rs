@@ -215,10 +215,15 @@ fn determine_active_member(
         .first()
         .and_then(|name| members.iter().find(|member| member.name == *name))
         .cloned();
+    // The CLI manifest path can be relative; Cargo has already resolved it here.
     let member_from_manifest = selection
         .manifest_path
         .as_ref()
-        .and_then(|path| members.iter().find(|member| member.manifest_path == *path))
+        .and_then(|_| {
+            members
+                .iter()
+                .find(|member| member.manifest_path == current_manifest)
+        })
         .cloned();
 
     match (member_from_package, member_from_manifest) {
@@ -290,6 +295,27 @@ mod tests {
         let root = PathBuf::from("/tmp/workspace");
         let current_manifest = PathBuf::from("/tmp/workspace/member-a/Cargo.toml");
         let selection = RuntimeSelection::default();
+        let members = vec![ProjectMember {
+            name: "member-a".to_string(),
+            manifest_path: PathBuf::from("/tmp/workspace/member-a/Cargo.toml"),
+            dir: PathBuf::from("/tmp/workspace/member-a"),
+        }];
+
+        let active =
+            determine_active_member(&selection, &cwd, &current_manifest, &root, &members).unwrap();
+
+        assert_eq!(active.name, "member-a");
+    }
+
+    #[test]
+    fn active_member_uses_relative_manifest_path_from_workspace_root() {
+        let cwd = PathBuf::from("/tmp/workspace");
+        let root = PathBuf::from("/tmp/workspace");
+        let current_manifest = PathBuf::from("/tmp/workspace/member-a/Cargo.toml");
+        let selection = RuntimeSelection {
+            manifest_path: Some(PathBuf::from("member-a/Cargo.toml")),
+            ..RuntimeSelection::default()
+        };
         let members = vec![ProjectMember {
             name: "member-a".to_string(),
             manifest_path: PathBuf::from("/tmp/workspace/member-a/Cargo.toml"),
