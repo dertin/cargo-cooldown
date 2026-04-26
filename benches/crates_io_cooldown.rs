@@ -110,8 +110,8 @@ Environment is forwarded to the benchmark script. Useful variables include:
   BENCH_ISOLATED_CARGO_HOME, BENCH_ARTIFACT_ROOT, BENCH_RUN_ID,
   RUST_LOG, COOLDOWN_VERBOSE
 
-The benchmark runs one cooldown mode. COOLDOWN_VERBOSE defaults to 1 so the
-runner can report registry API fallback usage from captured logs.
+The benchmark runs one cooldown enforcement policy. COOLDOWN_VERBOSE defaults to
+1 so the runner can report registry API fallback usage from captured logs.
 "#
     );
 }

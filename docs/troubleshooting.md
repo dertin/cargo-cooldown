@@ -1,24 +1,25 @@
 # Troubleshooting
 
-## "strict mode blocked fresh versions"
+## "strict enforcement blocked fresh versions"
 
 Meaning:
 
 - the listed versions are still newer than the configured cooldown window
 - cooldown tried older versions that Cargo would accept
 - Cargo still required those fresh versions
-- `strict` mode restored the original `Cargo.lock`
+- `strict` enforcement restored the original `Cargo.lock`
 
 This is different from `lockfile_baseline`.
 
 - `lockfile_baseline = "ignore"` lets cooldown try to downgrade packages that were
   already in the initial lockfile.
-- `mode = "strict"` still fails if any fresh version remains after those
+- `enforcement = "strict"` still fails if any fresh version remains after those
   attempts.
 
 Options:
 
-- use `mode = "best_effort"` to keep Cargo's best valid lockfile and warn
+- use `enforcement = "cargo_compatible"` to keep Cargo's best valid lockfile and
+  review the fresh versions in an interactive prompt
 - add `allow.package` or `allow.exact` for releases you intentionally accept
 - reduce `cooldown_minutes` if the window is too strict
 - inspect the dependency path that forces the fresh package
@@ -75,7 +76,9 @@ Meaning:
 Options:
 
 - add the registry to `skip_registries`
-- use `mode = "best_effort"` if warnings are acceptable
+- use `enforcement = "cargo_compatible"` if warnings are acceptable
+- set `cargo_compatible_accept = "auto"` only if unresolved fresh versions
+  should be accepted without an interactive prompt
 - ensure the registry exposes either `pubtime` or a compatible API
 
 ## "registry ... does not provide cached metadata"

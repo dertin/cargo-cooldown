@@ -46,14 +46,17 @@ cargo init
 
 ```toml
 cooldown_minutes = 1440
-mode = "strict"
+enforcement = "cargo_compatible"
+cargo_compatible_accept = "prompt"
 lockfile_baseline = "floor"
 ```
 
 Meaning:
 
 - `cooldown_minutes`: how old a release must be before cooldown accepts it
-- `mode`: what to do if some fresh versions cannot be cooled
+- `enforcement`: what to do if Cargo still requires fresh versions
+- `cargo_compatible_accept`: whether to prompt before accepting fresh versions
+  Cargo still requires
 - `lockfile_baseline`: whether the initial `Cargo.lock` is used as a version
   floor
 
@@ -64,28 +67,36 @@ Config is loaded in this order, from strongest to weakest:
 3. workspace or crate root `cooldown.toml`
 4. `$CARGO_HOME/cooldown.toml`
 
-## `mode` vs `lockfile_baseline`
+## `enforcement` vs `lockfile_baseline`
 
 These settings answer different questions:
 
 - `lockfile_baseline` controls whether cooldown may go below versions already
   present in the initial `Cargo.lock`.
-- `mode` controls what happens if Cargo still requires fresh versions.
+- `enforcement` controls what happens if Cargo still requires fresh versions.
 
-`lockfile_baseline = "ignore"` is not a force mode. Cargo still validates the final
-graph, so cooldown never writes a lockfile that Cargo rejects.
+`lockfile_baseline = "ignore"` is not a force setting. Cargo still validates the
+final graph, so cooldown never writes a lockfile that Cargo rejects.
 
-| Config | Human meaning |
+| Configuration | Meaning |
 | --- | --- |
-| `lockfile_baseline = "floor"` + `mode = "strict"` | Default. Use the pre-run lockfile as the minimum version floor. If any new fresh version remains, fail and restore the original `Cargo.lock`. |
-| `lockfile_baseline = "floor"` + `mode = "best_effort"` | Use the pre-run lockfile as the minimum version floor, keep the best valid lockfile if some fresh versions remain, and warn. |
-| `lockfile_baseline = "ignore"` + `mode = "strict"` | Try to cool every eligible locked registry package, including versions already present before the run. If any fresh version still cannot be cooled, fail and restore the original `Cargo.lock`. |
-| `lockfile_baseline = "ignore"` + `mode = "best_effort"` | Most permissive update mode. Try to cool everything, keep Cargo's best valid result, and warn about any remaining fresh versions. |
+| `lockfile_baseline = "floor"` + `enforcement = "cargo_compatible"` | `cargo cooldown init` default. Use the pre-run lockfile as the minimum version floor, keep the best Cargo-valid lockfile if some fresh versions remain, and warn. |
+| `lockfile_baseline = "floor"` + `enforcement = "strict"` | Fail-closed policy. Use the pre-run lockfile as the minimum version floor. If any new fresh version remains, fail and restore the original `Cargo.lock`. |
+| `lockfile_baseline = "ignore"` + `enforcement = "strict"` | Try to cool every eligible locked registry package, including versions already present before the run. If any fresh version still cannot be cooled, fail and restore the original `Cargo.lock`. |
+| `lockfile_baseline = "ignore"` + `enforcement = "cargo_compatible"` | Most permissive update policy. Try to cool everything, keep Cargo's best valid result, and warn about any remaining fresh versions. |
 
 A fresh version can remain when the current `Cargo.toml` graph requires it. That
 can happen because of semver ranges, exact dependencies, feature-selected
 dependencies, target-specific dependencies, or a group of crates that does not
 have an older compatible combination.
+
+`enforcement = "cargo_compatible"` is flexible only where Cargo requires a fresh
+version. It still cools every package Cargo can accept and reports the remaining
+fresh versions so you can review the supply-chain risk.
+
+By default, `cargo_compatible` asks before accepting unresolved fresh versions.
+Use `cargo_compatible_accept = "auto"` only when you want the previous
+non-interactive behavior.
 
 ## Allow Rules
 

@@ -213,12 +213,13 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::allow_rules::AllowRules;
-    use crate::config::{Config, LockfileBaselineMode, Mode};
+    use crate::config::{CargoCompatibleAccept, Config, Enforcement, LockfileBaselineMode};
 
     fn config_fixture() -> Config {
         Config {
             cooldown_minutes: 60,
-            mode: Mode::Strict,
+            enforcement: Enforcement::Strict,
+            cargo_compatible_accept: CargoCompatibleAccept::Prompt,
             lockfile_baseline: LockfileBaselineMode::Floor,
             now_override: None,
             ttl_seconds: 60,

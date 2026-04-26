@@ -12,26 +12,26 @@ license = "Apache-2.0 OR MIT"
 [dependencies]
 anyhow = "1"
 cargo_metadata = "0.23.1"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 dirs = "6.0"
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "gzip", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tame-index = "0.26.1"
+tame-index = "0.26.2"
 toml = "1.1.2"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 semver = "1"
 clap = { version = "4.5", features = ["derive"] }
 clap-cargo = { version = "0.18.3", features = ["cargo_metadata"] }
 indicatif = "0.18.4"
+tempfile = "3"
 
 [dev-dependencies]
 assert_fs = "1"
 flate2 = "1"
 sha2 = "0.11"
-tar = "0.4"
-tempfile = "3"
+tar = "0.4.45"
 
 [[bench]]
 name = "crates_io_cooldown"

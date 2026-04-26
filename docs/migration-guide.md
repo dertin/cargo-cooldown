@@ -1,6 +1,6 @@
 # Migration Guide
 
-This guide covers the upgrade path from the older configuration model to the
+This guide covers the upgrade path from the 0.2.x configuration model to the
 current registry-aware resolver.
 
 ## What changed
@@ -76,21 +76,35 @@ and discovers the fallback HTTP API from that registry index.
 
 `COOLDOWN_REGISTRY_API` no longer exists.
 
-### Best-effort behavior is controlled by `mode`
+### `enforcement` replaces 0.2.x `mode`
 
 `COOLDOWN_OFFLINE_OK` no longer exists.
 
-`mode` now accepts only:
+0.2.x used:
 
-- `strict`
-- `best_effort`
-- `off`
+- `mode = "strict"` / `COOLDOWN_MODE=strict`
+- `mode = "best_effort"` / `COOLDOWN_MODE=best_effort`
+- `mode = "off"` / `COOLDOWN_MODE=off`
 
-If you want cooldown failures to be downgraded to warnings and keep a
-best-effort lockfile, use:
+This release uses:
+
+- `enforcement = "strict"` / `COOLDOWN_ENFORCEMENT=strict`
+- `enforcement = "cargo_compatible"` / `COOLDOWN_ENFORCEMENT=cargo_compatible`
+- `enforcement = "off"` / `COOLDOWN_ENFORCEMENT=off`
+
+If you previously used 0.2.x best-effort behavior and want to keep Cargo's best
+valid lockfile while warning about fresh versions that Cargo still requires,
+use:
 
 ```bash
-COOLDOWN_MODE=best_effort
+COOLDOWN_ENFORCEMENT=cargo_compatible
+```
+
+This now prompts before accepting unresolved fresh versions. To keep the 0.2.x
+non-interactive behavior, also set:
+
+```bash
+COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto
 ```
 
 If you want a registry to be excluded from cooldown entirely, use
@@ -109,7 +123,12 @@ If you want a registry to be excluded from cooldown entirely, use
 5. Move allow rules into `cooldown.toml`.
 6. Add `skip_registries` or `COOLDOWN_SKIP_REGISTRIES` for any registry that
    should not participate in cooldown.
-7. If you relied on best-effort behavior, switch to `COOLDOWN_MODE=best_effort`.
+7. Replace `mode` with `enforcement` in `cooldown.toml`.
+8. Replace `COOLDOWN_MODE` with `COOLDOWN_ENFORCEMENT` in scripts and CI.
+9. If you relied on 0.2.x best-effort behavior, switch to
+   `COOLDOWN_ENFORCEMENT=cargo_compatible`.
+10. If that flow must remain non-interactive, add
+    `COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto`.
 
 ## Internal registries
 
@@ -121,9 +140,9 @@ per-crate HTTP only when `pubtime` is missing.
 
 If an internal registry still cannot provide timestamps:
 
-- `strict` mode fails closed;
-- `best_effort` mode emits a warning and continues;
-- `off` mode disables cooldown entirely.
+- `strict` enforcement fails closed;
+- `cargo_compatible` enforcement emits a warning and continues;
+- `off` enforcement disables cooldown entirely.
 
 For registries such as CodeArtifact, the practical migration path is usually:
 
@@ -158,4 +177,9 @@ See also:
 - no `cooldown-allowlist.toml`, `allowlist_path`, or
   `COOLDOWN_ALLOWLIST_PATH` references remain;
 - registries that should be excluded are listed in `skip_registries`;
-- flows that expect best-effort behavior use `COOLDOWN_MODE=best_effort`.
+- 0.2.x `mode` keys were renamed to `enforcement`;
+- 0.2.x `COOLDOWN_MODE` references were renamed to `COOLDOWN_ENFORCEMENT`;
+- flows that expect 0.2.x best-effort behavior use
+  `COOLDOWN_ENFORCEMENT=cargo_compatible`;
+- non-interactive flows that expect 0.2.x best-effort behavior also use
+  `COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto`.

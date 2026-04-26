@@ -9,7 +9,7 @@ The authoritative automated suite lives in `./tests`.
 - default baseline behavior for unchanged lockfile entries
 - opt-in `lockfile_baseline = "ignore"` behavior
 - fail-closed behavior for registries without release-time metadata
-- `best_effort` mode behavior for the same condition
+- `cargo_compatible` enforcement behavior for the same condition
 - `skip_registries` by name and by URL
 - snapshot reachability for the metadata-derived resolver state
 - batch solver coverage for independent, duplicate, optional, target-specific,

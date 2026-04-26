@@ -72,8 +72,8 @@ Available CASE values:
   allow-rules      Append package-scoped allow rules to the smoke workspace
                    config for one run, showing mixed per-crate cooldown
                    overrides.
-  best-effort      Keep cooldown enabled, but continue the Cargo command if
-                   cooldown resolution fails.
+  cargo-compatible Keep cooldown enabled, but continue the Cargo command if
+                   Cargo requires fresh versions.
   skip-crates-io   Skip crates.io entirely through COOLDOWN_SKIP_REGISTRIES
                    and verify that cooldown does not inspect registry packages.
   aggressive-ttl   Use a shorter cooldown window, short cache TTL, retries,
@@ -109,7 +109,7 @@ else
   echo "Using local cargo-cooldown binary built from current sources: ${CMD_BIN}" >&2
 fi
 
-SELECTED=("allow-rules" "best-effort" "skip-crates-io" "aggressive-ttl")
+SELECTED=("allow-rules" "cargo-compatible" "skip-crates-io" "aggressive-ttl")
 if [[ $# -gt 0 ]]; then
   SELECTED=("$@")
 fi
@@ -124,12 +124,13 @@ for case_name in "${SELECTED[@]}"; do
         $'[[allow.package]]\ncrate = "chrono"\nminutes = 60\n\n[[allow.package]]\ncrate = "serde_json"\nminutes = 0' \
         COOLDOWN_MINUTES=131401
       ;;
-    best-effort)
+    cargo-compatible)
       run_case \
-        "best-effort" \
-        "Cooldown is active, but any cooldown failure is downgraded to a warning and the Cargo command still runs." \
+        "cargo-compatible" \
+        "Cooldown is active, but fresh versions required by Cargo are reported as warnings and the Cargo command still runs." \
         yes \
-        COOLDOWN_MODE=best_effort
+        COOLDOWN_ENFORCEMENT=cargo_compatible \
+        COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto
       ;;
     skip-crates-io)
       run_case \

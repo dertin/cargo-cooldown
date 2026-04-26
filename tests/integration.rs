@@ -158,16 +158,19 @@ fn fails_closed_when_registry_lacks_release_time_metadata() {
 }
 
 #[test]
-fn best_effort_mode_continues_when_registry_lacks_release_time_metadata() {
+fn cargo_compatible_enforcement_continues_when_registry_lacks_release_time_metadata() {
     let mut harness =
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");
     harness.generate_lockfile();
 
-    let output =
-        harness.run_cooldown(&[LOCKFILE_BASELINE_IGNORE, ("COOLDOWN_MODE", "best_effort")]);
+    let output = harness.run_cooldown(&[
+        LOCKFILE_BASELINE_IGNORE,
+        ("COOLDOWN_ENFORCEMENT", "cargo_compatible"),
+        ("COOLDOWN_CARGO_COMPATIBLE_ACCEPT", "auto"),
+    ]);
     assert!(
         output.status.success(),
-        "best_effort mode should continue: {}",
+        "cargo_compatible enforcement should continue: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), FRESH_VERSION);
@@ -211,16 +214,16 @@ fn skips_registry_from_start_by_effective_url() {
 }
 
 #[test]
-fn mode_off_skips_cooldown_checks_entirely() {
+fn enforcement_off_skips_cooldown_checks_entirely() {
     let mut harness =
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");
     harness.generate_lockfile();
     harness.server.reset_counts();
 
-    let output = harness.run_cooldown(&[LOCKFILE_BASELINE_IGNORE, ("COOLDOWN_MODE", "off")]);
+    let output = harness.run_cooldown(&[LOCKFILE_BASELINE_IGNORE, ("COOLDOWN_ENFORCEMENT", "off")]);
     assert!(
         output.status.success(),
-        "mode=off should bypass cooldown: {}",
+        "enforcement=off should bypass cooldown: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), FRESH_VERSION);
@@ -439,6 +442,76 @@ fn cooldown_update_repins_new_fresh_versions_against_pre_update_baseline() {
     assert!(
         !stderr.contains("Updating `cool-reg` index"),
         "the initial cargo update output should stay hidden on success: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cooldown_update_holds_real_lockfile_and_uses_temp_workspace() {
+    let mut harness =
+        TestHarness::new_with_dependency_req(RegistryMode::PubtimeOnly, &format!("={OLD_VERSION}"))
+            .expect("harness should build");
+    harness.generate_lockfile();
+    harness.set_dependency_requirement("1");
+
+    let wrapper_dir = harness.temp_root.join("hold-wrapper-bin");
+    let wrapper_path = wrapper_dir.join(wrapper_binary_name());
+    let wrapper_log = harness.temp_root.join("hold-wrapper.log");
+    fs::create_dir_all(&wrapper_dir).expect("wrapper dir should exist");
+    write_hold_asserting_cargo_wrapper(&wrapper_path, &wrapper_log)
+        .expect("wrapper should be writable");
+    let path_with_wrapper = prepend_to_path(&wrapper_dir).expect("PATH should be buildable");
+    let runner_dir = harness.runner_dir();
+    let manifest_path = harness.workspace_dir.join("Cargo.toml");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .args([
+            "update",
+            "--manifest-path",
+            manifest_path.to_string_lossy().as_ref(),
+        ])
+        .current_dir(&runner_dir)
+        .env("CARGO_HOME", &harness.cargo_home)
+        .env("CARGO_TERM_PROGRESS_WHEN", "never")
+        .env("COOLDOWN_NOW", NOW)
+        .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+        .env("COOLDOWN_HTTP_RETRIES", "0")
+        .env("COOLDOWN_VERBOSE", "true")
+        .env("COOLDOWN_EXPECT_HELD_WORKSPACE", &harness.workspace_dir)
+        .env("PATH", &path_with_wrapper)
+        .output()
+        .expect("cargo-cooldown should run");
+
+    assert!(
+        output.status.success(),
+        "isolated update should succeed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&wrapper_log).unwrap_or_default()
+    );
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+
+    let wrapper_log = fs::read_to_string(&wrapper_log).expect("wrapper log should exist");
+    assert!(
+        wrapper_log.contains("update-held-lockfile"),
+        "internal cargo update should see the real Cargo.lock held: {wrapper_log}"
+    );
+    assert!(
+        wrapper_log.contains("update-used-temp-workspace"),
+        "internal cargo update should run from the temp workspace: {wrapper_log}"
+    );
+    assert!(
+        wrapper_log.contains("update-rewrote-manifest-path"),
+        "internal cargo update should receive the temp manifest path: {wrapper_log}"
+    );
+    assert!(
+        fs::read_dir(&harness.workspace_dir)
+            .expect("workspace should be readable")
+            .all(|entry| !entry
+                .expect("entry should be readable")
+                .file_name()
+                .to_string_lossy()
+                .starts_with("Cargo.lock.cooldown-backup.")),
+        "lockfile backup should be cleaned after publishing"
     );
 }
 
@@ -1199,15 +1272,15 @@ fn benchmark_batch_solver() {
 }
 
 #[test]
-fn best_effort_allows_resolver_constrained_versions_outside_selected_scope() {
+fn cargo_compatible_allows_resolver_constrained_versions_outside_selected_scope() {
     let mut harness = ScopedConflictHarness::new().expect("scoped conflict harness should build");
     harness.generate_lockfile();
     assert_eq!(harness.locked_version(), FRESH_VERSION);
 
-    let output = harness.run_cooldown(Some("best_effort"));
+    let output = harness.run_cooldown(Some("cargo_compatible"));
     assert!(
         output.status.success(),
-        "best_effort should keep the lockfile and warn: {}",
+        "cargo_compatible should keep the lockfile and warn: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), FRESH_VERSION);
@@ -1217,6 +1290,39 @@ fn best_effort_allows_resolver_constrained_versions_outside_selected_scope() {
         "{stderr}"
     );
     assert!(stderr.contains("- scopedfresh 1.0.1"), "{stderr}");
+    assert!(
+        stderr.contains("published: 2026-04-02T12:00:00Z"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn cargo_compatible_requires_prompt_unless_auto_accept_is_configured() {
+    let mut harness = ScopedConflictHarness::new().expect("scoped conflict harness should build");
+    harness.generate_lockfile();
+    let baseline_lockfile = harness.lockfile_contents();
+
+    let output = harness.run_cooldown_requiring_prompt();
+    assert!(
+        !output.status.success(),
+        "non-interactive cargo_compatible should require explicit acceptance: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.lockfile_contents(), baseline_lockfile);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Cargo requires fresh versions that cooldown could not replace."),
+        "{stderr}"
+    );
+    assert!(stderr.contains("- scopedfresh 1.0.1 @ "), "{stderr}");
+    assert!(
+        stderr.contains("published: 2026-04-02T12:00:00Z"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto"),
+        "{stderr}"
+    );
 }
 
 #[test]
@@ -1236,7 +1342,7 @@ fn strict_rejects_resolver_constrained_versions_outside_selected_scope() {
     assert_eq!(harness.locked_version(), FRESH_VERSION);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("strict mode blocked fresh versions"),
+        stderr.contains("strict enforcement blocked fresh versions"),
         "{stderr}"
     );
     assert!(stderr.contains("scopedfresh 1.0.1"), "{stderr}");
@@ -2262,7 +2368,26 @@ impl ScopedConflictHarness {
         );
     }
 
-    fn run_cooldown(&self, mode: Option<&str>) -> Output {
+    fn run_cooldown(&self, enforcement: Option<&str>) -> Output {
+        let mut command = self.cooldown_command();
+
+        if let Some(enforcement) = enforcement {
+            command.env("COOLDOWN_ENFORCEMENT", enforcement);
+            if enforcement == "cargo_compatible" {
+                command.env("COOLDOWN_CARGO_COMPATIBLE_ACCEPT", "auto");
+            }
+        }
+
+        command.output().expect("cargo-cooldown should run")
+    }
+
+    fn run_cooldown_requiring_prompt(&self) -> Output {
+        let mut command = self.cooldown_command();
+        command.env("COOLDOWN_ENFORCEMENT", "cargo_compatible");
+        command.output().expect("cargo-cooldown should run")
+    }
+
+    fn cooldown_command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
         command
             .args(["check", "--package", SCOPED_MEMBER_A])
@@ -2273,12 +2398,7 @@ impl ScopedConflictHarness {
             .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
             .env("COOLDOWN_HTTP_RETRIES", "0")
             .env("COOLDOWN_LOCKFILE_BASELINE", "ignore");
-
-        if let Some(mode) = mode {
-            command.env("COOLDOWN_MODE", mode);
-        }
-
-        command.output().expect("cargo-cooldown should run")
+        command
     }
 
     fn lockfile_contents(&self) -> String {
@@ -2860,6 +2980,54 @@ fn write_cargo_wrapper(
     log_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     write_platform_cargo_wrapper(wrapper_path, log_path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_hold_asserting_cargo_wrapper(
+    wrapper_path: &Path,
+    log_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(
+        wrapper_path,
+        format!(
+            r#"#!/bin/sh
+printf 'cargo %s cwd=%s\n' "$*" "$(pwd)" >> "{log_path}"
+if [ "$1" = "update" ]; then
+  lockfile="$COOLDOWN_EXPECT_HELD_WORKSPACE/Cargo.lock"
+  if grep -q '^cargo-cooldown lockfile hold' "$lockfile"; then
+    printf 'update-held-lockfile\n' >> "{log_path}"
+  else
+    printf 'update-missing-held-lockfile\n' >> "{log_path}"
+    exit 97
+  fi
+  if [ "$(pwd)" = "$COOLDOWN_EXPECT_HELD_WORKSPACE" ]; then
+    printf 'update-used-original-workspace\n' >> "{log_path}"
+    exit 98
+  else
+    printf 'update-used-temp-workspace\n' >> "{log_path}"
+  fi
+  case "$*" in
+    *"$COOLDOWN_EXPECT_HELD_WORKSPACE"*)
+      printf 'update-kept-original-manifest-path\n' >> "{log_path}"
+      exit 99
+      ;;
+    *)
+      printf 'update-rewrote-manifest-path\n' >> "{log_path}"
+      ;;
+  esac
+fi
+exec "{real_cargo}" "$@"
+"#,
+            log_path = log_path.display(),
+            real_cargo = real_cargo_binary(),
+        ),
+    )?;
+    let mut permissions = fs::metadata(wrapper_path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(wrapper_path, permissions)?;
     Ok(())
 }
 

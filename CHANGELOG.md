@@ -16,6 +16,11 @@ Migration guide:
 - explicit `skip_registries` / `COOLDOWN_SKIP_REGISTRIES`
 - explicit `lockfile_baseline` / `COOLDOWN_LOCKFILE_BASELINE` to choose between
   using the initial lockfile as a version floor or ignoring that floor
+- explicit `enforcement` / `COOLDOWN_ENFORCEMENT` to choose strict rollback,
+  Cargo-compatible warnings, or fully disabled cooldown
+- explicit `cargo_compatible_accept` / `COOLDOWN_CARGO_COMPATIBLE_ACCEPT` to
+  choose prompt-based review or automatic acceptance for unresolved fresh
+  versions under Cargo-compatible enforcement
 - `cargo cooldown update` to refresh the lockfile first and then cool only the
   versions that changed relative to the pre-update baseline
 - `cargo cooldown init` to scaffold `cooldown.toml` interactively for crates
@@ -38,16 +43,21 @@ Migration guide:
   member overrides only for uniquely targeted workspace members
 - repeated outer-loop scans now reuse in-memory registry timelines and locked
   version age inspections within one cooldown execution
-- missing release-time metadata is fail-closed in `strict` mode and downgraded
-  to warnings only in `best_effort` mode
+- missing release-time metadata is fail-closed under `strict` enforcement and
+  downgraded to warnings only under `cargo_compatible` enforcement
+- `cargo_compatible` now prompts before accepting resolver-constrained fresh
+  versions unless `cargo_compatible_accept = "auto"` is configured
+- cooldown now resolves and cools lockfiles in a temporary workspace, holding
+  the real root `Cargo.lock` with a backup plus sentinel until the final
+  Cargo-valid lockfile is ready to publish
 - `verbose = true` / `COOLDOWN_VERBOSE=true` now surfaces cooldown internals as
   `DEBUG` logs while keeping user-facing `INFO`/`WARN` output compact
 
 ### Breaking changes
 
 Configuration, registry discovery, allow rules, lockfile baseline handling, and
-mode names changed in this release. See the [Migration Guide](docs/migration-guide.md)
-for the upgrade steps.
+enforcement names changed in this release. See the
+[Migration Guide](docs/migration-guide.md) for the upgrade steps.
 
 ### Fixed
 
@@ -61,12 +71,12 @@ for the upgrade steps.
   freshly updated crate back to an exact version from the initial baseline,
   even when that baseline version is still inside the cooldown window
 - cooldown now treats blockers or parent constraints that were already
-  exhausted earlier in the run as best-effort skips instead of failing
+  exhausted earlier in the run as cargo-compatible skips instead of failing
   later with a generic fixed-point error
 - cooldown now emits a single final warning when fresh versions remain,
   distinguishing baseline-carried versions from resolver-constrained ones, and
-  `strict` now turns remaining resolver-constrained fresh versions into a
-  rollback error instead of allowing them through
+  `strict` enforcement now turns remaining resolver-constrained fresh versions
+  into a rollback error instead of allowing them through
 - cooldown now makes one bounded coordinated bundle attempt for small
   resolver-constrained groups, which helps cool tightly coupled crates such as
   `js-sys` / `wasm-bindgen*` / `web-sys` when individual pins cannot progress

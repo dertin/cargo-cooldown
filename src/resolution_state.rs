@@ -99,7 +99,7 @@ pub struct ScanSummary {
     pub inspected: usize,
     pub fresh: usize,
     pub baseline_exempt: usize,
-    pub best_effort_skipped: usize,
+    pub cargo_compatible_skipped: usize,
     pub skipped: usize,
     pub exact_allowed: usize,
     pub zero_minutes: usize,
@@ -219,7 +219,7 @@ struct PackageScanRecord {
     state: CrateState,
     inspected: bool,
     fresh: bool,
-    best_effort_skipped: bool,
+    cargo_compatible_skipped: bool,
 }
 
 /// Aggregated cooldown state for one resolver pass.
@@ -237,7 +237,7 @@ pub struct ResolutionState {
     pub scan_summary: ScanSummary,
     pub fresh_keys_present: HashSet<String>,
     fresh_entries: HashMap<PackageId, FreshCrate>,
-    best_effort_entries: HashMap<PackageId, FreshCrate>,
+    cargo_compatible_entries: HashMap<PackageId, FreshCrate>,
     version_requirement_counts: HashMap<PackageId, HashMap<String, (VersionReq, usize)>>,
     requirement_origin_counts: RequirementOriginCounts,
     equality_dependent_counts: HashMap<PackageId, HashMap<PackageId, usize>>,
@@ -252,7 +252,7 @@ struct ResolutionScanCtx<'a> {
     initial_lockfile: &'a LockfileSnapshot,
     registry_store: &'a mut RegistryStore,
     inspection_cache: &'a mut HashMap<ReleaseInspectionKey, ReleaseInspection>,
-    best_effort_skips: &'a HashMap<String, String>,
+    cargo_compatible_skips: &'a HashMap<String, String>,
     now: DateTime<Utc>,
 }
 
@@ -263,8 +263,8 @@ impl ResolutionState {
     }
 
     /// Fresh packages already skipped once and only eligible for coordinated retries.
-    pub fn best_effort_entries_vec(&self) -> Vec<FreshCrate> {
-        self.best_effort_entries.values().cloned().collect()
+    pub fn cargo_compatible_entries_vec(&self) -> Vec<FreshCrate> {
+        self.cargo_compatible_entries.values().cloned().collect()
     }
 
     fn apply_node(
@@ -319,7 +319,7 @@ impl ResolutionState {
             state: state.clone(),
             inspected: false,
             fresh: false,
-            best_effort_skipped: false,
+            cargo_compatible_skipped: false,
         };
         self.crate_states.insert(package_id.clone(), state.clone());
 
@@ -364,11 +364,12 @@ impl ResolutionState {
                     minimum_minutes,
                 };
                 let key = crate_failure_key(source_id, package.name.as_str(), &current_version);
-                // Best-effort skips are tied to the exact resolved package version so
-                // successful later pins can reclassify new versions normally.
-                if ctx.best_effort_skips.contains_key(&key) {
-                    record.best_effort_skipped = true;
-                    self.best_effort_entries.insert(package_id.clone(), fresh);
+                // Cargo-compatible skips are tied to the exact resolved package version
+                // so successful later pins can reclassify new versions normally.
+                if ctx.cargo_compatible_skips.contains_key(&key) {
+                    record.cargo_compatible_skipped = true;
+                    self.cargo_compatible_entries
+                        .insert(package_id.clone(), fresh);
                 } else {
                     self.fresh_entries.insert(package_id.clone(), fresh);
                 }
@@ -469,8 +470,8 @@ impl ResolutionState {
         self.scan_summary.exact_allowed += usize::from(record.state.exact_allowed);
         self.scan_summary.zero_minutes += usize::from(record.state.minimum_minutes == 0);
         self.scan_summary.inspected += usize::from(record.inspected);
-        self.scan_summary.fresh += usize::from(record.fresh && !record.best_effort_skipped);
-        self.scan_summary.best_effort_skipped += usize::from(record.best_effort_skipped);
+        self.scan_summary.fresh += usize::from(record.fresh && !record.cargo_compatible_skipped);
+        self.scan_summary.cargo_compatible_skipped += usize::from(record.cargo_compatible_skipped);
         if record.fresh {
             self.fresh_keys_present.insert(crate_failure_key(
                 &record.state.source_id,
@@ -495,7 +496,7 @@ pub fn build_resolution_state(
     initial_lockfile: &LockfileSnapshot,
     registry_store: &mut RegistryStore,
     inspection_cache: &mut HashMap<ReleaseInspectionKey, ReleaseInspection>,
-    best_effort_skips: &HashMap<String, String>,
+    cargo_compatible_skips: &HashMap<String, String>,
     now: DateTime<Utc>,
 ) -> Result<ResolutionState> {
     let mut state = ResolutionState::default();
@@ -505,7 +506,7 @@ pub fn build_resolution_state(
         initial_lockfile,
         registry_store,
         inspection_cache,
-        best_effort_skips,
+        cargo_compatible_skips,
         now,
     };
     for package_id in snapshot.reachable_order() {
@@ -706,13 +707,14 @@ fn find_manifest_dependency<'a>(
 mod tests {
     use super::*;
     use crate::allow_rules::AllowRules;
-    use crate::config::{Config, LockfileBaselineMode, Mode};
+    use crate::config::{CargoCompatibleAccept, Config, Enforcement, LockfileBaselineMode};
     use serde_json::json;
 
     fn config_fixture() -> Config {
         Config {
             cooldown_minutes: 60,
-            mode: Mode::Strict,
+            enforcement: Enforcement::Strict,
+            cargo_compatible_accept: CargoCompatibleAccept::Prompt,
             lockfile_baseline: LockfileBaselineMode::Ignore,
             now_override: None,
             ttl_seconds: 60,

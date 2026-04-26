@@ -12,7 +12,7 @@ use crate::project::{ProjectContext, ProjectKind, ProjectMember};
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfigTemplate {
     cooldown_minutes: Option<u64>,
-    mode: Option<String>,
+    enforcement: Option<String>,
     lockfile_baseline: Option<String>,
     skip_registries: Vec<String>,
     include_allow_examples: bool,
@@ -138,7 +138,7 @@ fn build_workspace_plan(project: &ProjectContext) -> Result<InitPlan> {
 
 fn prompt_base_template() -> Result<ConfigTemplate> {
     let cooldown_minutes = prompt_u64("Cooldown minutes", 1440)?;
-    let mode = select_mode("Mode", "strict")?;
+    let enforcement = select_enforcement("Enforcement", "cargo_compatible")?;
     let lockfile_baseline = select_lockfile_baseline("Cargo.lock baseline", "floor")?;
     let skip_registries =
         prompt_registry_list("Registries to skip (comma-separated, leave blank for none)")?;
@@ -146,7 +146,7 @@ fn prompt_base_template() -> Result<ConfigTemplate> {
 
     Ok(ConfigTemplate {
         cooldown_minutes: Some(cooldown_minutes),
-        mode: Some(mode),
+        enforcement: Some(enforcement),
         lockfile_baseline: Some(lockfile_baseline),
         skip_registries,
         include_allow_examples,
@@ -167,8 +167,8 @@ fn prompt_member_template(member: &ProjectMember) -> Result<Option<ConfigTemplat
     } else {
         None
     };
-    let mode = if customize_config {
-        select_optional_mode("Override mode (leave blank to inherit)")?
+    let enforcement = if customize_config {
+        select_optional_enforcement("Override enforcement (leave blank to inherit)")?
     } else {
         None
     };
@@ -184,7 +184,7 @@ fn prompt_member_template(member: &ProjectMember) -> Result<Option<ConfigTemplat
     };
 
     if cooldown_minutes.is_none()
-        && mode.is_none()
+        && enforcement.is_none()
         && lockfile_baseline.is_none()
         && skip_registries.is_empty()
         && !include_allow_examples
@@ -194,7 +194,7 @@ fn prompt_member_template(member: &ProjectMember) -> Result<Option<ConfigTemplat
 
     Ok(Some(ConfigTemplate {
         cooldown_minutes,
-        mode,
+        enforcement,
         lockfile_baseline,
         skip_registries,
         include_allow_examples,
@@ -217,8 +217,15 @@ fn render_config_file(template: &ConfigTemplate, is_override: bool) -> String {
         writeln!(&mut output, "cooldown_minutes = {cooldown_minutes}")
             .expect("writing to String should not fail");
     }
-    if let Some(mode) = &template.mode {
-        writeln!(&mut output, "mode = \"{mode}\"").expect("writing to String should not fail");
+    if let Some(enforcement) = &template.enforcement {
+        writeln!(&mut output, "enforcement = \"{enforcement}\"")
+            .expect("writing to String should not fail");
+        if enforcement == "cargo_compatible" {
+            output.push_str(
+                "# `prompt` asks before accepting fresh versions Cargo still requires; `auto` keeps the current best Cargo-valid lockfile without asking.\n",
+            );
+            output.push_str("cargo_compatible_accept = \"prompt\"\n");
+        }
     }
     if let Some(lockfile_baseline) = &template.lockfile_baseline {
         output.push_str(
@@ -429,8 +436,8 @@ fn prompt_multi_select(prompt: &str, options: &[ProjectMember]) -> Result<Vec<Pr
     Ok(selected)
 }
 
-fn select_mode(prompt: &str, default: &str) -> Result<String> {
-    let options = ["strict", "best_effort", "off"];
+fn select_enforcement(prompt: &str, default: &str) -> Result<String> {
+    let options = ["strict", "cargo_compatible", "off"];
     let default_index = options
         .iter()
         .position(|value| *value == default)
@@ -438,16 +445,16 @@ fn select_mode(prompt: &str, default: &str) -> Result<String> {
     Ok(options[prompt_select(prompt, &options, default_index)?].to_string())
 }
 
-fn select_optional_mode(prompt: &str) -> Result<Option<String>> {
+fn select_optional_enforcement(prompt: &str) -> Result<Option<String>> {
     loop {
         let input = prompt_input(prompt, Some(""))?;
         if input.is_empty() {
             return Ok(None);
         }
         match input.as_str() {
-            "strict" | "best_effort" | "off" => return Ok(Some(input)),
+            "strict" | "cargo_compatible" | "off" => return Ok(Some(input)),
             _ => eprintln!(
-                "Please enter one of: strict, best_effort, off, or leave the field blank."
+                "Please enter one of: strict, cargo_compatible, off, or leave the field blank."
             ),
         }
     }
@@ -511,7 +518,7 @@ mod tests {
         let rendered = render_config_file(
             &ConfigTemplate {
                 cooldown_minutes: Some(1440),
-                mode: Some("strict".to_string()),
+                enforcement: Some("cargo_compatible".to_string()),
                 lockfile_baseline: Some("floor".to_string()),
                 skip_registries: vec!["crates-io".to_string()],
                 include_allow_examples: true,
@@ -529,7 +536,7 @@ mod tests {
         let rendered = render_config_file(
             &ConfigTemplate {
                 cooldown_minutes: None,
-                mode: None,
+                enforcement: None,
                 lockfile_baseline: None,
                 skip_registries: Vec::new(),
                 include_allow_examples: false,

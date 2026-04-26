@@ -14,6 +14,8 @@ mod config;
 mod executor;
 /// Implements the interactive `cargo cooldown init` setup wizard.
 mod init;
+/// Keeps speculative Cargo resolution away from the user-visible workspace.
+mod isolation;
 /// Captures, restores, and indexes `Cargo.lock` baselines.
 mod lockfile;
 /// Wraps `cargo metadata` invocations.
@@ -40,7 +42,8 @@ use clap_cargo::{Features, Manifest, Workspace};
 use tracing::{debug, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Mode;
+use crate::config::Enforcement;
+use crate::isolation::{CurrentDirGuard, IsolatedWorkspace};
 use crate::project::ProjectContext;
 use crate::ui::PhaseStatus;
 
@@ -368,6 +371,88 @@ fn run_initial_cargo_update(
     Ok(output.status)
 }
 
+fn run_cooldown_guard_isolated(
+    config: &config::Config,
+    project: &ProjectContext,
+    cli: &Cli,
+    success_message: &str,
+) -> Result<()> {
+    let isolated = IsolatedWorkspace::create(project, &cli.manifest)?;
+    {
+        let _cwd = CurrentDirGuard::enter(isolated.current_dir())?;
+        let initial_lockfile = executor::capture_initial_lockfile(config, isolated.manifest())?;
+        executor::run_pinning_flow_with_snapshot(
+            config,
+            isolated.manifest(),
+            &cli.workspace,
+            &cli.features,
+            initial_lockfile,
+            success_message,
+        )?;
+    }
+    isolated.publish_lockfile()
+}
+
+enum IsolatedUpdateOutcome {
+    Done,
+    CargoFailed(i32),
+}
+
+fn run_update_with_cooldown_isolation(
+    config: &config::Config,
+    project: &ProjectContext,
+    cli: &Cli,
+    forwarded_args: &[OsString],
+    phase: &PhaseStatus,
+) -> Result<IsolatedUpdateOutcome> {
+    phase.set_message("Preparing isolated workspace...");
+    let isolated = IsolatedWorkspace::create(project, &cli.manifest)?;
+    let temp_forwarded_args = isolated.rewrite_cargo_args(forwarded_args);
+
+    {
+        let _cwd = CurrentDirGuard::enter(isolated.current_dir())?;
+        phase.set_message("Capturing lockfile baseline...");
+        let initial_lockfile = executor::capture_initial_lockfile(config, isolated.manifest())?;
+        let status = run_initial_cargo_update(&temp_forwarded_args, phase)?;
+        if !status.success() {
+            return Ok(IsolatedUpdateOutcome::CargoFailed(
+                status.code().unwrap_or(1),
+            ));
+        }
+
+        if config.enforcement != Enforcement::Off && config.cooldown_minutes > 0 {
+            match executor::run_pinning_flow_with_snapshot(
+                config,
+                isolated.manifest(),
+                &cli.workspace,
+                &cli.features,
+                initial_lockfile,
+                "dependency graph updated and cooled down",
+            ) {
+                Ok(()) => {}
+                Err(err) => match config.enforcement {
+                    Enforcement::CargoCompatible
+                        if executor::is_cargo_compatible_fresh_versions_not_accepted(&err) =>
+                    {
+                        return Err(err);
+                    }
+                    Enforcement::CargoCompatible => {
+                        warn!(error = %err, "cooldown guard failed after cargo update; continuing due to cargo_compatible enforcement");
+                        return Ok(IsolatedUpdateOutcome::Done);
+                    }
+                    Enforcement::Strict => {
+                        return Err(err);
+                    }
+                    Enforcement::Off => {}
+                },
+            }
+        }
+    }
+
+    isolated.publish_lockfile()?;
+    Ok(IsolatedUpdateOutcome::Done)
+}
+
 /// Program entry point.
 ///
 /// The command either runs the setup wizard or forwards a Cargo command through
@@ -405,54 +490,39 @@ fn main() -> Result<()> {
 
             if is_update_command(cargo_args) {
                 let phase = PhaseStatus::new(config.verbose);
-                phase.set_message("Capturing lockfile baseline...");
-                let initial_lockfile = executor::capture_initial_lockfile(&config, &cli.manifest)?;
-                let status = run_initial_cargo_update(&forwarded_args, &phase)?;
-                if !status.success() {
-                    exit_with(status.code().unwrap_or(1));
+                match run_update_with_cooldown_isolation(
+                    &config,
+                    &project,
+                    &cli,
+                    &forwarded_args,
+                    &phase,
+                )? {
+                    IsolatedUpdateOutcome::Done => exit_with(0),
+                    IsolatedUpdateOutcome::CargoFailed(code) => exit_with(code),
                 }
-
-                if config.mode != Mode::Off && config.cooldown_minutes > 0 {
-                    match executor::run_pinning_flow_with_snapshot(
-                        &config,
-                        &cli.manifest,
-                        &cli.workspace,
-                        &cli.features,
-                        initial_lockfile,
-                        "dependency graph updated and cooled down",
-                    ) {
-                        Ok(()) => {}
-                        Err(err) => match config.mode {
-                            Mode::BestEffort => {
-                                warn!(error = %err, "cooldown guard failed after cargo update; continuing due to best_effort mode");
-                            }
-                            Mode::Strict => {
-                                return Err(err);
-                            }
-                            Mode::Off => {}
-                        },
-                    }
-                }
-
-                exit_with(0);
             }
 
-            if config.mode != Mode::Off && config.cooldown_minutes > 0 {
-                match executor::run_pinning_flow(
+            if config.enforcement != Enforcement::Off && config.cooldown_minutes > 0 {
+                match run_cooldown_guard_isolated(
                     &config,
-                    &cli.manifest,
-                    &cli.workspace,
-                    &cli.features,
+                    &project,
+                    &cli,
+                    "dependency graph cooled down; continuing with Cargo command",
                 ) {
                     Ok(()) => {}
-                    Err(err) => match config.mode {
-                        Mode::BestEffort => {
-                            warn!(error = %err, "cooldown guard failed; continuing due to best_effort mode");
-                        }
-                        Mode::Strict => {
+                    Err(err) => match config.enforcement {
+                        Enforcement::CargoCompatible
+                            if executor::is_cargo_compatible_fresh_versions_not_accepted(&err) =>
+                        {
                             return Err(err);
                         }
-                        Mode::Off => {}
+                        Enforcement::CargoCompatible => {
+                            warn!(error = %err, "cooldown guard failed; continuing due to cargo_compatible enforcement");
+                        }
+                        Enforcement::Strict => {
+                            return Err(err);
+                        }
+                        Enforcement::Off => {}
                     },
                 }
             }

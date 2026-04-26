@@ -1,4 +1,5 @@
 cooldown_minutes = 86400
-mode = "best_effort"
+enforcement = "cargo_compatible"
+cargo_compatible_accept = "auto"
 lockfile_baseline = "ignore"
 verbose = false

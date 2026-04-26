@@ -11,11 +11,20 @@ re-reading the same registry metadata inside one cooldown execution.
 ```mermaid
 flowchart TD
     Start([Start cargo-cooldown]) --> Config[Load cooldown.toml and embedded allow rules]
-    Config --> Baseline[Snapshot initial Cargo.lock]
-    Baseline --> Command{Requested command}
-    Command -->|update| Update[Run cargo update]
-    Command -->|build/check/test/run| FixedNow[Fix one now for the whole run]
-    Update --> FixedNow
+    Config --> Command{Requested command}
+    Command -->|update| IsolateUpdate[Copy workspace to temp dir and hold real Cargo.lock]
+    Command -->|build/check/test/run with cooldown enabled| IsolateGuard[Copy workspace to temp dir and hold real Cargo.lock]
+    Command -->|build/check/test/run with cooldown disabled| DoneNoCooldown([Run Cargo without cooldown rewrites])
+    IsolateUpdate --> Baseline[Snapshot temp Cargo.lock from initial real lockfile]
+    IsolateGuard --> Baseline
+    Baseline --> UpdateOrExisting{Update command?}
+    UpdateOrExisting -->|Yes| Update[Run cargo update inside temp workspace]
+    Update --> UpdatedLock[Temp Cargo.lock contains Cargo's updated graph]
+    UpdateOrExisting -->|No| ExistingLock[Use temp copy of current Cargo.lock]
+    UpdatedLock --> CooldownEnabled{Cooldown enabled?}
+    ExistingLock --> CooldownEnabled
+    CooldownEnabled -->|No| Publish([Publish temp Cargo.lock to real workspace])
+    CooldownEnabled -->|Yes| FixedNow[Fix one now for the whole run]
     FixedNow --> Metadata[cargo metadata]
     Metadata --> Scan[Scan resolved registry packages]
     Scan --> Skip{Skipped or exempt?}
@@ -37,12 +46,19 @@ flowchart TD
     NextPkg --> DoneScan{More packages?}
     Queue --> DoneScan
     DoneScan -->|Yes| Scan
-    DoneScan -->|No| Batch[Build local batch assignment]
+    DoneScan -->|No| ActiveFresh{Active fresh queue?}
+    ActiveFresh -->|Yes| Batch[Build local batch assignment]
     Batch --> Validate[Validate with Cargo metadata]
     Validate -->|Applied| Metadata
-    Validate -->|Rejected| Policy[Report unresolved fresh packages by mode]
-    Policy -->|strict| Fail([Restore original lockfile and fail])
-    Policy -->|best_effort| Done([Keep best valid lockfile])
+    Validate -->|Rejected| MarkUnresolved[Mark resolver-constrained fresh versions]
+    MarkUnresolved --> Metadata
+    ActiveFresh -->|No| Coordinated{Small exact-coupled unresolved bundle?}
+    Coordinated -->|Resolvable| Validate
+    Coordinated -->|No| FinalPolicy[Apply final enforcement policy]
+    FinalPolicy -->|strict| Fail([Restore real Cargo.lock and fail])
+    FinalPolicy -->|cargo_compatible + prompt rejected| Fail
+    FinalPolicy -->|cargo_compatible + accepted/auto| Publish
+    Publish --> Done([Real Cargo.lock receives the final Cargo-valid graph])
 ```
 
 ## 1. Execution boundary
@@ -50,20 +66,69 @@ flowchart TD
 At the beginning of one `cargo-cooldown` execution, the resolver:
 
 1. loads config and embedded allow rules;
-2. snapshots the initial `Cargo.lock` once;
-3. if the requested command is `cargo cooldown update`, runs `cargo update`;
-4. fixes a single `now` timestamp for the whole run;
-5. creates one registry store that lives across every pin attempt in that run.
+2. copies the Cargo workspace to a temporary directory when it needs to resolve
+   or cool a lockfile;
+3. renames the real root `Cargo.lock` to a temporary backup name and writes an
+   invalid sentinel `Cargo.lock` while the temporary workspace is active;
+4. snapshots the temp `Cargo.lock` once as the initial baseline;
+5. if the requested command is `cargo cooldown update`, runs `cargo update`
+   inside the temp workspace;
+6. fixes a single `now` timestamp for the whole run;
+7. creates one registry store that lives across every pin attempt in that run.
 
-That snapshot is taken before any Cargo command is allowed to rewrite the
-lockfile.
+Cargo's stable interface does not provide a stable alternate lockfile path for
+all of the commands cooldown needs. The stable implementation therefore isolates
+the whole workspace instead of asking Cargo to use another `Cargo.lock`.
+
+The workspace copy preserves workspace members and member manifests, so commands
+with multiple `Cargo.toml` files keep the same Cargo workspace shape. The copied
+workspace skips heavy generated directories such as `.git` and `target`; normal
+workspace-local path dependencies are copied with the rest of the tree.
+
+The real root lockfile is held while cooldown works:
+
+- if a real `Cargo.lock` existed, it is renamed to
+  `Cargo.lock.cooldown-backup.<id>`;
+- an invalid sentinel is written at `Cargo.lock`, so an accidental plain
+  `cargo build` against the real workspace fails instead of resolving from a
+  half-finished lockfile;
+- on normal failure, rejection, or `strict` enforcement, the backup is restored;
+- on success, the final temp `Cargo.lock` is published back to the real
+  workspace and the backup is removed.
+
+If the process is killed abruptly, Rust destructors may not run. In that case
+the real workspace can be left with the sentinel plus the
+`Cargo.lock.cooldown-backup.<id>` file; restore by moving the backup back to
+`Cargo.lock`.
+
+The baseline snapshot is taken before any Cargo command is allowed to rewrite
+the temp lockfile.
 
 - for `cargo cooldown build|check|test|run`, the snapshot happens before
   `cargo metadata` and before any fallback `cargo generate-lockfile` when the
   lockfile is missing;
-- for `cargo cooldown update`, the snapshot happens before `cargo update`, and
-  the later cooldown pass evaluates the post-update lockfile against that
-  pre-update baseline.
+- for `cargo cooldown update`, the snapshot happens before `cargo update`.
+  `cargo update` then writes its result to the temp `Cargo.lock`, not to the
+  user-visible lockfile. The later cooldown pass evaluates that post-update temp
+  lockfile against the pre-update baseline.
+
+So `cargo cooldown update` can temporarily put fresh dependency versions in the
+temp `Cargo.lock`, but not in the real root `Cargo.lock`. They are not accepted
+as the final result until the cooldown pass finishes and the active enforcement
+policy allows the remaining graph. If the run fails, rejects the
+`cargo_compatible` prompt, or hits `strict` enforcement, cargo-cooldown restores
+the real pre-run lockfile.
+
+If cooldown is disabled with `enforcement = "off"` or `cooldown_minutes = 0`,
+`cargo cooldown update` still runs the update in the temporary workspace and then
+publishes Cargo's updated lockfile without a cooldown pass. Other forwarded
+Cargo commands skip the isolation step when cooldown is disabled.
+
+During the temp resolution phase, Cargo may refresh registry/index metadata in
+`CARGO_HOME`. Normal registry crate source archives are not fetched just because
+`cargo update` or `cargo metadata` changed a lockfile; source downloads happen
+when a later command such as `cargo build`, `cargo check`, `cargo test`,
+`cargo run`, or `cargo fetch` needs the crate contents.
 
 That boundary matters because the current implementation already caches:
 
@@ -76,29 +141,40 @@ need to rebuild the same registry timeline or re-evaluate the same locked
 version more than once inside the same process, and it does not recalculate the
 initial lockfile baseline after later pins.
 
-If any later cooldown step fails after Cargo has already rewritten `Cargo.lock`,
-the resolver restores the exact lockfile contents that were present at process
-start before returning the error.
+If any later cooldown step fails after Cargo has already rewritten the temp
+`Cargo.lock`, the resolver restores the exact temp lockfile contents that were
+present at process start before returning the error, and the real lockfile guard
+restores the original root `Cargo.lock`. Under `cargo_compatible`, a rejected or
+non-interactive unresolved-fresh-version prompt is treated as such a failure;
+other guard failures are downgraded to warnings by that enforcement mode after
+the temp lockfile has already been restored.
 
 That means `cargo cooldown update` has this exact shape:
 
-1. read and snapshot the current `Cargo.lock`;
-2. run `cargo update`;
-3. inspect the updated lockfile;
-4. with `lockfile_baseline = "floor"`, exempt any `(registry, crate, version)`
+1. copy the workspace to a temp directory;
+2. hold the real root `Cargo.lock` with a backup plus sentinel;
+3. read and snapshot the temp copy of the current `Cargo.lock`;
+4. run `cargo update`, letting Cargo write the newest graph it accepts to the
+   temp `Cargo.lock`;
+5. inspect that updated temp lockfile;
+6. with `lockfile_baseline = "floor"`, exempt any `(registry, crate, version)`
    that was already present in the original snapshot;
-5. pin only the newly introduced or version-changed fresh entries, but allow
+7. pin only the newly introduced or version-changed fresh entries, but allow
    them to return to an exact version from the original snapshot even if that
    baseline version is still fresher than the cutoff;
-6. with `lockfile_baseline = "floor"`, reject any cooldown assignment that would
+8. with `lockfile_baseline = "floor"`, reject any cooldown assignment that would
    downgrade a package below the newest version of that package already present
    in the original snapshot;
-7. if the cooldown step fails in `strict` mode, restore the original lockfile.
+9. if the cooldown step fails under `strict` enforcement, or if
+   `cargo_compatible` asks for unresolved fresh-version approval and approval is
+   not given, restore the original real lockfile;
+10. otherwise publish the final temp `Cargo.lock` to the real workspace.
 
 ## 2. Graph scan and release-age inspection
 
-On each outer pass, `cargo-cooldown` runs `cargo metadata` and rebuilds the
-derived cooldown state from Cargo's current resolved graph.
+On each outer pass, `cargo-cooldown` runs `cargo metadata` in the active
+workspace copy and rebuilds the derived cooldown state from Cargo's current
+resolved graph.
 
 For each registry package in the selected dependency closure:
 
@@ -111,12 +187,12 @@ For each registry package in the selected dependency closure:
    baseline;
 5. inspect the locked version age.
 
-For `cargo cooldown update`, step 4 compares the updated lockfile against the
-pre-update snapshot. So a version that was already in `Cargo.lock` before the
-update remains exempt, while a version introduced by `cargo update` is eligible
-for cooldown. If `cargo update` moves `foo 1.2.3` to `foo 1.2.4`, cooldown may
-pin `foo` back to `1.2.3` even when `1.2.3` is still fresh, because that exact
-version was already part of the baseline snapshot. With the default
+For `cargo cooldown update`, step 4 compares the updated temp lockfile against
+the pre-update snapshot. So a version that was already in the real `Cargo.lock`
+before the update remains exempt, while a version introduced by `cargo update`
+is eligible for cooldown. If `cargo update` moves `foo 1.2.3` to `foo 1.2.4`,
+cooldown may pin `foo` back to `1.2.3` even when `1.2.3` is still fresh, because
+that exact version was already part of the baseline snapshot. With the default
 `lockfile_baseline = "floor"`, it will not pin `foo` below `1.2.3` during that
 update run. With `lockfile_baseline = "ignore"`, the pre-update snapshot is not an
 exemption, so `foo` can be cooled below `1.2.3` when Cargo accepts the result.
@@ -133,8 +209,8 @@ The age inspection itself works like this:
    re-inspected after later pins.
 
 If a package is not skipped and still lacks a usable timestamp after local
-index plus fallback, the cooldown step fails in `strict` mode and becomes a
-warning in `best_effort` mode.
+index plus fallback, the cooldown step fails under `strict` enforcement and
+becomes a warning under `cargo_compatible` enforcement.
 
 ## 3. Candidate selection and pin loop
 
@@ -182,18 +258,18 @@ Two details matter here:
   locked version, emits a warning, and continues cooling the rest of the graph.
 
 If a batch succeeds, the resolver restarts from `cargo metadata` so Cargo can
-re-resolve the graph from the new lockfile state. Best-effort skips stay tied to
-the exact `(registry, crate, version)` that was skipped, so the same fresh
-version is not requeued again through blocker propagation after a restart. The
-initial baseline does not change, so any package that moves to a version not
+re-resolve the graph from the new lockfile state. Cargo-compatible skips stay
+tied to the exact `(registry, crate, version)` that was skipped, so the same
+fresh version is not requeued again through blocker propagation after a restart.
+The initial baseline does not change, so any package that moves to a version not
 present in that baseline becomes eligible for cooldown on the next pass.
 
-If a pass makes no successful pins but does record new best-effort skips, the
-resolver also restarts from `cargo metadata` once so those skipped versions are
-left out of the next freshness queue instead of ending in a generic fixed-point
-error immediately.
+If a pass makes no successful pins but does record new cargo-compatible skips,
+the resolver also restarts from `cargo metadata` once so those skipped versions
+are left out of the next freshness queue instead of ending in a generic
+fixed-point error immediately.
 
-Before giving up on the remaining best-effort set, cooldown runs one more
+Before giving up on the remaining cargo-compatible set, cooldown runs one more
 bounded pass for small resolver-constrained bundles linked by exact version
 requirements. It searches a small set of mutually compatible older versions
 using local index dependency metadata, rewrites that bundle in `Cargo.lock` as
@@ -212,12 +288,13 @@ between:
 - versions that the resolver had to keep fresh because no further compatible
   cooldown pin was possible in this run.
 
-That final distinction also drives the mode policy:
+That final distinction also drives the enforcement policy:
 
 - `strict` fails if any resolver-constrained fresh versions remain and restores
   the original lockfile
-- `best_effort` keeps the resulting lockfile and prints one warning block with
-  those remaining fresh versions
+- `cargo_compatible` prompts before keeping the resulting lockfile and prints
+  one warning block with those remaining fresh versions, unless
+  `cargo_compatible_accept = "auto"` is configured
 
 The main scalability goal of the batch solver is to avoid one Cargo resolver
 invocation per independent fresh crate. The bulk path handles the common case

@@ -9,17 +9,18 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{self, IsTerminal, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::{Metadata, PackageId};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use semver::{Comparator, Op, Version, VersionReq};
 use tracing::{debug, trace};
 
-use crate::config::{Config, Mode};
+use crate::config::{CargoCompatibleAccept, Config, Enforcement};
 use crate::lockfile::LockfileSnapshot;
 use crate::metadata::{read_metadata, read_metadata_locked};
 use crate::registry::{RegistryStore, ensure_timeline_available};
@@ -51,30 +52,6 @@ macro_rules! timed_debug {
         );
         result
     }};
-}
-
-/// Prepare the lockfile before running a normal forwarded Cargo command.
-///
-/// The caller provides the already loaded configuration, Cargo selector state,
-/// and feature flags from the CLI. This function captures the current
-/// `Cargo.lock` as the baseline, runs the cooldown resolver, and leaves the
-/// lockfile in the newest Cargo-valid state that respects the configured policy.
-/// It returns `Ok(())` when the lockfile is ready for Cargo to continue.
-pub fn run_pinning_flow(
-    config: &Config,
-    manifest: &Manifest,
-    workspace: &Workspace,
-    features: &Features,
-) -> Result<()> {
-    let initial_lockfile = capture_initial_lockfile(config, manifest)?;
-    run_pinning_flow_with_snapshot(
-        config,
-        manifest,
-        workspace,
-        features,
-        initial_lockfile,
-        "dependency graph cooled down; continuing with Cargo command",
-    )
 }
 
 /// Capture the user-visible `Cargo.lock` before cooldown mutates anything.
@@ -116,7 +93,7 @@ pub fn run_pinning_flow_with_snapshot(
         ui.set_phase("Preparing cooldown scan...");
         ensure_lockfile(manifest, &lockfile_path)?;
         let now = config.now_override.unwrap_or_else(Utc::now);
-        let mut best_effort_skips: HashMap<String, String> = HashMap::new();
+        let mut cargo_compatible_skips: HashMap<String, String> = HashMap::new();
         let mut constraint_edges: HashMap<String, HashSet<String>> = HashMap::new();
         let mut inspection_cache: HashMap<ReleaseInspectionKey, ReleaseInspection> = HashMap::new();
         ui.set_phase("Capturing cooldown baseline...");
@@ -158,15 +135,15 @@ pub fn run_pinning_flow_with_snapshot(
                     &initial_lockfile,
                     &mut registry_store,
                     &mut inspection_cache,
-                    &best_effort_skips,
+                    &cargo_compatible_skips,
                     now,
                 )
             })?;
 
-            // Keep best-effort decisions only for crate versions that are still fresh in the
+            // Keep cargo-compatible decisions only for crate versions that are still fresh in the
             // current lockfile. If a successful pin changes a crate version, the next pass
             // should reconsider the new version instead of inheriting stale skip state.
-            best_effort_skips.retain(|key, _| state.fresh_keys_present.contains(key));
+            cargo_compatible_skips.retain(|key, _| state.fresh_keys_present.contains(key));
             refresh_constraint_edges(
                 &mut constraint_edges,
                 &state.crate_states,
@@ -175,12 +152,12 @@ pub fn run_pinning_flow_with_snapshot(
             );
 
             debug!(
-                "cooldown: scan_summary registry_packages={} inspected={} fresh={} baseline_exempt={} best_effort_skipped={} skipped_registries={} exact_allowed={} zero_minutes={}",
+                "cooldown: scan_summary registry_packages={} inspected={} fresh={} baseline_exempt={} cargo_compatible_skipped={} skipped_registries={} exact_allowed={} zero_minutes={}",
                 state.scan_summary.registry_packages,
                 state.scan_summary.inspected,
                 state.scan_summary.fresh,
                 state.scan_summary.baseline_exempt,
-                state.scan_summary.best_effort_skipped,
+                state.scan_summary.cargo_compatible_skipped,
                 state.scan_summary.skipped,
                 state.scan_summary.exact_allowed,
                 state.scan_summary.zero_minutes,
@@ -189,11 +166,11 @@ pub fn run_pinning_flow_with_snapshot(
                 pass,
                 state.scan_summary.registry_packages,
                 state.scan_summary.inspected,
-                state.scan_summary.fresh + state.scan_summary.best_effort_skipped,
+                state.scan_summary.fresh + state.scan_summary.cargo_compatible_skipped,
             );
 
             let mut fresh_entries = state.fresh_entries_vec();
-            let best_effort_fresh_entries = state.best_effort_entries_vec();
+            let cargo_compatible_fresh_entries = state.cargo_compatible_entries_vec();
             let crate_states = &state.crate_states;
             let equality_dependents = &state.equality_dependents;
             let requirement_origins = &state.requirement_origins;
@@ -201,8 +178,8 @@ pub fn run_pinning_flow_with_snapshot(
 
             if fresh_entries.is_empty() {
                 // Single-package pins cannot handle every exact-version bundle.
-                // Try one small coordinated pass before deciding whether mode should fail.
-                if !best_effort_fresh_entries.is_empty()
+                // Try one small coordinated pass before deciding whether enforcement should fail.
+                if !cargo_compatible_fresh_entries.is_empty()
                     && attempt_coordinated_bundle_resolution(
                         &CoordinatedResolutionCtx {
                             manifest,
@@ -215,7 +192,7 @@ pub fn run_pinning_flow_with_snapshot(
                             now,
                         },
                         &mut registry_store,
-                        &best_effort_fresh_entries,
+                        &cargo_compatible_fresh_entries,
                         &constraint_edges,
                     )?
                 {
@@ -233,7 +210,7 @@ pub fn run_pinning_flow_with_snapshot(
                     crate_states,
                     registry_store: &mut registry_store,
                     inspection_cache: &mut inspection_cache,
-                    best_effort_skips: &best_effort_skips,
+                    cargo_compatible_skips: &cargo_compatible_skips,
                     now,
                     success_message,
                 })?;
@@ -284,7 +261,7 @@ pub fn run_pinning_flow_with_snapshot(
                     "the cooldown batch solver could not find a Cargo-valid older assignment"
                         .to_string();
                 recorded_batch_limit |=
-                    record_best_effort_skip(&mut best_effort_skips, &key, reason.clone());
+                    record_cargo_compatible_skip(&mut cargo_compatible_skips, &key, reason.clone());
                 debug!(
                     crate = %fresh.name,
                     registry = %fresh.source_id,
@@ -323,6 +300,33 @@ struct FreshVersionNotice {
     name: String,
     version: String,
     registry: String,
+    published_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+pub struct CargoCompatibleFreshVersionsNotAccepted {
+    message: String,
+}
+
+impl CargoCompatibleFreshVersionsNotAccepted {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CargoCompatibleFreshVersionsNotAccepted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CargoCompatibleFreshVersionsNotAccepted {}
+
+pub fn is_cargo_compatible_fresh_versions_not_accepted(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<CargoCompatibleFreshVersionsNotAccepted>()
+        .is_some()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -381,7 +385,7 @@ struct FinalRunSummaryCtx<'a> {
     crate_states: &'a HashMap<PackageId, CrateState>,
     registry_store: &'a mut RegistryStore,
     inspection_cache: &'a mut HashMap<ReleaseInspectionKey, ReleaseInspection>,
-    best_effort_skips: &'a HashMap<String, String>,
+    cargo_compatible_skips: &'a HashMap<String, String>,
     now: DateTime<Utc>,
     success_message: &'a str,
 }
@@ -402,7 +406,7 @@ fn emit_final_run_summary(ctx: &mut FinalRunSummaryCtx<'_>) -> Result<()> {
     for state in ctx.crate_states.values() {
         let key = crate_failure_key(&state.source_id, &state.name, &state.current_version);
         let baseline_candidate = state.baseline_exempt;
-        let resolver_candidate = ctx.best_effort_skips.contains_key(&key);
+        let resolver_candidate = ctx.cargo_compatible_skips.contains_key(&key);
         if !baseline_candidate && !resolver_candidate {
             continue;
         }
@@ -447,6 +451,7 @@ fn emit_final_run_summary(ctx: &mut FinalRunSummaryCtx<'_>) -> Result<()> {
             name: state.name.clone(),
             version: state.current_version.clone(),
             registry: context.logical_name,
+            published_at: inspection.published_at,
         };
 
         if baseline_candidate && baseline_seen.insert(notice.clone()) {
@@ -460,27 +465,95 @@ fn emit_final_run_summary(ctx: &mut FinalRunSummaryCtx<'_>) -> Result<()> {
     report.baseline_fresh.sort();
     report.resolver_constrained_fresh.sort();
 
-    enforce_final_report_policy(ctx.config.mode, &report)?;
+    enforce_final_report_policy(ctx.config.enforcement, &report)?;
+    confirm_cargo_compatible_fresh_versions(ctx.config, &report, ctx.ui.use_color())?;
 
     emit_final_summary(ctx.ui, &cooled_versions, &report, ctx.success_message);
     Ok(())
 }
 
-fn enforce_final_report_policy(mode: Mode, report: &FinalFreshReport) -> Result<()> {
-    if matches!(mode, Mode::Strict) && !report.resolver_constrained_fresh.is_empty() {
+fn enforce_final_report_policy(enforcement: Enforcement, report: &FinalFreshReport) -> Result<()> {
+    if matches!(enforcement, Enforcement::Strict) && !report.resolver_constrained_fresh.is_empty() {
         bail!(
-            "strict mode blocked fresh versions that could not be cooled further:\n{}\n\n\
+            "strict enforcement blocked fresh versions that could not be cooled further:\n{}\n\n\
              These versions are still inside the configured cooldown window after \
-             cargo-cooldown tried older Cargo-valid lockfile assignments. Strict mode \
+             cargo-cooldown tried older Cargo-valid lockfile assignments. Strict enforcement \
              restores the original Cargo.lock instead of keeping them.\n\n\
              To keep Cargo's resolved lockfile and report these as warnings, use \
-             `COOLDOWN_MODE=best_effort` or `mode = \"best_effort\"`. To accept specific \
+             `COOLDOWN_ENFORCEMENT=cargo_compatible` or `enforcement = \"cargo_compatible\"`. To accept specific \
              fresh releases intentionally, add `allow.package` or `allow.exact` rules.",
             format_fresh_notice_list(&report.resolver_constrained_fresh).join("\n")
         );
     }
 
     Ok(())
+}
+
+fn confirm_cargo_compatible_fresh_versions(
+    config: &Config,
+    report: &FinalFreshReport,
+    use_color: bool,
+) -> Result<()> {
+    if !matches!(config.enforcement, Enforcement::CargoCompatible)
+        || report.resolver_constrained_fresh.is_empty()
+        || matches!(config.cargo_compatible_accept, CargoCompatibleAccept::Auto)
+    {
+        return Ok(());
+    }
+
+    eprintln!(
+        "{}",
+        format_cargo_compatible_acceptance_prompt(report, use_color)
+    );
+
+    if !io::stdin().is_terminal() {
+        return Err(anyhow::Error::new(
+            CargoCompatibleFreshVersionsNotAccepted::new(
+                "cargo_compatible enforcement requires confirmation for fresh versions that could not be cooled, but stdin is not interactive. Set `cargo_compatible_accept = \"auto\"` or `COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto` to accept them without prompting.",
+            ),
+        ));
+    }
+
+    eprint!("Accept these fresh versions and continue? [y/N] ");
+    io::stderr().flush().map_err(|err| {
+        anyhow::Error::new(CargoCompatibleFreshVersionsNotAccepted::new(format!(
+            "failed to prompt for cargo-compatible fresh version acceptance: {err}"
+        )))
+    })?;
+
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).map_err(|err| {
+        anyhow::Error::new(CargoCompatibleFreshVersionsNotAccepted::new(format!(
+            "failed to read cargo-compatible fresh version acceptance: {err}"
+        )))
+    })?;
+
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(()),
+        _ => Err(anyhow::Error::new(
+            CargoCompatibleFreshVersionsNotAccepted::new(
+                "fresh versions that could not be cooled were not accepted; restored the original Cargo.lock",
+            ),
+        )),
+    }
+}
+
+fn format_cargo_compatible_acceptance_prompt(report: &FinalFreshReport, use_color: bool) -> String {
+    let mut lines = vec![format_status_line(
+        StatusKind::Warning,
+        "Cargo requires fresh versions that cooldown could not replace.",
+        use_color,
+    )];
+    lines.push(
+        "These versions will remain in or be added to Cargo.lock; if they are not already cached, the next Cargo command may download them:"
+            .to_string(),
+    );
+    lines.extend(format_fresh_notice_list(&report.resolver_constrained_fresh));
+    lines.push(
+        "Review before accepting: freshly published crates are the supply-chain risk cooldown is designed to reduce."
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 fn emit_final_summary(
@@ -545,14 +618,19 @@ fn format_fresh_notice_list(entries: &[FreshVersionNotice]) -> Vec<String> {
         .iter()
         .map(|entry| {
             format!(
-                "{} {}{}",
+                "{} {}{} (published: {})",
                 entry.name,
                 entry.version,
-                registry_suffix(&entry.registry)
+                registry_suffix(&entry.registry),
+                format_published_at(entry.published_at)
             )
         })
         .map(|entry| format!("      - {entry}"))
         .collect()
+}
+
+fn format_published_at(published_at: DateTime<Utc>) -> String {
+    published_at.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 fn collect_snapshot_inventory(snapshot: &LockfileSnapshot) -> VersionInventory {
@@ -1032,19 +1110,19 @@ fn workspace_lockfile_path(manifest: &Manifest) -> Result<PathBuf> {
     Ok(workspace_root.join("Cargo.lock"))
 }
 
-fn record_best_effort_skip(
-    best_effort_skips: &mut HashMap<String, String>,
+fn record_cargo_compatible_skip(
+    cargo_compatible_skips: &mut HashMap<String, String>,
     key: &str,
     reason: String,
 ) -> bool {
-    if best_effort_skips
+    if cargo_compatible_skips
         .get(key)
         .is_some_and(|existing| existing == &reason)
     {
         return false;
     }
 
-    best_effort_skips.insert(key.to_string(), reason);
+    cargo_compatible_skips.insert(key.to_string(), reason);
     true
 }
 
@@ -2589,16 +2667,16 @@ struct CoordinatedResolutionCtx<'a> {
 ///
 /// Some packages cannot be cooled one at a time because they depend on each
 /// other with exact `=x.y.z` requirements. This receives the unresolved
-/// best-effort entries, groups connected exact-requirement components, searches a
+/// cargo-compatible entries, groups connected exact-requirement components, searches a
 /// small compatible assignment, and applies it as one lockfile update. It returns
 /// `true` only when Cargo accepted a bundle and the outer loop should rescan.
 fn attempt_coordinated_bundle_resolution(
     ctx: &CoordinatedResolutionCtx<'_>,
     registry_store: &mut RegistryStore,
-    best_effort_entries: &[FreshCrate],
+    cargo_compatible_entries: &[FreshCrate],
     constraint_edges: &HashMap<String, HashSet<String>>,
 ) -> Result<bool> {
-    let components = best_effort_components(best_effort_entries, constraint_edges);
+    let components = cargo_compatible_components(cargo_compatible_entries, constraint_edges);
 
     for component in components {
         if component.len() > MAX_COORDINATED_COMPONENT_SIZE {
@@ -2655,11 +2733,11 @@ fn attempt_coordinated_bundle_resolution(
     Ok(false)
 }
 
-fn best_effort_components(
-    best_effort_entries: &[FreshCrate],
+fn cargo_compatible_components(
+    cargo_compatible_entries: &[FreshCrate],
     constraint_edges: &HashMap<String, HashSet<String>>,
 ) -> Vec<Vec<FreshCrate>> {
-    let entries_by_key: HashMap<String, FreshCrate> = best_effort_entries
+    let entries_by_key: HashMap<String, FreshCrate> = cargo_compatible_entries
         .iter()
         .cloned()
         .map(|entry| {
@@ -3336,7 +3414,7 @@ fn record_dependency_requirements(
 mod tests {
     use super::*;
     use crate::allow_rules::AllowRules;
-    use crate::config::{Config, LockfileBaselineMode, Mode};
+    use crate::config::{CargoCompatibleAccept, Config, Enforcement, LockfileBaselineMode};
     use serde_json::json;
 
     fn dependency_with(rename: Option<&str>, req: &str) -> cargo_metadata::Dependency {
@@ -3353,6 +3431,17 @@ mod tests {
             "registry": null
         }))
         .expect("dependency should deserialize")
+    }
+
+    fn fresh_notice(name: &str, version: &str) -> FreshVersionNotice {
+        FreshVersionNotice {
+            name: name.to_string(),
+            version: version.to_string(),
+            registry: "crates-io".to_string(),
+            published_at: DateTime::parse_from_rfc3339("2026-04-03T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        }
     }
 
     #[test]
@@ -3819,22 +3908,22 @@ mod tests {
     }
 
     #[test]
-    fn record_best_effort_skip_only_reports_new_entries() {
-        let mut best_effort_skips = HashMap::new();
+    fn record_cargo_compatible_skip_only_reports_new_entries() {
+        let mut cargo_compatible_skips = HashMap::new();
         let key = "registry+https://github.com/rust-lang/crates.io-index::demo@1.0.1";
 
-        assert!(record_best_effort_skip(
-            &mut best_effort_skips,
+        assert!(record_cargo_compatible_skip(
+            &mut cargo_compatible_skips,
             key,
             "reason".to_string()
         ));
-        assert!(!record_best_effort_skip(
-            &mut best_effort_skips,
+        assert!(!record_cargo_compatible_skip(
+            &mut cargo_compatible_skips,
             key,
             "reason".to_string()
         ));
-        assert!(record_best_effort_skip(
-            &mut best_effort_skips,
+        assert!(record_cargo_compatible_skip(
+            &mut cargo_compatible_skips,
             key,
             "different reason".to_string()
         ));
@@ -3918,16 +4007,8 @@ mod tests {
     fn format_final_fresh_warning_only_reports_resolver_constrained_versions() {
         let warning = format_final_fresh_warning(
             &FinalFreshReport {
-                baseline_fresh: vec![FreshVersionNotice {
-                    name: "serde".to_string(),
-                    version: "1.0.218".to_string(),
-                    registry: "crates-io".to_string(),
-                }],
-                resolver_constrained_fresh: vec![FreshVersionNotice {
-                    name: "web-sys".to_string(),
-                    version: "0.3.94".to_string(),
-                    registry: "crates-io".to_string(),
-                }],
+                baseline_fresh: vec![fresh_notice("serde", "1.0.218")],
+                resolver_constrained_fresh: vec![fresh_notice("web-sys", "0.3.94")],
             },
             false,
         );
@@ -3938,30 +4019,22 @@ mod tests {
                 "     Warning cooldown finished with fresh versions remaining.".to_string(),
                 "resolver-constrained versions that could not be cooled further (review these):"
                     .to_string(),
-                "      - web-sys 0.3.94".to_string(),
+                "      - web-sys 0.3.94 (published: 2026-04-03T00:00:00Z)".to_string(),
             ]
         );
     }
 
     #[test]
-    fn strict_mode_rejects_remaining_resolver_constrained_versions() {
+    fn strict_enforcement_rejects_remaining_resolver_constrained_versions() {
         let report = FinalFreshReport {
-            baseline_fresh: vec![FreshVersionNotice {
-                name: "serde".to_string(),
-                version: "1.0.218".to_string(),
-                registry: "crates-io".to_string(),
-            }],
-            resolver_constrained_fresh: vec![FreshVersionNotice {
-                name: "web-sys".to_string(),
-                version: "0.3.94".to_string(),
-                registry: "crates-io".to_string(),
-            }],
+            baseline_fresh: vec![fresh_notice("serde", "1.0.218")],
+            resolver_constrained_fresh: vec![fresh_notice("web-sys", "0.3.94")],
         };
 
-        let err = enforce_final_report_policy(Mode::Strict, &report).unwrap_err();
+        let err = enforce_final_report_policy(Enforcement::Strict, &report).unwrap_err();
         let message = format!("{err:#}");
         assert!(
-            message.contains("strict mode blocked fresh versions"),
+            message.contains("strict enforcement blocked fresh versions"),
             "{message}"
         );
         assert!(message.contains("web-sys 0.3.94"), "{message}");
@@ -3969,17 +4042,33 @@ mod tests {
     }
 
     #[test]
-    fn best_effort_mode_allows_remaining_resolver_constrained_versions() {
+    fn cargo_compatible_enforcement_allows_remaining_resolver_constrained_versions() {
         let report = FinalFreshReport {
             baseline_fresh: Vec::new(),
-            resolver_constrained_fresh: vec![FreshVersionNotice {
-                name: "web-sys".to_string(),
-                version: "0.3.94".to_string(),
-                registry: "crates-io".to_string(),
-            }],
+            resolver_constrained_fresh: vec![fresh_notice("web-sys", "0.3.94")],
         };
 
-        assert!(enforce_final_report_policy(Mode::BestEffort, &report).is_ok());
+        assert!(enforce_final_report_policy(Enforcement::CargoCompatible, &report).is_ok());
+    }
+
+    #[test]
+    fn format_cargo_compatible_acceptance_prompt_includes_publish_dates() {
+        let prompt = format_cargo_compatible_acceptance_prompt(
+            &FinalFreshReport {
+                baseline_fresh: Vec::new(),
+                resolver_constrained_fresh: vec![fresh_notice("web-sys", "0.3.94")],
+            },
+            false,
+        );
+
+        assert!(
+            prompt.contains("Cargo requires fresh versions that cooldown could not replace."),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("- web-sys 0.3.94 (published: 2026-04-03T00:00:00Z)"),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -3994,11 +4083,7 @@ mod tests {
                 registry: "cool-reg".to_string(),
             }],
             &FinalFreshReport {
-                baseline_fresh: vec![FreshVersionNotice {
-                    name: "serde".to_string(),
-                    version: "1.0.218".to_string(),
-                    registry: "crates-io".to_string(),
-                }],
+                baseline_fresh: vec![fresh_notice("serde", "1.0.218")],
                 resolver_constrained_fresh: Vec::new(),
             },
             "dependency graph updated and cooled down",
@@ -4302,7 +4387,8 @@ mod tests {
     fn config_fixture_remains_constructible_for_executor_tests() {
         let config = Config {
             cooldown_minutes: 60,
-            mode: Mode::Strict,
+            enforcement: Enforcement::Strict,
+            cargo_compatible_accept: CargoCompatibleAccept::Prompt,
             lockfile_baseline: LockfileBaselineMode::Floor,
             now_override: None,
             ttl_seconds: 60,

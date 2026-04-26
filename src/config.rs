@@ -14,20 +14,43 @@ use crate::project::ProjectContext;
 
 /// Behavior when cooldown cannot fully remove fresh versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
+pub enum Enforcement {
     Strict,
-    BestEffort,
+    CargoCompatible,
     Off,
 }
 
-impl Mode {
+impl Enforcement {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
-            "strict" => Ok(Mode::Strict),
-            "best_effort" => Ok(Mode::BestEffort),
-            "off" => Ok(Mode::Off),
+            "strict" => Ok(Enforcement::Strict),
+            "cargo_compatible" => Ok(Enforcement::CargoCompatible),
+            "off" => Ok(Enforcement::Off),
             _ => {
-                bail!("invalid cooldown mode `{value}`; expected one of: strict, best_effort, off")
+                bail!(
+                    "invalid cooldown enforcement `{value}`; expected one of: strict, cargo_compatible, off"
+                )
+            }
+        }
+    }
+}
+
+/// Whether cargo-compatible unresolved fresh versions require user confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CargoCompatibleAccept {
+    Prompt,
+    Auto,
+}
+
+impl CargoCompatibleAccept {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "prompt" => Ok(CargoCompatibleAccept::Prompt),
+            "auto" => Ok(CargoCompatibleAccept::Auto),
+            _ => {
+                bail!(
+                    "invalid cargo-compatible accept policy `{value}`; expected one of: prompt, auto"
+                )
             }
         }
     }
@@ -58,7 +81,8 @@ impl LockfileBaselineMode {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cooldown_minutes: u64,
-    pub mode: Mode,
+    pub enforcement: Enforcement,
+    pub cargo_compatible_accept: CargoCompatibleAccept,
     pub lockfile_baseline: LockfileBaselineMode,
     pub now_override: Option<DateTime<Utc>>,
     pub ttl_seconds: u64,
@@ -96,7 +120,8 @@ impl Config {
 #[serde(rename_all = "snake_case")]
 struct CooldownFile {
     cooldown_minutes: Option<u64>,
-    mode: Option<String>,
+    enforcement: Option<String>,
+    cargo_compatible_accept: Option<String>,
     lockfile_baseline: Option<String>,
     now: Option<String>,
     ttl_seconds: Option<u64>,
@@ -111,7 +136,8 @@ struct CooldownFile {
 #[derive(Debug, Default)]
 struct MergedConfig {
     cooldown_minutes: Option<u64>,
-    mode: Option<Mode>,
+    enforcement: Option<Enforcement>,
+    cargo_compatible_accept: Option<CargoCompatibleAccept>,
     lockfile_baseline: Option<LockfileBaselineMode>,
     now_override: Option<DateTime<Utc>>,
     ttl_seconds: Option<u64>,
@@ -131,8 +157,11 @@ impl MergedConfig {
         if let Some(minutes) = file.data.cooldown_minutes {
             self.cooldown_minutes = Some(minutes);
         }
-        if let Some(mode) = file.data.mode.as_deref() {
-            self.mode = Some(Mode::parse(mode)?);
+        if let Some(enforcement) = file.data.enforcement.as_deref() {
+            self.enforcement = Some(Enforcement::parse(enforcement)?);
+        }
+        if let Some(policy) = file.data.cargo_compatible_accept.as_deref() {
+            self.cargo_compatible_accept = Some(CargoCompatibleAccept::parse(policy)?);
         }
         if let Some(baseline) = file.data.lockfile_baseline.as_deref() {
             self.lockfile_baseline = Some(LockfileBaselineMode::parse(baseline)?);
@@ -169,8 +198,11 @@ impl MergedConfig {
         if let Some(minutes) = env_u64("COOLDOWN_MINUTES")? {
             self.cooldown_minutes = Some(minutes);
         }
-        if let Ok(value) = env::var("COOLDOWN_MODE") {
-            self.mode = Some(Mode::parse(&value)?);
+        if let Ok(value) = env::var("COOLDOWN_ENFORCEMENT") {
+            self.enforcement = Some(Enforcement::parse(&value)?);
+        }
+        if let Ok(value) = env::var("COOLDOWN_CARGO_COMPATIBLE_ACCEPT") {
+            self.cargo_compatible_accept = Some(CargoCompatibleAccept::parse(&value)?);
         }
         if let Ok(value) = env::var("COOLDOWN_LOCKFILE_BASELINE") {
             self.lockfile_baseline = Some(LockfileBaselineMode::parse(&value)?);
@@ -202,7 +234,10 @@ impl MergedConfig {
     fn finish(self) -> Config {
         Config {
             cooldown_minutes: self.cooldown_minutes.unwrap_or(0),
-            mode: self.mode.unwrap_or(Mode::Strict),
+            enforcement: self.enforcement.unwrap_or(Enforcement::Strict),
+            cargo_compatible_accept: self
+                .cargo_compatible_accept
+                .unwrap_or(CargoCompatibleAccept::Prompt),
             lockfile_baseline: self
                 .lockfile_baseline
                 .unwrap_or(LockfileBaselineMode::Floor),
@@ -445,7 +480,8 @@ mod tests {
         root.child("cooldown.toml")
             .write_str(
                 r#"cooldown_minutes = 15
-mode = "best_effort"
+enforcement = "cargo_compatible"
+cargo_compatible_accept = "auto"
 lockfile_baseline = "ignore"
 skip_registries = ["crates-io", "mirror"]
 verbose = true
@@ -460,7 +496,8 @@ version = "1.2.3"
         let config = Config::load(&project_fixture(root.path(), None)).unwrap();
 
         assert_eq!(config.cooldown_minutes, 15);
-        assert_eq!(config.mode, Mode::BestEffort);
+        assert_eq!(config.enforcement, Enforcement::CargoCompatible);
+        assert_eq!(config.cargo_compatible_accept, CargoCompatibleAccept::Auto);
         assert_eq!(config.lockfile_baseline, LockfileBaselineMode::Ignore);
         assert_eq!(
             config.skip_registries,
@@ -480,7 +517,7 @@ version = "1.2.3"
             .child(".cargo/cooldown.toml")
             .write_str(
                 r#"cooldown_minutes = 5
-mode = "off"
+enforcement = "off"
 http_retries = 3
 "#,
             )
@@ -496,7 +533,11 @@ http_retries = 3
         let config = Config::load(&project_fixture(root.path(), None)).unwrap();
 
         assert_eq!(config.cooldown_minutes, 5);
-        assert_eq!(config.mode, Mode::Off);
+        assert_eq!(config.enforcement, Enforcement::Off);
+        assert_eq!(
+            config.cargo_compatible_accept,
+            CargoCompatibleAccept::Prompt
+        );
         assert_eq!(config.http_retries, 3);
 
         match original_cargo_home {
@@ -520,29 +561,37 @@ http_retries = 3
         let root = TempDir::new().unwrap();
         root.child("cooldown.toml")
             .write_str(
-                r#"mode = "best_effort"
+                r#"enforcement = "cargo_compatible"
+cargo_compatible_accept = "prompt"
 lockfile_baseline = "ignore"
 skip_registries = ["from-file"]
 "#,
             )
             .unwrap();
 
-        let original_mode = env::var("COOLDOWN_MODE").ok();
+        let original_enforcement = env::var("COOLDOWN_ENFORCEMENT").ok();
+        let original_accept = env::var("COOLDOWN_CARGO_COMPATIBLE_ACCEPT").ok();
         let original_lockfile_baseline = env::var("COOLDOWN_LOCKFILE_BASELINE").ok();
         let original_skips = env::var("COOLDOWN_SKIP_REGISTRIES").ok();
 
-        unsafe { env::set_var("COOLDOWN_MODE", "off") };
+        unsafe { env::set_var("COOLDOWN_ENFORCEMENT", "off") };
+        unsafe { env::set_var("COOLDOWN_CARGO_COMPATIBLE_ACCEPT", "auto") };
         unsafe { env::set_var("COOLDOWN_LOCKFILE_BASELINE", "floor") };
         unsafe { env::set_var("COOLDOWN_SKIP_REGISTRIES", "from-env") };
 
         let config = Config::load(&project_fixture(root.path(), None)).unwrap();
-        assert_eq!(config.mode, Mode::Off);
+        assert_eq!(config.enforcement, Enforcement::Off);
+        assert_eq!(config.cargo_compatible_accept, CargoCompatibleAccept::Auto);
         assert_eq!(config.lockfile_baseline, LockfileBaselineMode::Floor);
         assert_eq!(config.skip_registries, vec!["from-env".to_string()]);
 
-        match original_mode {
-            Some(val) => unsafe { env::set_var("COOLDOWN_MODE", val) },
-            None => unsafe { env::remove_var("COOLDOWN_MODE") },
+        match original_enforcement {
+            Some(val) => unsafe { env::set_var("COOLDOWN_ENFORCEMENT", val) },
+            None => unsafe { env::remove_var("COOLDOWN_ENFORCEMENT") },
+        }
+        match original_accept {
+            Some(val) => unsafe { env::set_var("COOLDOWN_CARGO_COMPATIBLE_ACCEPT", val) },
+            None => unsafe { env::remove_var("COOLDOWN_CARGO_COMPATIBLE_ACCEPT") },
         }
         match original_lockfile_baseline {
             Some(val) => unsafe { env::set_var("COOLDOWN_LOCKFILE_BASELINE", val) },
@@ -555,37 +604,52 @@ skip_registries = ["from-file"]
     }
 
     #[test]
-    fn rejects_unknown_mode_value() {
+    fn rejects_unknown_enforcement_value() {
         let _guard = env_lock().lock().unwrap();
         let root = TempDir::new().unwrap();
         root.child("cooldown.toml")
-            .write_str(r#"mode = "soft""#)
+            .write_str(r#"enforcement = "soft""#)
             .unwrap();
 
         let err = Config::load(&project_fixture(root.path(), None)).unwrap_err();
         assert!(
-            format!("{err:#}").contains("invalid cooldown mode `soft`"),
+            format!("{err:#}").contains("invalid cooldown enforcement `soft`"),
             "{err:#}"
         );
     }
 
     #[test]
-    fn rejects_unknown_mode_value_from_env() {
+    fn rejects_unknown_enforcement_value_from_env() {
         let _guard = env_lock().lock().unwrap();
         let root = TempDir::new().unwrap();
-        let original_mode = env::var("COOLDOWN_MODE").ok();
-        unsafe { env::set_var("COOLDOWN_MODE", "soft") };
+        let original_enforcement = env::var("COOLDOWN_ENFORCEMENT").ok();
+        unsafe { env::set_var("COOLDOWN_ENFORCEMENT", "soft") };
 
         let err = Config::load(&project_fixture(root.path(), None)).unwrap_err();
         assert!(
-            format!("{err:#}").contains("invalid cooldown mode `soft`"),
+            format!("{err:#}").contains("invalid cooldown enforcement `soft`"),
             "{err:#}"
         );
 
-        match original_mode {
-            Some(val) => unsafe { env::set_var("COOLDOWN_MODE", val) },
-            None => unsafe { env::remove_var("COOLDOWN_MODE") },
+        match original_enforcement {
+            Some(val) => unsafe { env::set_var("COOLDOWN_ENFORCEMENT", val) },
+            None => unsafe { env::remove_var("COOLDOWN_ENFORCEMENT") },
         }
+    }
+
+    #[test]
+    fn rejects_unknown_cargo_compatible_accept_value() {
+        let _guard = env_lock().lock().unwrap();
+        let root = TempDir::new().unwrap();
+        root.child("cooldown.toml")
+            .write_str(r#"cargo_compatible_accept = "always""#)
+            .unwrap();
+
+        let err = Config::load(&project_fixture(root.path(), None)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("invalid cargo-compatible accept policy `always`"),
+            "{err:#}"
+        );
     }
 
     #[test]
