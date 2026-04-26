@@ -1,12 +1,20 @@
+//! Candidate selection over release timelines and cooldown cutoffs.
+//!
+//! This module does the small, pure decision of choosing which release versions
+//! are eligible. It does not touch Cargo or the lockfile; callers provide a
+//! timeline, semver requirements, current time, and baseline policy callback.
+
 use chrono::{DateTime, Duration, Utc};
 use semver::{Version, VersionReq};
 
 use crate::registry::{Release, ReleaseTimeline};
 
+/// Return the oldest publish time that is still accepted by the cooldown window.
 pub fn cutoff_time(minimum_minutes: u64, now: DateTime<Utc>) -> DateTime<Utc> {
     now - Duration::minutes(minimum_minutes as i64)
 }
 
+/// Determine whether a release is fresh when its publish time is known.
 pub fn is_release_fresh(
     release: &Release,
     minimum_minutes: u64,
@@ -17,6 +25,13 @@ pub fn is_release_fresh(
         .map(|published_at| published_at > cutoff_time(minimum_minutes, now))
 }
 
+/// Select the newest older compatible release accepted by cooldown.
+///
+/// The caller supplies the release timeline, the currently locked version,
+/// semver requirements that must remain true, the cooldown window, and a
+/// baseline callback for versions already allowed by the initial lockfile. The
+/// returned release is older than `current_version`, not yanked, requirement
+/// compatible, and either old enough or explicitly allowed by the baseline.
 pub fn select_candidate<'a>(
     timeline: &'a ReleaseTimeline,
     current_version: &str,
@@ -38,6 +53,12 @@ pub fn select_candidate<'a>(
     .next()
 }
 
+/// Select up to `limit` older compatible releases, newest first.
+///
+/// This is the broader form used by local and coordinated solvers. It walks the
+/// timeline from newest to oldest, filters out yanked, fresh, too-new, or
+/// requirement-incompatible releases, and returns candidates in the order the
+/// solver should try them.
 pub fn select_candidates<'a, F>(
     timeline: &'a ReleaseTimeline,
     current_version: &str,
@@ -92,6 +113,7 @@ where
     candidates
 }
 
+/// Unit tests for cutoff and candidate selection behavior.
 #[cfg(test)]
 mod tests {
     use super::*;

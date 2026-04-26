@@ -1,59 +1,58 @@
 # Configuration
 
-`cargo-cooldown` uses a single configuration file: `cooldown.toml`. Allow
-rules are embedded in that same file under the `allow` section.
+`cargo-cooldown` uses `cooldown.toml`. Allow rules live in the same file under
+the `allow` section.
 
-## Resolution order
+Create one interactively:
+
+```bash
+cargo cooldown init
+```
+
+## Minimal File
+
+```toml
+cooldown_minutes = 1440
+mode = "strict"
+lockfile_policy = "changed"
+```
+
+Meaning:
+
+- `cooldown_minutes`: releases newer than this window are considered fresh
+- `mode`: fail or warn when fresh versions remain
+- `lockfile_policy`: protect or re-check versions already in `Cargo.lock`
+
+## Resolution Order
 
 Configuration is loaded in this order:
 
 1. environment variables
-2. `cooldown.toml` for the active workspace member, when the run targets one
-   member unambiguously
-3. `cooldown.toml` in the workspace root or crate root
-4. `cooldown.toml` in `$CARGO_HOME`
+2. active member `cooldown.toml`, when exactly one workspace member is targeted
+3. workspace root or crate root `cooldown.toml`
+4. `$CARGO_HOME/cooldown.toml`
 
 Environment variables always win.
 
-Member overrides apply only when the runtime target is unique, for example:
+Recommended layout:
 
-- `cargo cooldown check --manifest-path member/Cargo.toml`
-- `cargo cooldown check --package member`
-- running from a member directory without `--workspace`
+- single crate: `<crate-root>/cooldown.toml`
+- workspace: `<workspace-root>/cooldown.toml`
+- optional workspace override: `<member-dir>/cooldown.toml`
 
-They do not apply to ambiguous or workspace-wide runs such as:
+Member overrides apply only to unambiguous member runs, such as:
 
-- `cargo cooldown check --workspace`
-- `cargo cooldown check --package a --package b`
-- runs that use `--exclude`
+```bash
+cargo cooldown check --package member
+cargo cooldown check --manifest-path member/Cargo.toml
+```
 
-## Recommended layout
+They do not apply to workspace-wide runs such as `--workspace`,
+`--package a --package b`, or `--exclude`.
 
-Single crate:
+## Supported Keys
 
-- `<crate-root>/cooldown.toml`
-
-Workspace:
-
-- `<workspace-root>/cooldown.toml`
-- optional `<member-dir>/cooldown.toml` overrides for member-specific runs
-
-The workspace root file should hold the shared policy. Member files should only
-contain the values that genuinely differ from the workspace defaults.
-
-## Supported environment variables
-
-- `COOLDOWN_MINUTES`
-- `COOLDOWN_MODE`
-- `COOLDOWN_LOCKFILE_POLICY`
-- `COOLDOWN_NOW`
-- `COOLDOWN_TTL_SECONDS`
-- `COOLDOWN_CACHE_DIR`
-- `COOLDOWN_HTTP_RETRIES`
-- `COOLDOWN_VERBOSE`
-- `COOLDOWN_SKIP_REGISTRIES`
-
-## Supported `cooldown.toml` keys
+`cooldown.toml` supports:
 
 - `cooldown_minutes`
 - `mode`
@@ -66,187 +65,158 @@ contain the values that genuinely differ from the workspace defaults.
 - `skip_registries`
 - `allow`
 
-`cooldown.toml` accepts the lowercase keys shown above. Unknown keys and
-invalid values fail configuration loading.
+Environment variables:
 
-`verbose = true` enables `DEBUG` logs for cooldown internals such as release-age
-inspection, candidate selection, and per-pass scan summaries. User-facing
-output stays compact: repeated pin attempts stay in `DEBUG`, and cooldown ends
-with one summary block that merges the net `Cargo.lock` changes from `cargo
-update` with any cooldown adjustments in a Cargo-style format, plus any fresh
-versions that had to remain.
-When stderr is an interactive terminal, cooldown also shows a resolver progress
-bar and colored status labels.
+- `COOLDOWN_MINUTES`
+- `COOLDOWN_MODE`
+- `COOLDOWN_LOCKFILE_POLICY`
+- `COOLDOWN_NOW`
+- `COOLDOWN_TTL_SECONDS`
+- `COOLDOWN_CACHE_DIR`
+- `COOLDOWN_HTTP_RETRIES`
+- `COOLDOWN_VERBOSE`
+- `COOLDOWN_SKIP_REGISTRIES`
 
-Cooldown selects older candidates for multiple fresh registry crates, expands
-compatible local dependency components from registry metadata, rewrites those
-entries in `Cargo.lock`, and validates the whole batch with Cargo. Local package
-identities include the current locked version, so multiple versions of the same
-crate can be cooled in one component when the current Cargo graph maps a
-dependency unambiguously. Validation retry budgets scale with the batch size and
-stop early when Cargo is only pruning a sparse blocker set.
+Unknown keys and invalid values fail configuration loading.
 
-`skip_registries` can be written as:
-
-```toml
-skip_registries = ["crates-io", "sparse+https://example.com/index/"]
-```
-
-`COOLDOWN_SKIP_REGISTRIES` uses a comma-separated list:
-
-```bash
-COOLDOWN_SKIP_REGISTRIES=crates-io,sparse+https://example.com/index/
-```
+Set `verbose = true` or `COOLDOWN_VERBOSE=1` for debug logs. Normal output stays
+compact and ends with one Cargo-style summary of lockfile changes.
 
 ## `mode`
 
-`mode` controls the guarantee level of the cooldown run:
+`mode` controls what happens after cooldown tries to make the graph old enough.
 
-- `strict` (default): if cooldown cannot eliminate every fresh version that was
-  newly introduced or updated in this run, it fails and restores the original
-  `Cargo.lock`
-- `best_effort`: cooldown keeps any remaining resolver-constrained fresh
-  versions, writes the resulting lockfile, and prints one final warning listing
-  them
+Values:
+
+- `strict` (default): fail and restore the original `Cargo.lock` if any fresh
+  version still cannot be replaced with an older version accepted by Cargo
+- `best_effort`: keep the best valid lockfile Cargo accepted and warn about
+  remaining fresh versions
 - `off`: skip cooldown entirely
 
-Examples:
+Example:
 
 ```toml
-mode = "strict"
+mode = "best_effort"
 ```
+
+or:
 
 ```bash
 COOLDOWN_MODE=best_effort cargo cooldown update
 ```
 
-## Allow rules
-
-Allow rules live in the same file:
-
-```toml
-[allow.global]
-minutes = 1440
-
-[[allow.exact]]
-crate = "serde"
-version = "1.0.218"
-
-[[allow.exact]]
-crate = "serde_json"
-version = "1.0.145"
-
-[[allow.package]]
-crate = "tokio"
-minutes = 60
-
-[[allow.package]]
-crate = "openssl"
-minutes = 0
-```
-
-What each rule means:
-
-- `[allow.global]`
-  applies one fallback cooldown override to every registry crate
-- `[[allow.package]]`
-  applies to one crate name per entry, and you can define as many entries as
-  needed with different cooldown windows
-- `[[allow.exact]]`
-  applies to one exact `(crate, version)` pair per entry, and you can define as
-  many pairs as needed
-
-`allow.global` and `allow.package` only reduce the effective cooldown window.
-They are combined with `cooldown_minutes` by taking the minimum value, so they
-cannot make a crate wait longer than the project-wide default.
-
-Examples:
-
-- use `[[allow.exact]]` when only one concrete version should bypass cooldown
-- use `[[allow.package]]` when a crate should always use a different cooldown
-  window than the project default
-- use `minutes = 0` in `[[allow.package]]` to exclude one crate from cooldown
-  entirely
-
-Example with multiple package-specific cooldowns:
-
-```toml
-cooldown_minutes = 1440
-
-[[allow.package]]
-crate = "tokio"
-minutes = 60
-
-[[allow.package]]
-crate = "ring"
-minutes = 10
-
-[[allow.package]]
-crate = "openssl"
-minutes = 0
-```
-
-Merge behavior for workspace root plus member override:
-
-- `allow.global`: the member value replaces the workspace value
-- `allow.package`: entries are merged by crate name and the member overrides
-  duplicates
-- `allow.exact`: entries are unioned and deduplicated
-
 ## `lockfile_policy`
 
-`lockfile_policy` controls whether versions that were already present in the
-initial `Cargo.lock` should participate in cooldown:
+`lockfile_policy` controls which locked versions cooldown is allowed to try to
+cool.
 
-- `changed` (default): only new or version-changed registry packages are cooled
-- `all`: apply cooldown to every eligible registry package, including versions
-  that were already present in the initial lockfile
+Values:
 
-Examples:
+- `changed` (default): protect versions that were already present in the
+  initial `Cargo.lock`
+- `all`: also check versions that were already present in the initial
+  `Cargo.lock`
+
+With `cargo cooldown update`, the initial lockfile means the file that existed
+before `cargo update` ran.
+
+Example:
 
 ```toml
 lockfile_policy = "all"
 ```
 
+or:
+
 ```bash
-COOLDOWN_LOCKFILE_POLICY=all cargo cooldown check
+COOLDOWN_LOCKFILE_POLICY=all cargo cooldown update
 ```
 
-`lockfile_policy = "changed"` is most visible with `cargo cooldown update`:
+Important: `lockfile_policy = "all"` is not a force downgrade mode. Cooldown
+still asks Cargo to validate the final graph. If Cargo rejects every older
+assignment, the fresh version remains unresolved.
 
-- versions already present in the pre-update `Cargo.lock` are left alone
-- versions introduced or changed by that update become eligible for cooldown
-- when a freshly updated package can be pinned back to a version that was
-  already present in the baseline lockfile, that baseline version remains a
-  valid pin target even if it is still inside the cooldown window
-- cooldown never downgrades a version that was already present in the
-  pre-update lockfile; that version becomes the minimum allowed version for the
-  package during the update run
-- if cooling one of those newly updated versions would require degrading
-  baseline-protected, already exhausted earlier in the run, or otherwise
-  cooldown-exempt dependencies, `best_effort` keeps the fresh version and warns
-  at the end, while `strict` fails and restores the original lockfile
+## Policy Combinations
 
-With `lockfile_policy = "all"`, the pre-update lockfile is not used as an
-exemption. Existing locked versions can be cooled when they are inside the
-cooldown window and Cargo accepts the lower compatible version.
+Use this table as the main mental model:
 
-For `build`, `check`, `test`, or `run`, Cargo usually reuses the existing
-lockfile. Those commands do not proactively refresh dependencies on their own.
+| Config | Human meaning |
+| --- | --- |
+| `lockfile_policy = "changed"` + `mode = "strict"` | Default. Keep the pre-run lockfile as the floor. Cool only versions added or changed by this run. Fail if any new fresh version remains. |
+| `lockfile_policy = "changed"` + `mode = "best_effort"` | Same lockfile protection as the default, but keep the best valid result and warn if some fresh versions remain. |
+| `lockfile_policy = "all"` + `mode = "strict"` | Try to cool every eligible locked registry package, including packages already in `Cargo.lock`. Fail if any fresh version still cannot be cooled. |
+| `lockfile_policy = "all"` + `mode = "best_effort"` | Try to cool every eligible locked registry package, keep Cargo's best valid result, and warn about the remaining fresh versions. |
+
+Why can a fresh version remain?
+
+- the current `Cargo.toml` requires a fresh version range
+- a transitive crate uses an exact dependency
+- features or target-specific dependencies activate a newer package
+- a group of crates has no older combination that Cargo accepts
+- an allow rule or skipped registry exempts the package
+- `lockfile_policy = "changed"` protects the pre-run lockfile floor
+
+## Allow Rules
+
+Allow rules reduce the cooldown window for selected crates.
+
+```toml
+[[allow.exact]]
+crate = "serde"
+version = "1.0.218"
+
+[[allow.package]]
+crate = "tokio"
+minutes = 60
+
+[[allow.package]]
+crate = "openssl"
+minutes = 0
+```
+
+Rules:
+
+- `[[allow.exact]]`: allow one exact `(crate, version)` pair
+- `[[allow.package]]`: use a shorter cooldown for one crate name
+- `minutes = 0`: exclude that crate from cooldown
+- `[allow.global]`: define a shorter default cooldown for all registry crates
+
+`allow.global` and `allow.package` only reduce the effective cooldown. They do
+not increase it above `cooldown_minutes`.
+
+Workspace merge behavior:
+
+- `allow.global`: member value replaces workspace value
+- `allow.package`: member entries override workspace entries with the same crate
+- `allow.exact`: member and workspace entries are unioned and deduplicated
+
+## `skip_registries`
+
+Skip a registry by logical name or effective URL:
+
+```toml
+skip_registries = ["crates-io", "sparse+https://example.com/index/"]
+```
+
+Environment variable form:
+
+```bash
+COOLDOWN_SKIP_REGISTRIES=crates-io,sparse+https://example.com/index/
+```
+
+Skipped registries are not inspected, fetched through fallback HTTP, or
+downgraded. Their packages still participate in Cargo's resolver constraints.
 
 ## `cargo cooldown init`
 
-Use `cargo cooldown init` from the project root to scaffold a `cooldown.toml`
+Use `cargo cooldown init` from the project root to create `cooldown.toml`
 interactively.
 
 - in a crate root, it creates one `cooldown.toml`
-- in a workspace root, it can create one shared `cooldown.toml` plus optional
-  member override files
+- in a workspace root, it can create one shared file plus optional member
+  override files
+- it refuses to overwrite existing `cooldown.toml` files
 
-The command refuses to run from a non-root directory and does not overwrite an
-existing `cooldown.toml`.
-
-This command is cargo-cooldown's own setup wizard. It does not forward to
-Cargo's `cargo init`. If you want to create a new Cargo package, run plain
-`cargo init` first and then run `cargo cooldown init` from the resulting
-project root.
+This is cargo-cooldown's setup wizard. It does not forward to Cargo's
+`cargo init`.

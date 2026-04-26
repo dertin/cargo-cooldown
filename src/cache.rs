@@ -1,3 +1,5 @@
+//! Time-limited on-disk JSON cache used by registry metadata fallback.
+
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -12,6 +14,7 @@ struct CacheEntry<T> {
     value: T,
 }
 
+/// Filesystem-backed cache rooted in the platform cache directory or an override.
 #[derive(Debug, Clone)]
 pub struct Cache {
     root: PathBuf,
@@ -93,6 +96,7 @@ fn current_epoch() -> u64 {
         .as_secs()
 }
 
+/// Unit tests for cache expiry, key sanitizing, and JSON errors.
 #[cfg(test)]
 mod tests {
     use super::*;

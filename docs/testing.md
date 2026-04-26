@@ -82,28 +82,14 @@ Run the default crates.io benchmark using the small smoke workspace:
 ./examples/run-crates-io-benchmark.sh
 ```
 
-That script warms one real crates.io snapshot first, then measures visible
-wall-clock cooldown runs under `strict` mode, allows network access in measured
-samples, reports whether any registry API fallback was observed, and copies
-every measured `Cargo.lock` plus its cooldown log for manual validation. Use
-`BENCH_OFFLINE=1 BENCH_PREFETCH_COOLDOWN=1` for an isolated offline run; the
-preload phase is reported separately because it runs cooldown too. The runner
-uses the normal Cargo cache by default; set `BENCH_ISOLATED_CARGO_HOME=1` to
-measure from an empty temporary Cargo home.
-Measured `Cargo.lock` files are copied under
-`target/cargo-cooldown-benchmarks/<run-id>/`; override `BENCH_ARTIFACT_ROOT` or
-`BENCH_RUN_ID` to choose a stable location/name.
+The runner warms one real crates.io snapshot, measures cooldown wall-clock
+time, reports fallback usage, and stores each measured `Cargo.lock` plus its
+log under `target/cargo-cooldown-benchmarks/<run-id>/`.
 
 Use the timing target when diagnosing resolver cost:
 
 ```bash
 RUST_LOG=cargo_cooldown::timing=debug ./examples/run-crates-io-large-60d-benchmark.sh
-```
-
-The shared crates.io benchmark runner is:
-
-```bash
-./examples/run-crates-io-benchmark.sh
 ```
 
 Run the aggressive 60-day crates.io benchmark using a larger workspace:
@@ -112,10 +98,8 @@ Run the aggressive 60-day crates.io benchmark using a larger workspace:
 ./examples/run-crates-io-large-60d-benchmark.sh
 ```
 
-That workload intentionally pulls a much larger transitive graph from crates.io
-so the cooldown batch solver does substantially more work than the small smoke
-workspace. It defaults to visible wall-clock runs without cooldown preload. Use
-`COOLDOWN_MINUTES=131401` to push the same benchmark to roughly 3 months.
+That workload pulls a larger transitive graph than the small smoke workspace.
+Use `COOLDOWN_MINUTES=131401` to push the same benchmark to roughly 3 months.
 
 The same benchmark runner is available through Cargo's benchmark command:
 

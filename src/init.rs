@@ -1,3 +1,5 @@
+//! Interactive setup wizard for creating project `cooldown.toml` files.
+
 use std::fmt::{Display, Write as _};
 use std::fs;
 use std::io::{self, Write};
@@ -27,6 +29,12 @@ struct InitPlan {
     files: Vec<InitFile>,
 }
 
+/// Run the setup wizard for the already discovered project.
+///
+/// The caller provides project shape and paths from discovery. The wizard shows
+/// what it found, asks a small set of configuration questions, builds the target
+/// `cooldown.toml` files, refuses to overwrite existing files, and writes the
+/// plan only after user confirmation.
 pub fn run(project: &ProjectContext) -> Result<()> {
     print_project_summary(project);
 
@@ -464,6 +472,7 @@ fn select_optional_lockfile_policy(prompt: &str) -> Result<Option<String>> {
     }
 }
 
+/// Unit tests for generated config templates and workspace init planning.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,3 +1,5 @@
+//! End-to-end cooldown tests using a deterministic local sparse registry.
+
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;

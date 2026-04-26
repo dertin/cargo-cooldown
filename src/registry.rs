@@ -1,3 +1,10 @@
+//! Registry resolution and release metadata loading.
+//!
+//! Cargo metadata gives cooldown a source ID, not a ready-to-use release
+//! database. This module resolves that source to the effective registry index,
+//! reads local index data for versions, timestamps, dependencies, and checksums,
+//! and fills missing publish times through the registry API when available.
+
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::thread::sleep;
@@ -20,6 +27,7 @@ use crate::config::Config;
 const CRATES_IO_LEGACY_SOURCE_ID: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_SPARSE_SOURCE_ID: &str = "sparse+https://index.crates.io/";
 
+/// Source used for a release timestamp.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReleaseSource {
@@ -36,6 +44,7 @@ impl ReleaseSource {
     }
 }
 
+/// One crate release with the metadata needed for cooldown decisions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Release {
     pub version: String,
@@ -44,6 +53,7 @@ pub struct Release {
     pub source: ReleaseSource,
 }
 
+/// Chronological release list for one crate.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseTimeline {
     pub releases: Vec<Release>,
@@ -63,6 +73,7 @@ impl ReleaseTimeline {
     }
 }
 
+/// Dependency metadata read from the local registry index for one release.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReleaseDependency {
     pub crate_name: String,
@@ -71,12 +82,14 @@ pub struct ReleaseDependency {
     pub target_specific: bool,
 }
 
+/// Local index metadata required to rewrite a lockfile package entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalReleaseMetadata {
     pub dependencies: Vec<ReleaseDependency>,
     pub checksum: String,
 }
 
+/// Resolved registry identity after Cargo config, mirrors, and source replacement.
 #[derive(Debug, Clone)]
 pub struct RegistryContext {
     pub logical_name: String,
@@ -101,6 +114,12 @@ struct CrateResponse {
     versions: Vec<ApiVersion>,
 }
 
+/// Cached registry access used across one cooldown execution.
+///
+/// The store receives Cargo source IDs from metadata and translates them into
+/// effective registry contexts. It then serves release timelines, dependency
+/// metadata, and checksums from local registry indexes, using the HTTP API only
+/// when timestamps are missing from the local data.
 pub struct RegistryStore {
     cache: Cache,
     http: Client,
@@ -113,6 +132,12 @@ pub struct RegistryStore {
 }
 
 impl RegistryStore {
+    /// Create a registry store for one cooldown run.
+    ///
+    /// Configuration supplies the on-disk cache location, cache TTL, HTTP retry
+    /// count, and registries to skip. The returned store keeps additional
+    /// in-memory caches so repeated resolver passes do not reload the same crate
+    /// metadata.
     pub fn new(config: &Config) -> Result<Self> {
         let cache = if let Some(ref root) = config.cache_dir {
             Cache::with_root(root.clone(), Duration::from_secs(config.ttl_seconds))?
@@ -137,6 +162,12 @@ impl RegistryStore {
         })
     }
 
+    /// Resolve a Cargo metadata source ID into the effective registry context.
+    ///
+    /// Cargo may report legacy, sparse, mirrored, or replacement registry URLs.
+    /// This function normalizes that input, finds the local index location and
+    /// optional API endpoint, applies `skip_registries`, and caches the result for
+    /// later timeline or checksum lookups.
     pub fn context_for_source(&mut self, source_id: &str) -> Result<&RegistryContext> {
         if !self.registries.contains_key(source_id) {
             let context = resolve_registry_context(source_id, &self.skip_registries)?;
@@ -148,6 +179,13 @@ impl RegistryStore {
             .context("resolved registry context should be present")
     }
 
+    /// Load and cache the release timeline for one crate.
+    ///
+    /// The caller passes the Cargo source ID and crate name from the resolved
+    /// graph. The store first reads local index data; if any release timestamp is
+    /// missing and the registry exposes an API endpoint, it fetches cached HTTP
+    /// fallback data and merges it in. The returned timeline is what cooldown uses
+    /// to decide whether a version is fresh and which older versions are valid.
     pub fn timeline_for(&mut self, source_id: &str, crate_name: &str) -> Result<ReleaseTimeline> {
         let cache_key = (source_id.to_string(), crate_name.to_string());
         if let Some(cached) = self.timelines.get(&cache_key) {
@@ -160,6 +198,8 @@ impl RegistryStore {
         }
 
         let local = load_local_timeline(&context, crate_name)?;
+        // The local index is authoritative when it has `pubtime`; HTTP fallback is
+        // only for registries or cache entries that do not expose timestamps.
         let api = if local
             .as_ref()
             .is_none_or(ReleaseTimeline::has_missing_timestamps)
@@ -174,6 +214,11 @@ impl RegistryStore {
         Ok(timeline)
     }
 
+    /// Read non-dev dependencies for one exact release from the local index.
+    ///
+    /// The dependency solver calls this when it needs to know what would happen
+    /// after pinning a package to `version`. `None` means the local index does not
+    /// have enough metadata, so the caller should avoid speculative rewriting.
     pub fn local_release_dependencies(
         &mut self,
         source_id: &str,
@@ -185,6 +230,10 @@ impl RegistryStore {
             .map(|metadata| metadata.dependencies))
     }
 
+    /// Read the checksum Cargo expects for one exact release.
+    ///
+    /// Lockfile rewrites must update both version and checksum. Returning `None`
+    /// means the release cannot be safely written directly from local metadata.
     pub fn local_release_checksum(
         &mut self,
         source_id: &str,
@@ -312,6 +361,7 @@ impl RegistryStore {
     }
 }
 
+/// Return whether a Cargo source id refers to a registry dependency.
 pub fn is_registry_source(source: &str) -> bool {
     source.starts_with("registry+") || source.starts_with("sparse+")
 }
@@ -368,6 +418,8 @@ fn resolve_non_crates_io_index_location(source_id: &str) -> Result<(TamePathBuf,
         return Ok(primary);
     };
 
+    // Cargo can represent a sparse registry in metadata as `registry+URL`.
+    // Prefer the sparse cache if that is the cache Cargo actually populated.
     let sparse_source = format!("sparse+{url}");
     let sparse = IndexLocation::new(IndexUrl::from(sparse_source.as_str())).into_parts()?;
 
@@ -461,6 +513,8 @@ fn merge_timelines(
     let mut releases = Vec::with_capacity(local.releases.len() + api_map.len());
     for release in local.releases {
         if let Some(api_version) = api_map.remove(&release.version) {
+            // Preserve index data when available, but fill missing publish times
+            // from the API so downstream freshness checks can stay fail-closed.
             let published_at = release.published_at.or(Some(api_version.created_at));
             let source = if release.published_at.is_some() {
                 release.source
@@ -596,6 +650,7 @@ fn checksum_hex(bytes: &[u8; 32]) -> String {
     hex
 }
 
+/// Extract a release timestamp or explain which registry metadata is missing.
 pub fn assert_has_timestamp(
     context: &RegistryContext,
     crate_name: &str,
@@ -609,6 +664,7 @@ pub fn assert_has_timestamp(
     })
 }
 
+/// Find a release in a loaded timeline with a registry-aware error message.
 pub fn require_release<'a>(
     timeline: &'a ReleaseTimeline,
     context: &RegistryContext,
@@ -623,6 +679,7 @@ pub fn require_release<'a>(
     })
 }
 
+/// Fail early when a registry timeline has no usable release metadata.
 pub fn ensure_timeline_available(
     context: &RegistryContext,
     crate_name: &str,
@@ -639,6 +696,7 @@ pub fn ensure_timeline_available(
     Ok(())
 }
 
+/// Unit tests for registry resolution, timeline merging, and skip matching.
 #[cfg(test)]
 mod tests {
     use super::*;

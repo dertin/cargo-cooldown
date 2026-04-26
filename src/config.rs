@@ -1,3 +1,5 @@
+//! Configuration loading, validation, and merge precedence.
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,6 +12,7 @@ use serde::Deserialize;
 use crate::allow_rules::{AllowRules, AllowSection};
 use crate::project::ProjectContext;
 
+/// Behavior when cooldown cannot fully remove fresh versions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Strict,
@@ -30,6 +33,7 @@ impl Mode {
     }
 }
 
+/// Scope of lockfile entries that may participate in cooldown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockfilePolicy {
     Changed,
@@ -50,6 +54,7 @@ impl LockfilePolicy {
     }
 }
 
+/// Effective runtime configuration after files and environment are merged.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cooldown_minutes: u64,
@@ -65,6 +70,12 @@ pub struct Config {
 }
 
 impl Config {
+    /// Load the effective configuration for one resolved Cargo project.
+    ///
+    /// Configuration is layered from global Cargo config, workspace
+    /// `cooldown.toml`, an active member override when the command targets one
+    /// member, and finally environment variables. The returned value is already
+    /// validated and contains defaults for any omitted settings.
     pub fn load(project: &ProjectContext) -> Result<Self> {
         let mut merged = MergedConfig::default();
 
@@ -328,6 +339,7 @@ fn cargo_home_dir() -> Option<PathBuf> {
         .or_else(|| home_dir().map(|home| home.join(".cargo")))
 }
 
+/// Unit tests for configuration loading, precedence, and validation.
 #[cfg(test)]
 mod tests {
     use super::*;

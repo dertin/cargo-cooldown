@@ -1,3 +1,5 @@
+//! End-to-end tests for the interactive `cargo cooldown init` command.
+
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};

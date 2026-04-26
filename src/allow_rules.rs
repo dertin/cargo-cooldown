@@ -1,7 +1,10 @@
+//! Allow-rule parsing and merging for package-specific cooldown exceptions.
+
 use std::collections::HashMap;
 
 use serde::Deserialize;
 
+/// Root allow-rule object embedded in `cooldown.toml`.
 #[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AllowRules {
@@ -9,6 +12,7 @@ pub struct AllowRules {
     pub allow: AllowSection,
 }
 
+/// TOML section that contains global, package, and exact-version rules.
 #[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AllowSection {
@@ -19,6 +23,7 @@ pub struct AllowSection {
     pub global: Option<AllowGlobal>,
 }
 
+/// Allows one exact crate version to bypass cooldown.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AllowExact {
@@ -27,6 +32,7 @@ pub struct AllowExact {
     pub version: String,
 }
 
+/// Overrides the cooldown window for one crate name.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AllowPackage {
@@ -36,6 +42,7 @@ pub struct AllowPackage {
     pub minutes: Option<u64>,
 }
 
+/// Provides a lower default cooldown window for all registry crates.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AllowGlobal {
@@ -118,6 +125,7 @@ impl AllowSection {
     }
 }
 
+/// Unit tests for allow-rule merging and lookup semantics.
 #[cfg(test)]
 mod tests {
     use super::*;

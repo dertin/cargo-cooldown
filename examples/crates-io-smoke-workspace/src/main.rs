@@ -1,3 +1,5 @@
+//! Small crates.io-backed workspace used by smoke tests and benchmarks.
+
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;

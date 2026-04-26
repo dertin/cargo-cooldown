@@ -1,3 +1,5 @@
+//! Cargo bench harness that delegates to the real crates.io benchmark scripts.
+
 use std::env;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};

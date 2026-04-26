@@ -1,3 +1,11 @@
+//! Builds the per-pass cooldown state from Cargo's resolved dependency graph.
+//!
+//! The executor asks this module to turn raw Cargo metadata into the facts it
+//! needs for one resolver pass: which registry packages are reachable, which
+//! semver requirements constrain them, which versions are fresh, and which
+//! packages are exempt because of config, registry skipping, or the initial
+//! lockfile baseline.
+
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{Context, Result};
@@ -15,6 +23,11 @@ use crate::registry::{
 use crate::resolver::{cutoff_time, is_release_fresh};
 use clap_cargo::Workspace;
 
+/// Fresh package candidate that may need a lockfile pin.
+///
+/// A value here means the package is reachable from the selected workspace
+/// command, is not skipped or allowed, and its locked release timestamp is newer
+/// than the active cooldown cutoff.
 #[derive(Clone, Debug)]
 pub struct FreshCrate {
     pub package_id: PackageId,
@@ -24,6 +37,11 @@ pub struct FreshCrate {
     pub minimum_minutes: u64,
 }
 
+/// Cooldown-relevant state for one resolved registry package.
+///
+/// The state keeps the data needed by later solver phases without carrying the
+/// whole Cargo metadata package around: identity, current version, effective
+/// cooldown minutes, and the reasons this package may be exempt from pinning.
 #[derive(Clone, Debug)]
 pub struct CrateState {
     pub name: String,
@@ -36,11 +54,13 @@ pub struct CrateState {
 }
 
 impl CrateState {
+    /// Whether this package should be left untouched by cooldown.
     pub fn is_cooldown_exempt(&self) -> bool {
         self.exact_allowed || self.minimum_minutes == 0 || self.skipped || self.baseline_exempt
     }
 }
 
+/// Cache key for one locked-version release-age inspection.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReleaseInspectionKey {
     pub source_id: String,
@@ -49,6 +69,7 @@ pub struct ReleaseInspectionKey {
     pub minimum_minutes: u64,
 }
 
+/// Result of checking whether one locked release is inside the cooldown window.
 #[derive(Clone, Debug)]
 pub struct ReleaseInspection {
     pub published_at: DateTime<Utc>,
@@ -56,6 +77,7 @@ pub struct ReleaseInspection {
     pub fresh: bool,
 }
 
+/// Parent manifest requirement that constrains a resolved package.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RequirementOrigin {
     pub parent_id: PackageId,
@@ -64,11 +86,13 @@ pub struct RequirementOrigin {
 }
 
 impl RequirementOrigin {
+    /// Parse the stored semver requirement.
     pub fn requirement_req(&self) -> VersionReq {
         VersionReq::parse(&self.requirement).expect("requirement origins store valid semver")
     }
 }
 
+/// Counts emitted in verbose logs and used for progress reporting.
 #[derive(Debug, Default, Clone)]
 pub struct ScanSummary {
     pub registry_packages: usize,
@@ -115,6 +139,11 @@ struct SnapshotNode {
     deps: Vec<SnapshotNodeDep>,
 }
 
+/// Snapshot of the selected dependency closure from `cargo metadata`.
+///
+/// Cargo metadata is large and tied to the exact command invocation. This compact
+/// snapshot keeps only the packages, resolved dependency edges, and manifest
+/// dependency requirements reachable from the selected workspace roots.
 #[derive(Clone, Debug)]
 pub struct CargoSnapshot {
     packages: HashMap<PackageId, SnapshotPackage>,
@@ -123,6 +152,12 @@ pub struct CargoSnapshot {
 }
 
 impl CargoSnapshot {
+    /// Build a compact dependency snapshot limited to the selected workspace closure.
+    ///
+    /// The input is raw `cargo metadata` for the same manifest/features that the
+    /// user command will run. The method determines selected workspace roots,
+    /// walks their resolved dependency closure, and returns only that subset so
+    /// cooldown does not inspect unrelated workspace members.
     pub fn from_metadata(metadata: Metadata, workspace: &Workspace) -> Result<Self> {
         let resolve = metadata
             .resolve
@@ -156,6 +191,7 @@ impl CargoSnapshot {
         })
     }
 
+    /// Package IDs in reachable metadata order.
     pub fn reachable_order(&self) -> &[PackageId] {
         &self.reachable_order
     }
@@ -186,6 +222,12 @@ struct PackageScanRecord {
     best_effort_skipped: bool,
 }
 
+/// Aggregated cooldown state for one resolver pass.
+///
+/// The executor rebuilds this state after each accepted lockfile rewrite. It is
+/// the bridge between "what Cargo currently resolved" and "what cooldown should
+/// try next": fresh entries, version requirements, exact-version dependents, and
+/// counters used for progress/debug output.
 #[derive(Clone, Debug, Default)]
 pub struct ResolutionState {
     pub crate_states: HashMap<PackageId, CrateState>,
@@ -215,10 +257,12 @@ struct ResolutionScanCtx<'a> {
 }
 
 impl ResolutionState {
+    /// Fresh packages that should be actively cooled in this pass.
     pub fn fresh_entries_vec(&self) -> Vec<FreshCrate> {
         self.fresh_entries.values().cloned().collect()
     }
 
+    /// Fresh packages already skipped once and only eligible for coordinated retries.
     pub fn best_effort_entries_vec(&self) -> Vec<FreshCrate> {
         self.best_effort_entries.values().cloned().collect()
     }
@@ -235,6 +279,8 @@ impl ResolutionState {
             return Ok(());
         };
 
+        // Record constraints before deciding whether this package itself is subject
+        // to cooldown. Skipped packages still shape valid versions elsewhere.
         let contributions = constraint_contributions(node, package, ctx.snapshot);
         for contribution in &contributions {
             self.add_contribution(contribution);
@@ -318,6 +364,8 @@ impl ResolutionState {
                     minimum_minutes,
                 };
                 let key = crate_failure_key(source_id, package.name.as_str(), &current_version);
+                // Best-effort skips are tied to the exact resolved package version so
+                // successful later pins can reclassify new versions normally.
                 if ctx.best_effort_skips.contains_key(&key) {
                     record.best_effort_skipped = true;
                     self.best_effort_entries.insert(package_id.clone(), fresh);
@@ -334,6 +382,8 @@ impl ResolutionState {
     fn add_contribution(&mut self, contribution: &ConstraintContribution) {
         let child_id = &contribution.child_id;
 
+        // Requirements are reference-counted because one parent can disappear after
+        // a pin while another still keeps the same semver constraint alive.
         let requirements = self
             .version_requirement_counts
             .entry(child_id.clone())
@@ -431,6 +481,14 @@ impl ResolutionState {
     }
 }
 
+/// Build the cooldown scan state from Cargo metadata and the configured policy.
+///
+/// The caller provides a compact Cargo snapshot, effective config, the original
+/// lockfile baseline, registry access, per-run release inspection cache, and the
+/// current time. Each reachable package contributes dependency constraints first;
+/// registry packages are then checked against skip rules, allow rules, baseline
+/// policy, and release age. The returned state tells the executor which crates
+/// are fresh and which constraints must be respected when cooling them.
 pub fn build_resolution_state(
     snapshot: &CargoSnapshot,
     config: &Config,
@@ -456,10 +514,12 @@ pub fn build_resolution_state(
     Ok(state)
 }
 
+/// Stable key used to remember exact fresh versions across resolver passes.
 pub fn crate_failure_key(source_id: &str, name: &str, current_version: &str) -> String {
     format!("{source_id}::{name}@{current_version}")
 }
 
+/// Workspace packages selected by the current Cargo command.
 pub fn selected_package_ids(metadata: &Metadata, workspace: &Workspace) -> HashSet<PackageId> {
     workspace
         .partition_packages(metadata)
@@ -469,6 +529,7 @@ pub fn selected_package_ids(metadata: &Metadata, workspace: &Workspace) -> HashS
         .collect()
 }
 
+/// Dependency closure reachable from the selected workspace packages.
 pub fn reachable_package_ids(
     resolve: &Resolve,
     selected_root_ids: &HashSet<PackageId>,
@@ -582,6 +643,12 @@ fn constraint_contributions(
     contributions.into_values().collect()
 }
 
+/// Inspect the locked release age, reusing per-run cache entries.
+///
+/// This receives the resolved crate identity and registry context, loads the
+/// crate timeline if needed, finds the exact locked release, and compares its
+/// publish time with the cooldown cutoff. The boolean in the return value says
+/// whether this inspection was served from the in-memory cache.
 pub fn inspect_current_release(
     registry_store: &mut RegistryStore,
     inspection_cache: &mut HashMap<ReleaseInspectionKey, ReleaseInspection>,
@@ -634,6 +701,7 @@ fn find_manifest_dependency<'a>(
     })
 }
 
+/// Unit tests for metadata snapshots and requirement-origin tracking.
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,3 +1,5 @@
+//! Project discovery for crate roots, workspaces, and member-specific configs.
+
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,12 +9,14 @@ use anyhow::{Context, Result, bail};
 use cargo_metadata::Metadata;
 use clap_cargo::{Manifest, Workspace};
 
+/// Cargo project shape used to decide which config files can be generated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectKind {
     Crate,
     Workspace,
 }
 
+/// Workspace member with enough path data to locate member overrides.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectMember {
     pub name: String,
@@ -20,6 +24,7 @@ pub struct ProjectMember {
     pub dir: PathBuf,
 }
 
+/// Resolved project context for config loading or `cargo cooldown init`.
 #[derive(Debug, Clone)]
 pub struct ProjectContext {
     pub cwd: PathBuf,
@@ -39,6 +44,12 @@ struct RuntimeSelection {
 }
 
 impl ProjectContext {
+    /// Discover project context for a runtime Cargo command.
+    ///
+    /// The caller passes the parsed Cargo manifest and workspace selectors from
+    /// the CLI. Discovery resolves the workspace root, member list, and optional
+    /// active member so configuration loading can pick the correct workspace and
+    /// member `cooldown.toml` files.
     pub fn discover_for_runtime(manifest: &Manifest, workspace: &Workspace) -> Result<Self> {
         let selection = RuntimeSelection {
             manifest_path: manifest.manifest_path.clone(),
@@ -50,6 +61,12 @@ impl ProjectContext {
         Self::discover(&selection)
     }
 
+    /// Discover project context for `cargo cooldown init`.
+    ///
+    /// Init has no forwarded Cargo command, so discovery starts from the current
+    /// directory and then verifies that the user is at the project root. The
+    /// returned context tells the wizard whether it is configuring a crate or a
+    /// workspace and where files should be created.
     pub fn discover_for_init() -> Result<Self> {
         let context = Self::discover(&RuntimeSelection::default())?;
         if context.cwd != context.workspace_root {
@@ -99,10 +116,12 @@ impl ProjectContext {
         })
     }
 
+    /// Path to the workspace or crate root `cooldown.toml`.
     pub fn workspace_config_path(&self) -> PathBuf {
         self.workspace_root.join("cooldown.toml")
     }
 
+    /// Path to the active member override, when the run targets exactly one member.
     pub fn member_config_path(&self) -> Option<PathBuf> {
         self.active_member.as_ref().and_then(|member| {
             let path = member.dir.join("cooldown.toml");
@@ -218,6 +237,7 @@ fn determine_active_member(
     }
 }
 
+/// Unit tests for workspace member detection and config path selection.
 #[cfg(test)]
 mod tests {
     use super::*;

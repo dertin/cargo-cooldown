@@ -1,3 +1,11 @@
+//! Cooldown execution loop, lockfile pinning, and Cargo validation.
+//!
+//! This module receives the already parsed Cargo command context and turns the
+//! current lockfile into a cooled, Cargo-valid lockfile. It repeatedly reads
+//! Cargo metadata, identifies registry packages that are too fresh, selects older
+//! compatible releases, rewrites the lockfile in bounded batches, and asks Cargo
+//! to validate every proposed assignment before keeping it.
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
@@ -31,6 +39,7 @@ const COOLDOWN_LOCAL_SEED_CANDIDATES: usize = 8;
 const COOLDOWN_LOCAL_REQUIRED_CANDIDATES_PER_REQUIREMENT: usize = 2;
 const COOLDOWN_LOCAL_ASSIGNMENT_CEILING: usize = 250_000;
 
+/// Log the cost of expensive resolver phases without changing their return type.
 macro_rules! timed_debug {
     ($message:literal, $block:block) => {{
         let started = Instant::now();
@@ -44,6 +53,13 @@ macro_rules! timed_debug {
     }};
 }
 
+/// Prepare the lockfile before running a normal forwarded Cargo command.
+///
+/// The caller provides the already loaded configuration, Cargo selector state,
+/// and feature flags from the CLI. This function captures the current
+/// `Cargo.lock` as the baseline, runs the cooldown resolver, and leaves the
+/// lockfile in the newest Cargo-valid state that respects the configured policy.
+/// It returns `Ok(())` when the lockfile is ready for Cargo to continue.
 pub fn run_pinning_flow(
     config: &Config,
     manifest: &Manifest,
@@ -61,6 +77,12 @@ pub fn run_pinning_flow(
     )
 }
 
+/// Capture the user-visible `Cargo.lock` before cooldown mutates anything.
+///
+/// The snapshot stores the file contents and an index of registry package
+/// versions. Later phases use it to restore the exact starting state on failure
+/// and, under the default `changed` policy, to avoid downgrading versions that
+/// were already locked before this command started.
 pub fn capture_initial_lockfile(config: &Config, manifest: &Manifest) -> Result<LockfileSnapshot> {
     let mut registry_store = RegistryStore::new(config)?;
     let lockfile_path = workspace_lockfile_path(manifest)?;
@@ -69,6 +91,14 @@ pub fn capture_initial_lockfile(config: &Config, manifest: &Manifest) -> Result<
     LockfileSnapshot::capture(&lockfile_path, &mut registry_store)
 }
 
+/// Run the full cooldown resolver from an already captured baseline.
+///
+/// This is the main execution loop. It receives the immutable command context,
+/// the initial lockfile snapshot, and the success message to show at the end.
+/// Each pass reads Cargo metadata, marks fresh registry packages, tries a batch
+/// lockfile assignment, validates that assignment with Cargo, and repeats if the
+/// graph changed. It returns `Ok(())` after emitting the final user summary, or
+/// restores the initial lockfile before returning an error.
 pub fn run_pinning_flow_with_snapshot(
     config: &Config,
     manifest: &Manifest,
@@ -83,16 +113,20 @@ pub fn run_pinning_flow_with_snapshot(
     let result = (|| {
         // Missing lockfiles are created only after the initial snapshot exists, so the
         // default policy always compares against the pre-run lockfile state.
+        ui.set_phase("Preparing cooldown scan...");
         ensure_lockfile(manifest, &lockfile_path)?;
         let now = config.now_override.unwrap_or_else(Utc::now);
         let mut best_effort_skips: HashMap<String, String> = HashMap::new();
         let mut constraint_edges: HashMap<String, HashSet<String>> = HashMap::new();
         let mut inspection_cache: HashMap<ReleaseInspectionKey, ReleaseInspection> = HashMap::new();
+        ui.set_phase("Capturing cooldown baseline...");
         let cooldown_start_lockfile =
             LockfileSnapshot::capture(&lockfile_path, &mut registry_store)?;
         let mut pass = 0usize;
         let mut next_metadata = None;
 
+        // Each successful pin can change Cargo's resolved graph, so the loop always
+        // restarts from metadata after Cargo accepts a new lockfile assignment.
         'outer: loop {
             pass += 1;
             let metadata = if let Some(metadata) = next_metadata.take() {
@@ -103,11 +137,20 @@ pub fn run_pinning_flow_with_snapshot(
                 );
                 metadata
             } else {
+                if pass == 1 {
+                    ui.set_phase("Reading Cargo metadata...");
+                }
                 timed_debug!("cargo metadata", { read_metadata(manifest, features) })?
             };
+            if pass == 1 {
+                ui.set_phase("Scanning dependency graph...");
+            }
             let snapshot = timed_debug!("snapshot from metadata", {
                 CargoSnapshot::from_metadata(metadata, workspace)
             })?;
+            if pass == 1 {
+                ui.set_phase("Inspecting release ages...");
+            }
             let state = timed_debug!("build resolution state", {
                 build_resolution_state(
                     &snapshot,
@@ -124,7 +167,12 @@ pub fn run_pinning_flow_with_snapshot(
             // current lockfile. If a successful pin changes a crate version, the next pass
             // should reconsider the new version instead of inheriting stale skip state.
             best_effort_skips.retain(|key, _| state.fresh_keys_present.contains(key));
-            retain_constraint_edges(&mut constraint_edges, &state.fresh_keys_present);
+            refresh_constraint_edges(
+                &mut constraint_edges,
+                &state.crate_states,
+                &state.requirement_origins,
+                &state.fresh_keys_present,
+            );
 
             debug!(
                 "cooldown: scan_summary registry_packages={} inspected={} fresh={} baseline_exempt={} best_effort_skipped={} skipped_registries={} exact_allowed={} zero_minutes={}",
@@ -152,6 +200,8 @@ pub fn run_pinning_flow_with_snapshot(
             let version_requirements = &state.version_requirements;
 
             if fresh_entries.is_empty() {
+                // Single-package pins cannot handle every exact-version bundle.
+                // Try one small coordinated pass before deciding whether mode should fail.
                 if !best_effort_fresh_entries.is_empty()
                     && attempt_coordinated_bundle_resolution(
                         &CoordinatedResolutionCtx {
@@ -419,7 +469,13 @@ fn emit_final_run_summary(ctx: &mut FinalRunSummaryCtx<'_>) -> Result<()> {
 fn enforce_final_report_policy(mode: Mode, report: &FinalFreshReport) -> Result<()> {
     if matches!(mode, Mode::Strict) && !report.resolver_constrained_fresh.is_empty() {
         bail!(
-            "strict mode blocked fresh versions that could not be cooled further:\n{}",
+            "strict mode blocked fresh versions that could not be cooled further:\n{}\n\n\
+             These versions are still inside the configured cooldown window after \
+             cargo-cooldown tried older Cargo-valid lockfile assignments. Strict mode \
+             restores the original Cargo.lock instead of keeping them.\n\n\
+             To keep Cargo's resolved lockfile and report these as warnings, use \
+             `COOLDOWN_MODE=best_effort` or `mode = \"best_effort\"`. To accept specific \
+             fresh releases intentionally, add `allow.package` or `allow.exact` rules.",
             format_fresh_notice_list(&report.resolver_constrained_fresh).join("\n")
         );
     }
@@ -992,17 +1048,60 @@ fn record_best_effort_skip(
     true
 }
 
-fn retain_constraint_edges(
+fn refresh_constraint_edges(
     constraint_edges: &mut HashMap<String, HashSet<String>>,
+    crate_states: &HashMap<PackageId, CrateState>,
+    requirement_origins: &HashMap<PackageId, Vec<RequirementOrigin>>,
     fresh_keys_present: &HashSet<String>,
 ) {
-    constraint_edges.retain(|key, neighbors| {
-        if !fresh_keys_present.contains(key) {
-            return false;
+    constraint_edges.clear();
+
+    // Coordinated bundle solving is intentionally narrow: only exact-version
+    // relationships are grouped, which avoids turning broad semver constraints
+    // into large expensive components.
+    let fresh_key_by_id = crate_states
+        .iter()
+        .filter_map(|(package_id, state)| {
+            let key = crate_failure_key(&state.source_id, &state.name, &state.current_version);
+            fresh_keys_present
+                .contains(&key)
+                .then(|| (package_id.clone(), key))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for (child_id, origins) in requirement_origins {
+        let Some(child_key) = fresh_key_by_id.get(child_id) else {
+            continue;
+        };
+
+        for origin in origins {
+            if !is_exact_requirement_text(&origin.requirement) {
+                continue;
+            }
+            let Some(parent_key) = fresh_key_by_id.get(&origin.parent_id) else {
+                continue;
+            };
+            if child_key == parent_key {
+                continue;
+            }
+            constraint_edges
+                .entry(child_key.clone())
+                .or_default()
+                .insert(parent_key.clone());
+            constraint_edges
+                .entry(parent_key.clone())
+                .or_default()
+                .insert(child_key.clone());
         }
-        neighbors.retain(|neighbor| fresh_keys_present.contains(neighbor));
-        !neighbors.is_empty()
-    });
+    }
+}
+
+fn is_exact_requirement_text(requirement: &str) -> bool {
+    VersionReq::parse(requirement).is_ok_and(|req| is_exact_requirement(&req))
+}
+
+fn is_exact_requirement(req: &VersionReq) -> bool {
+    req.comparators.len() == 1 && matches!(req.comparators[0].op, Op::Exact)
 }
 
 #[derive(Clone, Debug)]
@@ -1091,6 +1190,9 @@ impl LocalDependencyResolver {
         let mut package_keys_by_source_and_name: HashMap<(String, String), Vec<LocalPackageKey>> =
             HashMap::new();
 
+        // Keep both PackageId and source/name indexes. PackageId is precise for
+        // the current graph, while source/name is the fallback for index metadata
+        // that does not carry Cargo's resolved IDs.
         for key in locked_packages.keys() {
             package_keys_by_source_and_name
                 .entry(key.source_name())
@@ -1201,11 +1303,17 @@ struct LocalSearchBudget {
     estimated_space: usize,
 }
 
+/// Result of asking Cargo whether a rewritten lockfile assignment is valid.
 enum BatchPinOutcome {
     Applied { metadata: Box<Metadata> },
     Rejected { error: String },
 }
 
+/// Read-only inputs shared by the batch solver.
+///
+/// The solver does not own CLI state or configuration. It borrows the same
+/// manifest/workspace/features that Cargo will use, plus the current graph state
+/// and initial lockfile baseline needed to choose safe candidate versions.
 struct CooldownBatchSolverCtx<'a> {
     manifest: &'a Manifest,
     workspace: &'a Workspace,
@@ -1219,6 +1327,14 @@ struct CooldownBatchSolverCtx<'a> {
     now: DateTime<Utc>,
 }
 
+/// Try to cool many fresh crates with one validated lockfile rewrite.
+///
+/// For each fresh crate this builds a candidate pin from registry metadata,
+/// applies any baseline floor required by `lockfile_policy = "changed"`, asks
+/// the local dependency solver to add coupled transitive pins, and then validates
+/// the whole batch with Cargo. It returns fresh `cargo metadata` when Cargo
+/// accepted the assignment, or `None` when this pass should fall back to smaller
+/// later strategies.
 fn attempt_cooldown_batch_solver(
     ctx: &CooldownBatchSolverCtx<'_>,
     registry_store: &mut RegistryStore,
@@ -1300,6 +1416,12 @@ fn attempt_cooldown_batch_solver(
     apply_cooldown_batch_with_blocker_pruning(ctx, registry_store, pins)
 }
 
+/// Validate a batch assignment and retry after removing Cargo-reported blockers.
+///
+/// The input pins are optimistic: they may contain crates whose constraints make
+/// the batch impossible. Cargo's resolver diagnostics are used to remove those
+/// blockers and retry while progress stays meaningful. The returned metadata is
+/// the Cargo-accepted graph after a successful rewrite.
 fn apply_cooldown_batch_with_blocker_pruning(
     ctx: &CooldownBatchSolverCtx<'_>,
     registry_store: &mut RegistryStore,
@@ -1336,6 +1458,9 @@ fn apply_cooldown_batch_with_blocker_pruning(
                 if blocker_names.is_empty() {
                     return Ok(None);
                 }
+                // Cargo's resolver diagnostics identify packages that made the
+                // batch impossible. Prune those pins and retry the rest as one
+                // batch instead of falling back to one Cargo call per crate.
                 let blocker_signature =
                     blockers.iter().map(Blocker::label).collect::<BTreeSet<_>>();
                 if !seen_blocker_signatures.insert(blocker_signature) {
@@ -1412,6 +1537,12 @@ fn batch_pruning_progress_is_too_low(
     broad_batch && removed < expected_progress
 }
 
+/// Expand root pins into locally consistent dependency components.
+///
+/// The batch starts with crates that are fresh in the current lockfile. This
+/// helper reads local registry dependency metadata and pulls in any locked
+/// package that must move with those roots. Components are solved in memory first
+/// so Cargo only sees assignments that are likely to be coherent.
 fn solve_cooldown_batch_locally(
     ctx: &CooldownBatchSolverCtx<'_>,
     registry_store: &mut RegistryStore,
@@ -1486,6 +1617,12 @@ fn locked_packages_by_identity(
     packages
 }
 
+/// Build the search plans used by the local dependency solver.
+///
+/// The queue starts with root pins selected by cooldown. While planning their
+/// candidate versions, any dependency or reverse dependency that could be broken
+/// is added to the same planning set. The result is a map of package keys to the
+/// candidate versions the local search may try.
 fn build_local_solver_plans(
     ctx: &CooldownBatchSolverCtx<'_>,
     registry_store: &mut RegistryStore,
@@ -1541,6 +1678,9 @@ fn build_local_solver_plans(
                 if !root_names_by_key.contains_key(&dependency.key) && current_satisfies {
                     continue;
                 }
+                // If a candidate would require changing a dependency that was not
+                // part of the original pin set, pull that dependency into the same
+                // local component so Cargo sees a coherent assignment.
                 let requirement_added = record_local_required_requirement(
                     &mut required_requirements_by_key,
                     dependency.key.clone(),
@@ -1567,6 +1707,8 @@ fn build_local_solver_plans(
                 if requirement.matches(&candidate.parsed_version) {
                     continue;
                 }
+                // Reverse constraints matter too: lowering this candidate can break
+                // already-selected parents, so those parents must be planned with it.
                 let Some(parent_key) = dependency_resolver.key_for_package_id(&origin.parent_id)
                 else {
                     continue;
@@ -1612,6 +1754,12 @@ fn record_local_required_requirement(
     true
 }
 
+/// Build candidate versions for one locked package in a local solver component.
+///
+/// Root packages must move to an older cooldown-safe version. Non-root packages
+/// may stay where they are if their current version still satisfies all external
+/// requirements. The returned plan is `None` when registry metadata is missing or
+/// no candidate can satisfy the known constraints.
 fn build_local_solver_plan(
     ctx: &CooldownBatchSolverCtx<'_>,
     registry_store: &mut RegistryStore,
@@ -1640,6 +1788,8 @@ fn build_local_solver_plan(
     let mut seen_versions = HashSet::new();
     let mut current_candidate_available = false;
 
+    // Non-root packages may stay at their current version when that version still
+    // satisfies the external requirements. Root packages must pick an older pin.
     if !is_root
         && version_matches_requirements(&locked.current_version, &external_requirements)
         && let Ok(parsed_version) = Version::parse(&locked.current_version)
@@ -1979,6 +2129,8 @@ fn local_component_search_budget(
     component: &[LocalPackageKey],
     plans: &HashMap<LocalPackageKey, LocalSolverPlan>,
 ) -> LocalSearchBudget {
+    // Exhaustive search is cheap for small components and bounded for large ones.
+    // The floor avoids starving wide but still manageable dependency components.
     let estimated_space = capped_local_assignment_space(
         component,
         plans,
@@ -2339,6 +2491,11 @@ fn version_matches_requirements(version: &str, requirements: &[VersionReq]) -> b
         .all(|requirement| requirement.matches(&parsed))
 }
 
+/// Convert the initial lockfile version into a semver floor when policy requires it.
+///
+/// Under `lockfile_policy = "changed"`, an already locked version becomes the
+/// minimum acceptable candidate for the same crate and registry. Returning
+/// `None` means the current policy allows normal cooldown downgrades.
 fn baseline_floor_requirement(
     initial_lockfile: &LockfileSnapshot,
     config: &Config,
@@ -2350,6 +2507,8 @@ fn baseline_floor_requirement(
         return None;
     }
 
+    // Default policy treats the pre-run lockfile as the minimum effective
+    // version, preventing accidental downgrades of already locked packages.
     let floor =
         initial_lockfile
             .baseline()
@@ -2426,6 +2585,13 @@ struct CoordinatedResolutionCtx<'a> {
     now: DateTime<Utc>,
 }
 
+/// Try one bounded solve for fresh crates tied together by exact requirements.
+///
+/// Some packages cannot be cooled one at a time because they depend on each
+/// other with exact `=x.y.z` requirements. This receives the unresolved
+/// best-effort entries, groups connected exact-requirement components, searches a
+/// small compatible assignment, and applies it as one lockfile update. It returns
+/// `true` only when Cargo accepted a bundle and the outer loop should rescan.
 fn attempt_coordinated_bundle_resolution(
     ctx: &CoordinatedResolutionCtx<'_>,
     registry_store: &mut RegistryStore,
@@ -2543,6 +2709,12 @@ fn has_duplicate_crate_names(component: &[FreshCrate]) -> bool {
         .any(|entry| !seen.insert(entry.name.clone()))
 }
 
+/// Search compatible versions for one exact-requirement bundle.
+///
+/// The input component is already small and connected. For each member we collect
+/// cooldown-safe candidates, separate external constraints from internal bundle
+/// constraints, and backtrack over a bounded candidate space. The returned map is
+/// crate name to target version, or `None` when no coherent assignment is found.
 fn find_coordinated_assignment(
     registry_store: &mut RegistryStore,
     requirement_origins: &HashMap<PackageId, Vec<RequirementOrigin>>,
@@ -2560,6 +2732,8 @@ fn find_coordinated_assignment(
     let mut plans = Vec::with_capacity(component.len());
 
     for fresh in component {
+        // Requirements from inside the bundle are solved together; requirements
+        // from outside the bundle still constrain each member independently.
         let external_requirements = requirement_origins
             .get(&fresh.package_id)
             .map(|origins| {
@@ -2762,6 +2936,13 @@ fn apply_lockfile_pin_assignment(
     ))
 }
 
+/// Write a proposed pin assignment and ask Cargo to validate the result.
+///
+/// The current lockfile is captured first. After rewriting package versions and
+/// checksums, Cargo is run with `--locked`; if Cargo needs to refresh derived
+/// lockfile data, one unlocked metadata pass is allowed and then rechecked with
+/// `--locked`. Any rejection restores the captured lockfile and reports why the
+/// batch failed.
 fn apply_lockfile_pin_assignment_detailed(
     manifest: &Manifest,
     workspace: &Workspace,
@@ -2844,6 +3025,12 @@ fn apply_lockfile_pin_assignment_detailed(
     })
 }
 
+/// Rewrite only the package entries targeted by the selected pins.
+///
+/// The function receives exact current-version identities, so duplicate package
+/// names in the lockfile remain distinguishable. It updates version/checksum
+/// fields from local registry metadata and deduplicates entries that collapse to
+/// the same name/version/source after the rewrite.
 fn write_lockfile_pin_assignment(
     lockfile_path: &Path,
     registry_store: &mut RegistryStore,
@@ -3078,14 +3265,6 @@ impl Blocker {
 }
 
 #[cfg(test)]
-fn is_exact_requirement(req: &VersionReq) -> bool {
-    if req.comparators.len() != 1 {
-        return false;
-    }
-    matches!(req.comparators[0].op, semver::Op::Exact)
-}
-
-#[cfg(test)]
 fn find_manifest_dependency<'a>(
     deps: &'a [cargo_metadata::Dependency],
     dep_name: &str,
@@ -3152,6 +3331,7 @@ fn record_dependency_requirements(
     }
 }
 
+/// Unit tests for cooldown execution helpers and summary formatting.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3658,6 +3838,80 @@ mod tests {
             key,
             "different reason".to_string()
         ));
+    }
+
+    #[test]
+    fn refresh_constraint_edges_links_only_current_fresh_exact_dependencies() {
+        let source_id = "registry+https://github.com/rust-lang/crates.io-index";
+        let parent_id = PackageId {
+            repr: format!("{source_id}#parent@1.0.1"),
+        };
+        let child_id = PackageId {
+            repr: format!("{source_id}#child@1.0.1"),
+        };
+        let unrelated_id = PackageId {
+            repr: format!("{source_id}#unrelated@1.0.1"),
+        };
+        let state = |name: &str| CrateState {
+            name: name.to_string(),
+            source_id: source_id.to_string(),
+            current_version: "1.0.1".to_string(),
+            minimum_minutes: 60,
+            exact_allowed: false,
+            skipped: false,
+            baseline_exempt: false,
+        };
+        let crate_states = HashMap::from([
+            (parent_id.clone(), state("parent")),
+            (child_id.clone(), state("child")),
+            (unrelated_id.clone(), state("unrelated")),
+        ]);
+        let parent_key = crate_failure_key(source_id, "parent", "1.0.1");
+        let child_key = crate_failure_key(source_id, "child", "1.0.1");
+        let unrelated_key = crate_failure_key(source_id, "unrelated", "1.0.1");
+        let requirement_origins = HashMap::from([(
+            child_id.clone(),
+            vec![
+                RequirementOrigin {
+                    parent_id: parent_id.clone(),
+                    parent_name: "parent".to_string(),
+                    requirement: "=1.0.1".to_string(),
+                },
+                RequirementOrigin {
+                    parent_id: unrelated_id,
+                    parent_name: "unrelated".to_string(),
+                    requirement: "^1".to_string(),
+                },
+            ],
+        )]);
+        let mut constraint_edges =
+            HashMap::from([(unrelated_key.clone(), HashSet::from([parent_key.clone()]))]);
+
+        refresh_constraint_edges(
+            &mut constraint_edges,
+            &crate_states,
+            &requirement_origins,
+            &HashSet::from([parent_key.clone(), child_key.clone()]),
+        );
+
+        assert_eq!(
+            constraint_edges.get(&parent_key),
+            Some(&HashSet::from([child_key.clone()]))
+        );
+        assert_eq!(
+            constraint_edges.get(&child_key),
+            Some(&HashSet::from([parent_key.clone()]))
+        );
+        assert!(!constraint_edges.contains_key(&unrelated_key));
+
+        refresh_constraint_edges(
+            &mut constraint_edges,
+            &crate_states,
+            &requirement_origins,
+            &HashSet::from([child_key]),
+        );
+
+        assert!(constraint_edges.is_empty());
     }
 
     #[test]

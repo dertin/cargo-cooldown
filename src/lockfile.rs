@@ -1,3 +1,10 @@
+//! `Cargo.lock` snapshotting, restoration, and baseline indexing.
+//!
+//! Cooldown rewrites lockfiles speculatively, so every attempt starts from a
+//! snapshot that can be restored exactly. The same snapshot also records which
+//! registry versions were already present, allowing the default policy to avoid
+//! accidental downgrades of existing locked dependencies.
+
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::Path;
@@ -8,6 +15,11 @@ use serde::Deserialize;
 
 use crate::registry::{RegistryStore, is_registry_source};
 
+/// Captured lockfile contents plus the registry package baseline derived from them.
+///
+/// A snapshot is intentionally both bytes and meaning: the original file text is
+/// needed to restore the workspace exactly, while the parsed baseline is used by
+/// cooldown policy to understand which registry versions were already present.
 #[derive(Debug, Clone)]
 pub struct LockfileSnapshot {
     baseline: LockfileBaseline,
@@ -15,6 +27,12 @@ pub struct LockfileSnapshot {
 }
 
 impl LockfileSnapshot {
+    /// Read the current `Cargo.lock` and build the baseline index.
+    ///
+    /// Missing lockfiles are represented as an empty snapshot, not as an error.
+    /// Existing lockfiles are parsed only enough to index registry packages by
+    /// crate, effective registry URL, and version. The returned snapshot can be
+    /// queried during resolution and later restored byte-for-byte.
     pub fn capture(path: &Path, registry_store: &mut RegistryStore) -> Result<Self> {
         let contents = fs::read_to_string(path).ok();
         let baseline = LockfileBaseline::from_contents(contents.as_deref(), registry_store)?;
@@ -25,6 +43,12 @@ impl LockfileSnapshot {
         &self.baseline
     }
 
+    /// Restore the exact captured file state, including a missing lockfile.
+    ///
+    /// If the snapshot came from an existing file, that content is written back.
+    /// If the snapshot came from a missing lockfile, any generated lockfile is
+    /// removed. Callers use this after failed resolver attempts so users never
+    /// keep a partial cooldown rewrite.
     pub fn restore(&self, path: &Path) -> Result<()> {
         match &self.contents {
             Some(contents) => fs::write(path, contents)
@@ -36,6 +60,11 @@ impl LockfileSnapshot {
     }
 }
 
+/// Registry-package index used to protect or compare the initial lockfile state.
+///
+/// The index answers two policy questions quickly: whether an exact
+/// name/registry/version was already locked, and which already locked version is
+/// the newest floor below a current candidate.
 #[derive(Debug, Clone, Default)]
 pub struct LockfileBaseline {
     packages: HashSet<LockfilePackageKey>,
@@ -66,6 +95,8 @@ impl LockfileBaseline {
                 .clone();
             let name = package.name;
             let version = package.version;
+            // Keep a sorted parsed-version index so default policy can find the
+            // pre-run floor without reparsing the whole lockfile on each lookup.
             if let Ok(parsed_version) = Version::parse(&version) {
                 versions_by_package
                     .entry(name.clone())
@@ -94,11 +125,17 @@ impl LockfileBaseline {
         })
     }
 
+    /// Return whether this exact registry package existed in the captured lockfile.
     pub fn contains_registry_version(&self, name: &str, registry: &str, version: &str) -> bool {
         self.packages
             .contains(&LockfilePackageKey::new(name, registry, version))
     }
 
+    /// Find the newest captured version that is not greater than the current one.
+    ///
+    /// This is used as the effective minimum under the default lockfile policy:
+    /// cooldown may block future upgrades, but it should not downgrade versions
+    /// the user already had locked before the command started.
     pub fn newest_version_at_or_below(
         &self,
         name: &str,
@@ -107,10 +144,15 @@ impl LockfileBaseline {
     ) -> Option<Version> {
         let versions = self.versions_by_package.get(name)?.get(registry)?;
         let current = Version::parse(current_version).ok()?;
+        // Versions are sorted once at capture time, so the floor lookup stays O(log n).
         let index = versions.partition_point(|version| version <= &current);
         index.checked_sub(1).map(|index| versions[index].clone())
     }
 
+    /// Return a human-oriented inventory grouped by crate name and registry URL.
+    ///
+    /// Final summaries compare inventories from the initial and final snapshots
+    /// to explain which versions were added, removed, downgraded, or preserved.
     pub fn version_inventory(&self) -> BTreeMap<(String, String), Vec<String>> {
         let mut inventory = BTreeMap::new();
 
@@ -155,6 +197,7 @@ struct RawLockfilePackage {
     source: Option<String>,
 }
 
+/// Unit tests for lockfile baseline capture and restoration.
 #[cfg(test)]
 mod tests {
     use super::*;

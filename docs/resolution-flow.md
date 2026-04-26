@@ -1,4 +1,7 @@
-# How Resolution Works Today
+# Resolution Flow
+
+This is the implementation reference. Start with
+[Configuration](configuration.md) if you only need to choose settings.
 
 `cargo-cooldown` runs as an outer Cargo loop.
 
@@ -191,13 +194,13 @@ left out of the next freshness queue instead of ending in a generic fixed-point
 error immediately.
 
 Before giving up on the remaining best-effort set, cooldown runs one more
-bounded pass for small resolver-constrained bundles. It groups fresh crates that
-kept blocking each other, searches a small set of mutually compatible older
-versions using local index dependency metadata, rewrites that bundle in
-`Cargo.lock` as one coordinated candidate state, and asks Cargo to validate the
-result. This helps for tightly coupled stacks such as `js-sys` /
-`wasm-bindgen*` / `web-sys`, where no single-package downgrade can make progress
-from the current lockfile but a coordinated older bundle is still valid.
+bounded pass for small resolver-constrained bundles linked by exact version
+requirements. It searches a small set of mutually compatible older versions
+using local index dependency metadata, rewrites that bundle in `Cargo.lock` as
+one coordinated candidate state, and asks Cargo to validate the result. This
+helps for tightly coupled stacks such as `js-sys` / `wasm-bindgen*` / `web-sys`,
+where no single-package downgrade can make progress from the current lockfile
+but a coordinated older bundle is still valid.
 
 At the end of the run, cooldown emits one user-facing summary block. For cooled
 packages, it renders Cargo-style lines from the initial `Cargo.lock` version to

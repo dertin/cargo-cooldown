@@ -1,14 +1,32 @@
+//! CLI entry point for the `cargo cooldown` wrapper.
+//!
+//! This file handles argument normalization, configuration discovery, the
+//! `cargo cooldown init` command, and forwarding normal Cargo commands after the
+//! cooldown guard has prepared or validated the lockfile.
+
+/// Parses and merges allow rules from `cooldown.toml`.
 mod allow_rules;
+/// Provides a small JSON cache for registry API fallback responses.
 mod cache;
+/// Loads configuration from files and environment variables.
 mod config;
+/// Runs the cooldown lockfile rewrite and validation loop.
 mod executor;
+/// Implements the interactive `cargo cooldown init` setup wizard.
 mod init;
+/// Captures, restores, and indexes `Cargo.lock` baselines.
 mod lockfile;
+/// Wraps `cargo metadata` invocations.
 mod metadata;
+/// Discovers the active Cargo project, workspace, and member config paths.
 mod project;
+/// Resolves registries and reads release metadata from indexes or APIs.
 mod registry;
+/// Builds the cooldown view of Cargo's resolved dependency graph.
 mod resolution_state;
+/// Selects compatible older releases from a registry timeline.
 mod resolver;
+/// Owns terminal progress, status formatting, and color behavior.
 mod ui;
 
 use std::ffi::OsString;
@@ -24,6 +42,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::Mode;
 use crate::project::ProjectContext;
+use crate::ui::PhaseStatus;
 
 #[derive(Debug, Parser)]
 #[command(bin_name = "cargo")]
@@ -74,6 +93,12 @@ fn init_logging(verbose: bool) {
         .try_init();
 }
 
+/// Parse CLI arguments in both `cargo cooldown ...` and direct binary forms.
+///
+/// Cargo subcommands receive a leading `cooldown` token, while direct test or
+/// development invocations may not. This normalizes those shapes, detects the
+/// common `cargo cooldown init <path>` confusion early, and returns the parsed
+/// command state used by the rest of the program.
 fn parse_cli(raw_args: &[OsString]) -> Cli {
     let user_args = raw_user_args(raw_args);
     let (_, cargo_args) = hoist_cargo_selectors(user_args);
@@ -99,6 +124,12 @@ fn raw_user_args(raw_args: &[OsString]) -> &[OsString] {
     }
 }
 
+/// Normalize user arguments into the shape expected by clap.
+///
+/// Cargo allows package, workspace, manifest, and feature selectors in flexible
+/// positions. clap-cargo expects those selectors before the external Cargo
+/// subcommand, so this function hoists them while preserving the forwarded Cargo
+/// command and trailing arguments.
 fn normalize_cli_args(raw_args: &[OsString]) -> Vec<OsString> {
     let Some(binary) = raw_args.first() else {
         return Vec::new();
@@ -115,6 +146,11 @@ fn normalize_cli_args(raw_args: &[OsString]) -> Vec<OsString> {
     normalized
 }
 
+/// Split top-level Cargo selectors from the forwarded Cargo command.
+///
+/// The input is the user-facing argument list after the optional `cooldown`
+/// token. The return value is `(selectors, cargo_args)`: selectors are parsed by
+/// this wrapper, and `cargo_args` are passed back to Cargo after cooldown runs.
 fn hoist_cargo_selectors(args: &[OsString]) -> (Vec<OsString>, Vec<OsString>) {
     let mut selectors = Vec::new();
     let mut cargo_args = Vec::new();
@@ -144,6 +180,8 @@ fn hoist_cargo_selectors(args: &[OsString]) -> (Vec<OsString>, Vec<OsString>) {
         }
 
         if let Some(consumed) = selector_width(arg_str) {
+            // clap-cargo expects selectors before the external subcommand, while
+            // users often type them in Cargo's flexible order after the command.
             selectors.push(arg.clone());
             if consumed == 2 {
                 if let Some(value) = args.get(index + 1) {
@@ -220,6 +258,12 @@ fn is_update_command(cargo_args: &[OsString]) -> bool {
 /// Canonicalize the Cargo invocation so the subcommand leads and the selectors
 /// parsed by clap-cargo (`--manifest-path`, `--package`, feature flags, etc.)
 /// are re-applied in the order that upstream `cargo` expects.
+/// Rebuild the Cargo command that should run after cooldown processing.
+///
+/// The parsed wrapper state is converted back into normal Cargo flags, including
+/// manifest path, workspace selectors, and feature selectors. The returned vector
+/// is passed directly to `cargo`, so the original subcommand and its trailing
+/// arguments stay under Cargo's control.
 fn assemble_cargo_args(cli: &Cli, cargo_args: &[OsString]) -> Vec<OsString> {
     let mut args = Vec::new();
     let mut cargo_iter = cargo_args.iter();
@@ -297,21 +341,40 @@ fn write_captured_output(output: &Output) {
     }
 }
 
-fn run_initial_cargo_update(forwarded_args: &[OsString]) -> Result<std::process::ExitStatus> {
+/// Run the user's initial `cargo update` before applying cooldown.
+///
+/// `cargo cooldown update` first lets Cargo compute the newest valid graph for
+/// the user's manifests and selectors. Its output is captured so the progress UI
+/// stays clean; output is replayed only when Cargo itself fails. The returned
+/// status decides whether cooldown should continue.
+fn run_initial_cargo_update(
+    forwarded_args: &[OsString],
+    phase: &PhaseStatus,
+) -> Result<std::process::ExitStatus> {
     debug!("refreshing lockfile via cargo update before applying cooldown");
+    phase.set_message("Running cargo update...");
     let started = Instant::now();
+    // Capture Cargo's output so the cooldown progress UI does not interleave with it.
     let output = Command::new("cargo").args(forwarded_args).output()?;
     debug!(
         target: "cargo_cooldown::timing",
         elapsed_ms = started.elapsed().as_millis(),
         "cooldown timing: initial cargo update"
     );
+    phase.finish();
     if !output.status.success() {
         write_captured_output(&output);
     }
     Ok(output.status)
 }
 
+/// Program entry point.
+///
+/// The command either runs the setup wizard or forwards a Cargo command through
+/// cooldown. For `cargo cooldown update`, Cargo updates first, then cooldown
+/// cools the resulting lockfile from the pre-update baseline. Other Cargo
+/// commands run cooldown first when it is enabled, then execute Cargo with the
+/// prepared lockfile.
 fn main() -> Result<()> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = parse_cli(&raw_args);
@@ -341,8 +404,10 @@ fn main() -> Result<()> {
             }
 
             if is_update_command(cargo_args) {
+                let phase = PhaseStatus::new(config.verbose);
+                phase.set_message("Capturing lockfile baseline...");
                 let initial_lockfile = executor::capture_initial_lockfile(&config, &cli.manifest)?;
-                let status = run_initial_cargo_update(&forwarded_args)?;
+                let status = run_initial_cargo_update(&forwarded_args, &phase)?;
                 if !status.success() {
                     exit_with(status.code().unwrap_or(1));
                 }
@@ -398,6 +463,7 @@ fn main() -> Result<()> {
     }
 }
 
+/// Unit tests for CLI parsing and forwarded Cargo argument assembly.
 #[cfg(test)]
 mod tests {
     use super::{

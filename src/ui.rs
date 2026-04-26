@@ -1,3 +1,5 @@
+//! Terminal output helpers for progress indicators and Cargo-style status lines.
+
 use std::env;
 use std::io::IsTerminal;
 use std::time::Duration;
@@ -11,6 +13,7 @@ const ANSI_BOLD_RED: &str = "\x1b[1;31m";
 const ANSI_BOLD_YELLOW: &str = "\x1b[1;33m";
 const ANSI_RESET: &str = "\x1b[0m";
 
+/// Status categories used to render final lockfile change summaries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StatusKind {
     Adding,
@@ -45,6 +48,12 @@ impl StatusKind {
     }
 }
 
+/// Long-lived UI handle for the cooldown resolver phase.
+///
+/// The executor creates this after configuration is loaded and uses it while the
+/// dependency graph is being inspected and cooled. It owns terminal capability
+/// decisions so resolver code can report phases and counts without knowing
+/// whether output is interactive, colored, or quiet.
 pub struct UserOutput {
     progress: Option<ProgressBar>,
     progress_total: usize,
@@ -52,13 +61,18 @@ pub struct UserOutput {
 }
 
 impl UserOutput {
+    /// Create progress output according to terminal and verbosity settings.
+    ///
+    /// Verbose mode disables spinners so debug logs remain readable. Non-TTY
+    /// output also disables progress animation and leaves only stable status
+    /// lines for scripts or CI logs.
     pub fn new(verbose: bool) -> Self {
         let interactive = std::io::stderr().is_terminal();
         let use_color = colors_enabled(interactive);
         let progress = progress_enabled(interactive, verbose).then(|| {
-            let progress = ProgressBar::new(0);
+            let progress = ProgressBar::new_spinner();
             progress.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
-            progress.set_style(progress_style(use_color));
+            progress.set_style(phase_style(use_color));
             progress.enable_steady_tick(Duration::from_millis(120));
             progress
         });
@@ -70,6 +84,19 @@ impl UserOutput {
         }
     }
 
+    /// Show a phase message before a numeric progress total is known.
+    pub fn set_phase(&self, message: &str) {
+        if let Some(progress) = &self.progress {
+            progress.set_style(phase_style(self.use_color));
+            progress.set_message(message.to_string());
+        }
+    }
+
+    /// Update the resolver progress bar from the latest scan summary.
+    ///
+    /// `unresolved_fresh` is the active work remaining. The total is kept as the
+    /// maximum seen in this run so later passes can move the bar forward without
+    /// shrinking it when Cargo's graph changes.
     pub fn update_resolver_progress(
         &mut self,
         pass: usize,
@@ -87,6 +114,7 @@ impl UserOutput {
             return;
         }
 
+        progress.set_style(progress_style(self.use_color));
         progress.set_length(self.progress_total as u64);
         progress.set_position(self.progress_total.saturating_sub(unresolved_fresh) as u64);
         progress.set_message(format!(
@@ -102,6 +130,54 @@ impl UserOutput {
 
     pub fn use_color(&self) -> bool {
         self.use_color
+    }
+}
+
+/// Short-lived spinner used before a full progress total is known.
+///
+/// This is used around pre-scan work such as capturing the baseline or running
+/// the initial `cargo update`. It clears itself on drop so early returns do not
+/// leave stale spinner lines in the terminal.
+pub struct PhaseStatus {
+    progress: Option<ProgressBar>,
+    use_color: bool,
+}
+
+impl PhaseStatus {
+    pub fn new(verbose: bool) -> Self {
+        let interactive = std::io::stderr().is_terminal();
+        let use_color = colors_enabled(interactive);
+        let progress = progress_enabled(interactive, verbose).then(|| {
+            let progress = ProgressBar::new_spinner();
+            progress.set_draw_target(ProgressDrawTarget::stderr_with_hz(10));
+            progress.set_style(phase_style(use_color));
+            progress.enable_steady_tick(Duration::from_millis(120));
+            progress
+        });
+
+        Self {
+            progress,
+            use_color,
+        }
+    }
+
+    pub fn set_message(&self, message: &str) {
+        if let Some(progress) = &self.progress {
+            progress.set_style(phase_style(self.use_color));
+            progress.set_message(message.to_string());
+        }
+    }
+
+    pub fn finish(&self) {
+        if let Some(progress) = &self.progress {
+            progress.finish_and_clear();
+        }
+    }
+}
+
+impl Drop for PhaseStatus {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -149,6 +225,17 @@ fn progress_style(use_color: bool) -> ProgressStyle {
         .progress_chars("=>-")
 }
 
+fn phase_style(use_color: bool) -> ProgressStyle {
+    let template = if use_color {
+        "{spinner:.green} {msg}"
+    } else {
+        "{spinner} {msg}"
+    };
+
+    ProgressStyle::with_template(template).expect("phase progress template should be valid")
+}
+
+/// Unit tests for stable user-facing status formatting.
 #[cfg(test)]
 mod tests {
     use super::{StatusKind, format_status_line};
