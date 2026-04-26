@@ -1,8 +1,4 @@
-use std::process::Command;
-
-use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
-use clap_cargo::Manifest;
 use semver::{Version, VersionReq};
 
 use crate::registry::{Release, ReleaseTimeline};
@@ -94,35 +90,6 @@ where
     }
 
     candidates
-}
-
-#[derive(Debug)]
-pub enum PinOutcome {
-    Applied,
-    Rejected { stdout: String, stderr: String },
-}
-
-pub fn try_pin_precise(
-    manifest: &Manifest,
-    name: &str,
-    current: &str,
-    version: &str,
-) -> Result<PinOutcome> {
-    let spec = format!("{name}@{current}");
-    let mut command = Command::new("cargo");
-    command.arg("update");
-    if let Some(path) = &manifest.manifest_path {
-        command.arg("--manifest-path").arg(path);
-    }
-    let output = command.args(["-p", &spec, "--precise", version]).output()?;
-    if output.status.success() {
-        Ok(PinOutcome::Applied)
-    } else {
-        Ok(PinOutcome::Rejected {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    }
 }
 
 #[cfg(test)]

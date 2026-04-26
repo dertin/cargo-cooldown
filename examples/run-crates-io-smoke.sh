@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_DIR=$(cd "${ROOT_DIR}/.." && pwd)
-WORKSPACE_DIR="${ROOT_DIR}/demo"
+WORKSPACE_DIR="${ROOT_DIR}/crates-io-smoke-workspace"
 CONFIG_FILE="${WORKSPACE_DIR}/cooldown.toml"
 CARGO_SUBCOMMAND=${CARGO_SUBCOMMAND:-build}
 
@@ -21,14 +21,6 @@ resolve_local_binary() {
   cargo build --quiet --manifest-path "${REPO_DIR}/Cargo.toml"
   printf '%s/debug/cargo-cooldown' "${target_dir}"
 }
-
-if [[ -n ${CMD:-} ]]; then
-  CMD_BIN="${CMD}"
-  echo "Using override command: ${CMD_BIN}" >&2
-else
-  CMD_BIN=$(resolve_local_binary)
-  echo "Using local cargo-cooldown binary built from current sources: ${CMD_BIN}" >&2
-fi
 
 CMD_ARGS=()
 
@@ -70,16 +62,17 @@ run_case_with_appended_config() {
 
 usage() {
   cat <<'USAGE'
-Usage: ./smoke-test-crates-io.sh [CASE ...]
+Usage: ./examples/run-crates-io-smoke.sh [CASE ...]
 
 Run smoke-test scenarios for cargo-cooldown against the current crates.io
 state. This is intentionally non-deterministic and meant only as a quick
 manual check of the public workflow.
 
 Available CASE values:
-  allow-rules      Append package-scoped allow rules to the demo config for one
-                   run, showing mixed per-crate cooldown overrides.
-  warn-mode        Keep cooldown enabled, but continue the Cargo command if
+  allow-rules      Append package-scoped allow rules to the smoke workspace
+                   config for one run, showing mixed per-crate cooldown
+                   overrides.
+  best-effort      Keep cooldown enabled, but continue the Cargo command if
                    cooldown resolution fails.
   skip-crates-io   Skip crates.io entirely through COOLDOWN_SKIP_REGISTRIES
                    and verify that cooldown does not inspect registry packages.
@@ -94,7 +87,7 @@ if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
 fi
 
 if [[ ${CARGO_SUBCOMMAND} == "update" ]]; then
-  echo "This smoke script focuses on build/check-style scenarios. For lockfile refreshes under cooldown, run 'cargo cooldown update' directly in the demo workspace instead." >&2
+  echo "This smoke script focuses on build/check-style scenarios. For lockfile refreshes under cooldown, run 'cargo cooldown update' directly in the smoke workspace instead." >&2
   exit 1
 fi
 
@@ -104,11 +97,19 @@ if [[ ! -d "${WORKSPACE_DIR}" ]]; then
 fi
 
 if [[ ! -f "${CONFIG_FILE}" ]]; then
-  echo "Expected demo configuration at ${CONFIG_FILE}" >&2
+  echo "Expected smoke workspace configuration at ${CONFIG_FILE}" >&2
   exit 1
 fi
 
-SELECTED=("allow-rules" "warn-mode" "skip-crates-io" "aggressive-ttl")
+if [[ -n ${CMD:-} ]]; then
+  CMD_BIN="${CMD}"
+  echo "Using override command: ${CMD_BIN}" >&2
+else
+  CMD_BIN=$(resolve_local_binary)
+  echo "Using local cargo-cooldown binary built from current sources: ${CMD_BIN}" >&2
+fi
+
+SELECTED=("allow-rules" "best-effort" "skip-crates-io" "aggressive-ttl")
 if [[ $# -gt 0 ]]; then
   SELECTED=("$@")
 fi
@@ -123,12 +124,12 @@ for case_name in "${SELECTED[@]}"; do
         $'[[allow.package]]\ncrate = "chrono"\nminutes = 60\n\n[[allow.package]]\ncrate = "serde_json"\nminutes = 0' \
         COOLDOWN_MINUTES=131401
       ;;
-    warn-mode)
+    best-effort)
       run_case \
-        "warn-mode" \
+        "best-effort" \
         "Cooldown is active, but any cooldown failure is downgraded to a warning and the Cargo command still runs." \
         yes \
-        COOLDOWN_MODE=warn
+        COOLDOWN_MODE=best_effort
       ;;
     skip-crates-io)
       run_case \

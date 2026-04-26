@@ -3,12 +3,14 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 #[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq)]
-pub struct Allowlist {
+#[serde(deny_unknown_fields)]
+pub struct AllowRules {
     #[serde(default)]
     pub allow: AllowSection,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AllowSection {
     #[serde(default)]
     pub exact: Vec<AllowExact>,
@@ -18,6 +20,7 @@ pub struct AllowSection {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AllowExact {
     #[serde(rename = "crate")]
     pub crate_name: String,
@@ -25,24 +28,22 @@ pub struct AllowExact {
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AllowPackage {
     #[serde(rename = "crate")]
     pub crate_name: String,
-    #[serde(default)]
-    pub minimum_release_age: Option<u64>,
     #[serde(default)]
     pub minutes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AllowGlobal {
-    #[serde(default)]
-    pub minimum_release_age: Option<u64>,
     #[serde(default)]
     pub minutes: Option<u64>,
 }
 
-impl Allowlist {
+impl AllowRules {
     #[cfg(test)]
     pub fn merged(base: &Self, overlay: &Self) -> Self {
         let mut merged = base.clone();
@@ -65,15 +66,12 @@ impl Allowlist {
         self.allow
             .package
             .iter()
-            .filter_map(|pkg| pkg.effective_minutes().map(|m| (pkg.crate_name.clone(), m)))
+            .filter_map(|pkg| pkg.minutes.map(|minutes| (pkg.crate_name.clone(), minutes)))
             .collect()
     }
 
     pub fn global_minutes(&self) -> Option<u64> {
-        self.allow
-            .global
-            .as_ref()
-            .and_then(AllowGlobal::effective_minutes)
+        self.allow.global.as_ref().and_then(|global| global.minutes)
     }
 
     #[cfg(test)]
@@ -83,7 +81,7 @@ impl Allowlist {
             effective = effective.min(global);
         }
         if let Some(rule) = self.allow.package.iter().find(|pkg| pkg.crate_name == name)
-            && let Some(minutes) = rule.effective_minutes()
+            && let Some(minutes) = rule.minutes
         {
             effective = effective.min(minutes);
         }
@@ -120,25 +118,13 @@ impl AllowSection {
     }
 }
 
-impl AllowPackage {
-    pub fn effective_minutes(&self) -> Option<u64> {
-        self.minimum_release_age.or(self.minutes)
-    }
-}
-
-impl AllowGlobal {
-    pub fn effective_minutes(&self) -> Option<u64> {
-        self.minimum_release_age.or(self.minutes)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn merged_allowlist_deduplicates_exact_and_overrides_package_minutes() {
-        let base = Allowlist {
+    fn merged_allow_rules_deduplicates_exact_and_overrides_package_minutes() {
+        let base = AllowRules {
             allow: AllowSection {
                 exact: vec![AllowExact {
                     crate_name: "foo".to_string(),
@@ -146,16 +132,12 @@ mod tests {
                 }],
                 package: vec![AllowPackage {
                     crate_name: "bar".to_string(),
-                    minimum_release_age: Some(10),
-                    minutes: None,
+                    minutes: Some(10),
                 }],
-                global: Some(AllowGlobal {
-                    minimum_release_age: Some(60),
-                    minutes: None,
-                }),
+                global: Some(AllowGlobal { minutes: Some(60) }),
             },
         };
-        let overlay = Allowlist {
+        let overlay = AllowRules {
             allow: AllowSection {
                 exact: vec![
                     AllowExact {
@@ -169,17 +151,13 @@ mod tests {
                 ],
                 package: vec![AllowPackage {
                     crate_name: "bar".to_string(),
-                    minimum_release_age: Some(5),
-                    minutes: None,
+                    minutes: Some(5),
                 }],
-                global: Some(AllowGlobal {
-                    minimum_release_age: Some(30),
-                    minutes: None,
-                }),
+                global: Some(AllowGlobal { minutes: Some(30) }),
             },
         };
 
-        let merged = Allowlist::merged(&base, &overlay);
+        let merged = AllowRules::merged(&base, &overlay);
 
         assert!(merged.is_exact_allowed("foo", "1.2.3"));
         assert!(merged.is_exact_allowed("baz", "9.9.9"));
@@ -190,22 +168,20 @@ mod tests {
 
     #[test]
     fn package_rule_can_disable_cooldown_for_one_crate() {
-        let allowlist = Allowlist {
+        let allow_rules = AllowRules {
             allow: AllowSection {
                 exact: Vec::new(),
                 package: vec![AllowPackage {
                     crate_name: "tokio".to_string(),
-                    minimum_release_age: None,
                     minutes: Some(0),
                 }],
                 global: Some(AllowGlobal {
-                    minimum_release_age: Some(1440),
-                    minutes: None,
+                    minutes: Some(1440),
                 }),
             },
         };
 
-        assert_eq!(allowlist.effective_minutes_for("tokio", 1440), 0);
-        assert_eq!(allowlist.effective_minutes_for("serde", 1440), 1440);
+        assert_eq!(allow_rules.effective_minutes_for("tokio", 1440), 0);
+        assert_eq!(allow_rules.effective_minutes_for("serde", 1440), 1440);
     }
 }

@@ -45,14 +45,9 @@ Migration guide:
 
 ### Breaking changes
 
-- `COOLDOWN_REGISTRY_INDEX`, `COOLDOWN_REGISTRY_API`, and
-  `COOLDOWN_OFFLINE_OK` are replaced by the current registry-aware model; see
-  the [Migration Guide](docs/migration-guide.md)
-- `cooldown-allowlist.toml`, `allowlist_path`, and
-  `COOLDOWN_ALLOWLIST_PATH` were removed in favor of one `cooldown.toml`
-- default cooldown behavior now respects the initial `Cargo.lock` baseline
-  unless `lockfile_policy = "all"` is enabled
-- `mode` now accepts only `strict`, `best_effort`, or `off`
+Configuration, registry discovery, allow rules, lockfile baseline handling, and
+mode names changed in this release. See the [Migration Guide](docs/migration-guide.md)
+for the upgrade steps.
 
 ### Fixed
 

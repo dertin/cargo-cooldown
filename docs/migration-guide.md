@@ -62,6 +62,10 @@ minutes = 60
 minutes = 1440
 ```
 
+If an existing rule uses `minimum_release_age`, rename that key to `minutes`.
+Use lowercase TOML keys such as `cooldown_minutes`; environment variable names
+are only accepted from the environment.
+
 For workspaces, put shared rules in the workspace root file and use
 member-local `cooldown.toml` overrides only for uniquely targeted member runs.
 
@@ -141,8 +145,8 @@ See also:
 - configuration discovery now starts from the effective Cargo root instead of
   implicitly following the current directory;
 - allow rules now live inside `cooldown.toml`;
-- `--manifest-path` is honored during both cooldown inspection and
-  `cargo update --precise` pinning;
+- `--manifest-path` is honored during cooldown inspection, batch validation,
+  and the forwarded Cargo command;
 - Cargo-style selectors such as `--manifest-path`, `--package`, `--workspace`,
   `--exclude`, and feature flags are accepted even when passed after the
   forwarded Cargo subcommand.

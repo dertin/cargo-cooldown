@@ -8,7 +8,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -45,9 +45,29 @@ const BUNDLE_OLD_VERSION: &str = "1.0.0";
 const BUNDLE_FRESH_VERSION: &str = "1.1.0";
 const BUNDLE_OLD_PUBTIME: &str = "2026-03-01T00:00:00Z";
 const BUNDLE_FRESH_PUBTIME: &str = "2026-04-02T12:00:00Z";
+const BACKTRACK_LEFT_NAME: &str = "backtrackleft";
+const BACKTRACK_RIGHT_NAME: &str = "backtrackright";
+const BACKTRACK_SHARED_NAME: &str = "backtrackshared";
+const BACKTRACK_OLD_VERSION: &str = "1.0.0";
+const BACKTRACK_COMPAT_VERSION: &str = "1.1.0";
+const BACKTRACK_CONFLICT_VERSION: &str = "1.2.0";
+const BACKTRACK_FRESH_VERSION: &str = "1.3.0";
+const DUP_ROOT_A_NAME: &str = "dupuserone";
+const DUP_ROOT_B_NAME: &str = "dupusertwo";
+const DUP_SHARED_NAME: &str = "dupshared";
+const DUP_V1_OLD_VERSION: &str = "1.0.0";
+const DUP_V1_FRESH_VERSION: &str = "1.0.1";
+const DUP_V2_OLD_VERSION: &str = "2.0.0";
+const DUP_V2_FRESH_VERSION: &str = "2.0.1";
+const DUP_PARENT_OLD_VERSION: &str = "1.0.0";
+const DUP_PARENT_FRESH_VERSION: &str = "1.1.0";
+const DUP_TRANSITIVE_CURRENT_PUBTIME: &str = "2026-03-15T00:00:00Z";
+const BASELINE_FLOOR_NAME: &str = "baselinefloor";
+const BASELINE_USER_NAME: &str = "baselineuser";
 const SCOPED_CONFLICT_NAME: &str = "scopedfresh";
 const SCOPED_MEMBER_A: &str = "member-a";
 const SCOPED_MEMBER_B: &str = "member-b";
+const BENCHMARK_CRATE_COUNT: usize = 24;
 
 #[test]
 fn existing_lockfile_fresh_dependency_is_ignored_by_default() {
@@ -340,7 +360,7 @@ fn workspace_member_manifest_generates_workspace_root_lockfile_when_missing() {
 }
 
 #[test]
-fn exact_allowlist_keeps_fresh_version_pinned() {
+fn exact_allow_rule_keeps_fresh_version_pinned() {
     let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
     harness.generate_lockfile();
     let config = harness.workspace_dir.join("cooldown.toml");
@@ -355,7 +375,7 @@ fn exact_allowlist_keeps_fresh_version_pinned() {
     let output = harness.run_cooldown(&[]);
     assert!(
         output.status.success(),
-        "exact allowlist should bypass cooldown for the pinned version: {}",
+        "exact allow rule should bypass cooldown for the pinned version: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), FRESH_VERSION);
@@ -526,6 +546,140 @@ fn cooldown_update_can_restore_a_fresh_baseline_version() {
 }
 
 #[test]
+fn cooldown_update_does_not_downgrade_existing_fresh_lockfile_versions() {
+    assert_cooldown_update_with_existing_fresh_lockfile_version(&[], false);
+}
+
+#[test]
+fn cooldown_update_all_policy_can_cool_existing_lockfile_versions() {
+    assert_cooldown_update_with_existing_fresh_lockfile_version(&[LOCKFILE_POLICY_ALL], true);
+}
+
+fn assert_cooldown_update_with_existing_fresh_lockfile_version(
+    extra_env: &[(&str, &str)],
+    expect_success: bool,
+) {
+    let temp_dir = tempdir().expect("tempdir should build");
+    let temp_root = temp_dir.path().to_path_buf();
+    let cargo_home = temp_root.join("cargo-home");
+    let workspace_dir = temp_root.join("workspace");
+    let server = RegistryServer::with_crates(
+        vec![
+            PublishedCrate::new(
+                BASELINE_FLOOR_NAME,
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                ],
+            ),
+            PublishedCrate::new(
+                BASELINE_USER_NAME,
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false).with_dependencies(
+                        vec![RegistryDependency::exact(BASELINE_FLOOR_NAME, OLD_VERSION)],
+                    ),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false)
+                        .with_dependencies(vec![RegistryDependency::exact(
+                            BASELINE_FLOOR_NAME,
+                            FRESH_VERSION,
+                        )]),
+                ],
+            ),
+        ],
+        false,
+    )
+    .expect("registry should build");
+
+    fs::create_dir_all(&cargo_home).expect("cargo home should exist");
+    create_workspace_with_dependency(
+        &workspace_dir,
+        &server,
+        BASELINE_FLOOR_NAME,
+        &format!("={FRESH_VERSION}"),
+    )
+    .expect("workspace should build");
+    write_registry_config(&cargo_home, &server).expect("registry config should write");
+
+    let output = Command::new("cargo")
+        .arg("generate-lockfile")
+        .current_dir(&workspace_dir)
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_TERM_PROGRESS_WHEN", "never")
+        .output()
+        .expect("cargo generate-lockfile should run");
+    assert!(
+        output.status.success(),
+        "lockfile generation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let baseline_lockfile =
+        fs::read_to_string(workspace_dir.join("Cargo.lock")).expect("lockfile should exist");
+    assert_eq!(
+        parse_lockfile_version(&baseline_lockfile, BASELINE_FLOOR_NAME).as_deref(),
+        Some(FRESH_VERSION)
+    );
+    assert!(
+        parse_lockfile_version(&baseline_lockfile, BASELINE_USER_NAME).is_none(),
+        "new dependency should not exist in the baseline lockfile"
+    );
+
+    write_root_manifest(
+        &workspace_dir,
+        &[(BASELINE_FLOOR_NAME, "1"), (BASELINE_USER_NAME, "1")],
+    )
+    .expect("manifest should update");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+    command
+        .arg("update")
+        .current_dir(&workspace_dir)
+        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_TERM_PROGRESS_WHEN", "never")
+        .env("COOLDOWN_NOW", NOW)
+        .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+        .env("COOLDOWN_HTTP_RETRIES", "0")
+        .env("COOLDOWN_VERBOSE", "true");
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let output = command.output().expect("cargo-cooldown should run");
+
+    let final_lockfile =
+        fs::read_to_string(workspace_dir.join("Cargo.lock")).expect("lockfile should exist");
+    if expect_success {
+        assert!(
+            output.status.success(),
+            "all policy should cool both existing and newly introduced fresh versions: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            parse_lockfile_version(&final_lockfile, BASELINE_FLOOR_NAME).as_deref(),
+            Some(OLD_VERSION)
+        );
+        assert_eq!(
+            parse_lockfile_version(&final_lockfile, BASELINE_USER_NAME).as_deref(),
+            Some(OLD_VERSION)
+        );
+    } else {
+        assert!(
+            !output.status.success(),
+            "strict cooldown should reject adding a fresh dependency when the only cool candidate downgrades an existing lockfile version: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(final_lockfile, baseline_lockfile);
+        assert_eq!(
+            parse_lockfile_version(&final_lockfile, BASELINE_FLOOR_NAME).as_deref(),
+            Some(FRESH_VERSION)
+        );
+        assert!(
+            parse_lockfile_version(&final_lockfile, BASELINE_USER_NAME).is_none(),
+            "failed strict update should restore the pre-update lockfile"
+        );
+    }
+}
+
+#[test]
 fn coordinated_bundle_resolution_cools_exactly_coupled_transitives() {
     let mut harness = CoordinatedBundleHarness::new().expect("bundle harness should build");
     harness.generate_lockfile();
@@ -550,12 +704,494 @@ fn coordinated_bundle_resolution_cools_exactly_coupled_transitives() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("coordinated bundle resolution succeeded"),
+        stderr.contains("attempting cooldown batch solver")
+            || stderr.contains("coordinated bundle resolution succeeded"),
         "{stderr}"
     );
     assert!(
         !stderr.contains("resolver-constrained versions that could not be cooled further"),
         "{stderr}"
+    );
+}
+
+#[test]
+fn batch_solver_cools_independent_crates_without_per_crate_precise_updates() {
+    let mut harness = MultiPassBenchmarkHarness::new(BENCHMARK_CRATE_COUNT)
+        .expect("benchmark harness should build");
+    harness.generate_lockfile();
+
+    let output = harness.run_cooldown(&[]);
+    assert!(
+        output.status.success(),
+        "batch solver run should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lockfile = harness.lockfile_contents();
+    for index in 0..BENCHMARK_CRATE_COUNT {
+        let crate_name = benchmark_crate_name(index);
+        assert_eq!(
+            parse_lockfile_version(&lockfile, &crate_name).as_deref(),
+            Some(OLD_VERSION),
+            "{crate_name} should be cooled in the final lockfile"
+        );
+    }
+
+    let precise_updates = harness
+        .cargo_log()
+        .into_iter()
+        .filter(|line| line.contains("--precise"))
+        .count();
+    assert_eq!(
+        precise_updates, 0,
+        "independent fresh crates should be cooled by one verified lockfile batch, not one cargo update --precise per crate"
+    );
+}
+
+#[test]
+fn batch_solver_cools_single_crate_without_per_crate_precise_update() {
+    let mut harness = MultiPassBenchmarkHarness::new(1).expect("single-crate harness should build");
+    harness.generate_lockfile();
+
+    let output = harness.run_cooldown(&[]);
+    assert!(
+        output.status.success(),
+        "batch solver run should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lockfile = harness.lockfile_contents();
+    assert_eq!(
+        parse_lockfile_version(&lockfile, &benchmark_crate_name(0)).as_deref(),
+        Some(OLD_VERSION),
+        "single fresh crate should be cooled in the final lockfile"
+    );
+
+    let precise_updates = harness
+        .cargo_log()
+        .into_iter()
+        .filter(|line| line.contains("--precise"))
+        .count();
+    assert_eq!(
+        precise_updates, 0,
+        "a single locally valid fresh crate should be cooled by one verified lockfile assignment, not cargo update --precise"
+    );
+}
+
+#[test]
+fn batch_solver_backtracks_internal_dependency_candidates_locally() {
+    let mut harness = BacktrackingBundleHarness::new().expect("backtracking harness should build");
+    harness.generate_lockfile();
+    assert_eq!(
+        harness.locked_version(BACKTRACK_LEFT_NAME),
+        BACKTRACK_FRESH_VERSION
+    );
+    assert_eq!(
+        harness.locked_version(BACKTRACK_RIGHT_NAME),
+        BACKTRACK_FRESH_VERSION
+    );
+    assert_eq!(
+        harness.locked_version(BACKTRACK_SHARED_NAME),
+        BACKTRACK_COMPAT_VERSION
+    );
+
+    let output = harness.run_cooldown();
+    assert!(
+        output.status.success(),
+        "batch solver should backtrack internal exact dependency candidates: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        harness.locked_version(BACKTRACK_LEFT_NAME),
+        BACKTRACK_COMPAT_VERSION
+    );
+    assert_eq!(
+        harness.locked_version(BACKTRACK_RIGHT_NAME),
+        BACKTRACK_CONFLICT_VERSION
+    );
+    assert_eq!(
+        harness.locked_version(BACKTRACK_SHARED_NAME),
+        BACKTRACK_OLD_VERSION
+    );
+
+    let precise_updates = harness
+        .cargo_log()
+        .into_iter()
+        .filter(|line| line.contains("--precise"))
+        .count();
+    assert_eq!(
+        precise_updates, 0,
+        "compatible local component solving should avoid per-crate cargo update --precise calls"
+    );
+}
+
+#[test]
+fn batch_solver_batches_duplicate_package_names_without_precise_updates() {
+    let mut harness =
+        DuplicateNameBatchHarness::new().expect("duplicate-name harness should build");
+    harness.generate_lockfile();
+    assert_eq!(
+        sorted_lockfile_versions(&harness.lockfile_contents(), DUP_SHARED_NAME),
+        vec![
+            DUP_V1_FRESH_VERSION.to_string(),
+            DUP_V2_FRESH_VERSION.to_string()
+        ]
+    );
+
+    let output = harness.run_cooldown();
+    assert!(
+        output.status.success(),
+        "batch solver should cool duplicate-name packages via one validated batch: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        sorted_lockfile_versions(&harness.lockfile_contents(), DUP_SHARED_NAME),
+        vec![
+            DUP_V1_OLD_VERSION.to_string(),
+            DUP_V2_OLD_VERSION.to_string()
+        ]
+    );
+
+    let precise_updates = harness
+        .cargo_log()
+        .into_iter()
+        .filter(|line| line.contains("--precise"))
+        .count();
+    assert_eq!(
+        precise_updates, 0,
+        "duplicate package names are unambiguous in Cargo.lock by current version and should not require per-crate cargo update --precise calls"
+    );
+}
+
+#[test]
+fn batch_solver_resolves_duplicate_transitive_package_names_locally() {
+    let mut harness =
+        DuplicateTransitiveBatchHarness::new().expect("duplicate-transitive harness should build");
+    harness.generate_lockfile();
+    assert_eq!(
+        harness.locked_version(DUP_ROOT_A_NAME),
+        DUP_PARENT_FRESH_VERSION
+    );
+    assert_eq!(
+        harness.locked_version(DUP_ROOT_B_NAME),
+        DUP_PARENT_FRESH_VERSION
+    );
+    assert_eq!(
+        sorted_lockfile_versions(&harness.lockfile_contents(), DUP_SHARED_NAME),
+        vec![
+            DUP_V1_FRESH_VERSION.to_string(),
+            DUP_V2_FRESH_VERSION.to_string()
+        ]
+    );
+
+    let output = harness.run_cooldown();
+    assert!(
+        output.status.success(),
+        "batch solver should cool duplicate transitive packages locally: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        harness.locked_version(DUP_ROOT_A_NAME),
+        DUP_PARENT_OLD_VERSION
+    );
+    assert_eq!(
+        harness.locked_version(DUP_ROOT_B_NAME),
+        DUP_PARENT_OLD_VERSION
+    );
+    assert_eq!(
+        sorted_lockfile_versions(&harness.lockfile_contents(), DUP_SHARED_NAME),
+        vec![
+            DUP_V1_OLD_VERSION.to_string(),
+            DUP_V2_OLD_VERSION.to_string()
+        ]
+    );
+
+    let precise_updates = harness
+        .cargo_log()
+        .into_iter()
+        .filter(|line| line.contains("--precise"))
+        .count();
+    assert_eq!(
+        precise_updates, 0,
+        "duplicate transitive package names should be solved in the local batch, not by per-crate cargo update --precise calls"
+    );
+}
+
+#[test]
+fn batch_solver_cools_workspace_dev_dependencies() {
+    let mut harness = FeatureCoverageHarness::new(
+        vec![PublishedCrate::new(
+            "devcool",
+            vec![
+                PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+            ],
+        )],
+        vec![
+            (
+                "Cargo.toml",
+                format!(
+                    r#"[workspace]
+members = ["member"]
+resolver = "3"
+
+[workspace.dependencies]
+devcool = {{ version = "1", registry = "{REGISTRY_NAME}" }}
+"#
+                ),
+            ),
+            (
+                "member/Cargo.toml",
+                r#"[package]
+name = "member"
+version = "0.1.0"
+edition = "2024"
+
+[dev-dependencies]
+devcool = { workspace = true }
+"#
+                .to_string(),
+            ),
+            ("member/src/lib.rs", String::new()),
+        ],
+    )
+    .expect("feature coverage harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version("devcool"), FRESH_VERSION);
+
+    let output = harness.run_cooldown();
+    assert!(
+        output.status.success(),
+        "batch solver should cool workspace dev-dependencies: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version("devcool"), OLD_VERSION);
+    assert_no_precise_updates(&harness);
+}
+
+#[test]
+fn batch_solver_cools_feature_activated_optional_dependency() {
+    let mut harness = FeatureCoverageHarness::new(
+        vec![
+            PublishedCrate::new(
+                "featureuser",
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false)
+                        .with_dependencies(vec![
+                            RegistryDependency::exact("featuredep", OLD_VERSION).optional(),
+                        ])
+                        .with_features(vec![("with-dep", vec!["dep:featuredep"])]),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false)
+                        .with_dependencies(vec![
+                            RegistryDependency::exact("featuredep", FRESH_VERSION).optional(),
+                        ])
+                        .with_features(vec![("with-dep", vec!["dep:featuredep"])]),
+                ],
+            ),
+            PublishedCrate::new(
+                "featuredep",
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                ],
+            ),
+        ],
+        root_package_files(
+            r#"[dependencies]
+featureuser = { version = "1", registry = "cool-reg", features = ["with-dep"] }
+"#,
+        ),
+    )
+    .expect("feature coverage harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version("featureuser"), FRESH_VERSION);
+    assert_eq!(harness.locked_version("featuredep"), FRESH_VERSION);
+
+    let output = harness.run_cooldown();
+    assert!(
+        output.status.success(),
+        "batch solver should cool optional dependencies activated by root features: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version("featureuser"), OLD_VERSION);
+    assert_eq!(harness.locked_version("featuredep"), OLD_VERSION);
+    assert_no_precise_updates(&harness);
+}
+
+#[test]
+fn batch_solver_handles_candidate_only_optional_dependency() {
+    let mut harness = FeatureCoverageHarness::new(
+        vec![
+            PublishedCrate::new(
+                "candidateoptionaluser",
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false)
+                        .with_dependencies(vec![
+                            RegistryDependency::new("candidateonlydep", "1").optional(),
+                        ])
+                        .with_features(vec![("with-extra", vec!["dep:candidateonlydep"])]),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false)
+                        .with_features(vec![("with-extra", Vec::new())]),
+                ],
+            ),
+            PublishedCrate::new(
+                "candidateonlydep",
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                ],
+            ),
+        ],
+        root_package_files(
+            r#"[dependencies]
+candidateoptionaluser = { version = "1", registry = "cool-reg", features = ["with-extra"] }
+"#,
+        ),
+    )
+    .expect("feature coverage harness should build");
+    harness.generate_lockfile();
+    assert_eq!(
+        harness.locked_version("candidateoptionaluser"),
+        FRESH_VERSION
+    );
+    assert!(
+        parse_lockfile_version(&harness.lockfile_contents(), "candidateonlydep").is_none(),
+        "fresh root candidate should not depend on candidateonlydep yet"
+    );
+
+    let output = harness.run_cooldown();
+    assert!(
+        output.status.success(),
+        "batch solver should cool optional dependencies introduced by the selected candidate: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version("candidateoptionaluser"), OLD_VERSION);
+    assert_eq!(harness.locked_version("candidateonlydep"), OLD_VERSION);
+    assert_no_precise_updates(&harness);
+}
+
+#[test]
+fn batch_solver_cools_target_specific_dependency() {
+    let active_target = "cfg(any(unix, windows))";
+    let mut harness = FeatureCoverageHarness::new(
+        vec![
+            PublishedCrate::new(
+                "targetuser",
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false).with_dependencies(
+                        vec![
+                            RegistryDependency::exact("targetdep", OLD_VERSION)
+                                .target(active_target),
+                        ],
+                    ),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false)
+                        .with_dependencies(vec![
+                            RegistryDependency::exact("targetdep", FRESH_VERSION)
+                                .target(active_target),
+                        ]),
+                ],
+            ),
+            PublishedCrate::new(
+                "targetdep",
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                ],
+            ),
+        ],
+        root_package_files(
+            r#"[dependencies]
+targetuser = { version = "1", registry = "cool-reg" }
+"#,
+        ),
+    )
+    .expect("feature coverage harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version("targetuser"), FRESH_VERSION);
+    assert_eq!(harness.locked_version("targetdep"), FRESH_VERSION);
+
+    let output = harness.run_cooldown();
+    assert!(
+        output.status.success(),
+        "batch solver should cool target-specific dependencies active for the current target: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version("targetuser"), OLD_VERSION);
+    assert_eq!(harness.locked_version("targetdep"), OLD_VERSION);
+    assert_no_precise_updates(&harness);
+}
+
+#[test]
+fn batch_solver_cools_candidate_introduced_transitive_dependency() {
+    let mut harness = FeatureCoverageHarness::new(
+        vec![
+            PublishedCrate::new(
+                "newtransitiveparent",
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false)
+                        .with_dependencies(vec![RegistryDependency::new("introduceddep", "1")]),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                ],
+            ),
+            PublishedCrate::new(
+                "introduceddep",
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                ],
+            ),
+        ],
+        root_package_files(
+            r#"[dependencies]
+newtransitiveparent = { version = "1", registry = "cool-reg" }
+"#,
+        ),
+    )
+    .expect("feature coverage harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version("newtransitiveparent"), FRESH_VERSION);
+    assert!(
+        parse_lockfile_version(&harness.lockfile_contents(), "introduceddep").is_none(),
+        "fresh parent candidate should not depend on introduceddep yet"
+    );
+
+    let output = harness.run_cooldown();
+    assert!(
+        output.status.success(),
+        "batch solver should cool transitive dependencies introduced by the selected candidate: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version("newtransitiveparent"), OLD_VERSION);
+    assert_eq!(harness.locked_version("introduceddep"), OLD_VERSION);
+    assert_no_precise_updates(&harness);
+}
+
+#[test]
+#[ignore = "manual benchmark; run with -- --ignored --nocapture"]
+fn benchmark_batch_solver() {
+    let mut samples = Vec::new();
+
+    for sample in 0..3 {
+        let mut harness = MultiPassBenchmarkHarness::new(BENCHMARK_CRATE_COUNT)
+            .expect("benchmark harness should build");
+        harness.generate_lockfile();
+        let started = Instant::now();
+        let output = harness.run_cooldown(&[]);
+        let elapsed = started.elapsed();
+        assert!(
+            output.status.success(),
+            "batch solver run should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        samples.push(elapsed);
+
+        println!("sample {}: batch_solver={:?}", sample + 1, elapsed);
+    }
+
+    let total: f64 = samples.iter().map(Duration::as_secs_f64).sum();
+    println!(
+        "average batch_solver={:?}",
+        Duration::from_secs_f64(total / samples.len() as f64),
     );
 }
 
@@ -718,6 +1354,42 @@ struct CoordinatedBundleHarness {
     _server: RegistryServer,
 }
 
+struct BacktrackingBundleHarness {
+    _temp_dir: TempDir,
+    cargo_home: PathBuf,
+    workspace_dir: PathBuf,
+    _server: RegistryServer,
+    cargo_wrapper_log: PathBuf,
+    path_with_wrapper: OsString,
+}
+
+struct DuplicateNameBatchHarness {
+    _temp_dir: TempDir,
+    cargo_home: PathBuf,
+    workspace_dir: PathBuf,
+    _server: RegistryServer,
+    cargo_wrapper_log: PathBuf,
+    path_with_wrapper: OsString,
+}
+
+struct DuplicateTransitiveBatchHarness {
+    _temp_dir: TempDir,
+    cargo_home: PathBuf,
+    workspace_dir: PathBuf,
+    _server: RegistryServer,
+    cargo_wrapper_log: PathBuf,
+    path_with_wrapper: OsString,
+}
+
+struct FeatureCoverageHarness {
+    _temp_dir: TempDir,
+    cargo_home: PathBuf,
+    workspace_dir: PathBuf,
+    _server: RegistryServer,
+    cargo_wrapper_log: PathBuf,
+    path_with_wrapper: OsString,
+}
+
 impl CoordinatedBundleHarness {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
@@ -831,6 +1503,399 @@ impl CoordinatedBundleHarness {
         let lockfile = fs::read_to_string(self.workspace_dir.join("Cargo.lock"))
             .expect("lockfile should be readable");
         parse_lockfile_version(&lockfile, crate_name).expect("crate should exist in lockfile")
+    }
+}
+
+impl BacktrackingBundleHarness {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_root = temp_dir.path().to_path_buf();
+        let cargo_home = temp_root.join("cargo-home");
+        let workspace_dir = temp_root.join("workspace");
+        let wrapper_dir = temp_root.join("wrapper-bin");
+        let cargo_wrapper_log = temp_root.join("cargo-invocations.log");
+        let wrapper_path = wrapper_dir.join(wrapper_binary_name());
+        let server = RegistryServer::with_crates(
+            vec![
+                PublishedCrate::new(
+                    BACKTRACK_LEFT_NAME,
+                    vec![
+                        PackageVersion::new(BACKTRACK_OLD_VERSION, Some(OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                BACKTRACK_SHARED_NAME,
+                                BACKTRACK_OLD_VERSION,
+                            )]),
+                        PackageVersion::new(BACKTRACK_COMPAT_VERSION, Some(OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                BACKTRACK_SHARED_NAME,
+                                BACKTRACK_OLD_VERSION,
+                            )]),
+                        PackageVersion::new(BACKTRACK_CONFLICT_VERSION, Some(OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                BACKTRACK_SHARED_NAME,
+                                BACKTRACK_COMPAT_VERSION,
+                            )]),
+                        PackageVersion::new(
+                            BACKTRACK_FRESH_VERSION,
+                            Some(BUNDLE_FRESH_PUBTIME),
+                            false,
+                        )
+                        .with_dependencies(vec![
+                            RegistryDependency::exact(
+                                BACKTRACK_SHARED_NAME,
+                                BACKTRACK_COMPAT_VERSION,
+                            ),
+                        ]),
+                    ],
+                ),
+                PublishedCrate::new(
+                    BACKTRACK_RIGHT_NAME,
+                    vec![
+                        PackageVersion::new(BACKTRACK_OLD_VERSION, Some(OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                BACKTRACK_SHARED_NAME,
+                                BACKTRACK_OLD_VERSION,
+                            )]),
+                        PackageVersion::new(BACKTRACK_COMPAT_VERSION, Some(OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                BACKTRACK_SHARED_NAME,
+                                BACKTRACK_OLD_VERSION,
+                            )]),
+                        PackageVersion::new(BACKTRACK_CONFLICT_VERSION, Some(OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                BACKTRACK_SHARED_NAME,
+                                BACKTRACK_OLD_VERSION,
+                            )]),
+                        PackageVersion::new(
+                            BACKTRACK_FRESH_VERSION,
+                            Some(BUNDLE_FRESH_PUBTIME),
+                            false,
+                        )
+                        .with_dependencies(vec![
+                            RegistryDependency::exact(
+                                BACKTRACK_SHARED_NAME,
+                                BACKTRACK_COMPAT_VERSION,
+                            ),
+                        ]),
+                    ],
+                ),
+                PublishedCrate::new(
+                    BACKTRACK_SHARED_NAME,
+                    vec![
+                        PackageVersion::new(BACKTRACK_OLD_VERSION, Some(OLD_PUBTIME), false),
+                        PackageVersion::new(
+                            BACKTRACK_COMPAT_VERSION,
+                            Some(BUNDLE_FRESH_PUBTIME),
+                            false,
+                        ),
+                    ],
+                ),
+            ],
+            false,
+        )?;
+
+        fs::create_dir_all(&cargo_home)?;
+        fs::create_dir_all(&wrapper_dir)?;
+        create_workspace_with_dependencies(
+            &workspace_dir,
+            &server,
+            &[(BACKTRACK_LEFT_NAME, "1"), (BACKTRACK_RIGHT_NAME, "1")],
+        )?;
+        write_registry_config(&cargo_home, &server)?;
+        write_cargo_wrapper(&wrapper_path, &cargo_wrapper_log)?;
+        let path_with_wrapper = prepend_to_path(&wrapper_dir)?;
+
+        Ok(Self {
+            _temp_dir: temp_dir,
+            cargo_home,
+            workspace_dir,
+            _server: server,
+            cargo_wrapper_log,
+            path_with_wrapper,
+        })
+    }
+
+    fn generate_lockfile(&mut self) {
+        let output = Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .output()
+            .expect("cargo generate-lockfile should run");
+
+        assert!(
+            output.status.success(),
+            "lockfile generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_cooldown(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .arg("check")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .env("COOLDOWN_NOW", NOW)
+            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("COOLDOWN_HTTP_RETRIES", "0")
+            .env("COOLDOWN_LOCKFILE_POLICY", "all")
+            .env("PATH", &self.path_with_wrapper)
+            .output()
+            .expect("cargo-cooldown should run")
+    }
+
+    fn locked_version(&self, crate_name: &str) -> String {
+        let lockfile = fs::read_to_string(self.workspace_dir.join("Cargo.lock"))
+            .expect("lockfile should be readable");
+        parse_lockfile_version(&lockfile, crate_name).expect("crate should exist in lockfile")
+    }
+
+    fn cargo_log(&self) -> Vec<String> {
+        fs::read_to_string(&self.cargo_wrapper_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl DuplicateNameBatchHarness {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_root = temp_dir.path().to_path_buf();
+        let cargo_home = temp_root.join("cargo-home");
+        let workspace_dir = temp_root.join("workspace");
+        let wrapper_dir = temp_root.join("wrapper-bin");
+        let cargo_wrapper_log = temp_root.join("cargo-invocations.log");
+        let wrapper_path = wrapper_dir.join(wrapper_binary_name());
+        let server = RegistryServer::with_crates(
+            vec![
+                PublishedCrate::new(
+                    DUP_ROOT_A_NAME,
+                    vec![
+                        PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::new(DUP_SHARED_NAME, "1")]),
+                    ],
+                ),
+                PublishedCrate::new(
+                    DUP_ROOT_B_NAME,
+                    vec![
+                        PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::new(DUP_SHARED_NAME, "2")]),
+                    ],
+                ),
+                PublishedCrate::new(
+                    DUP_SHARED_NAME,
+                    vec![
+                        PackageVersion::new(DUP_V1_OLD_VERSION, Some(OLD_PUBTIME), false),
+                        PackageVersion::new(DUP_V1_FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                        PackageVersion::new(DUP_V2_OLD_VERSION, Some(OLD_PUBTIME), false),
+                        PackageVersion::new(DUP_V2_FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                    ],
+                ),
+            ],
+            false,
+        )?;
+
+        fs::create_dir_all(&cargo_home)?;
+        fs::create_dir_all(&wrapper_dir)?;
+        create_workspace_with_dependencies(
+            &workspace_dir,
+            &server,
+            &[(DUP_ROOT_A_NAME, "1"), (DUP_ROOT_B_NAME, "1")],
+        )?;
+        write_registry_config(&cargo_home, &server)?;
+        write_cargo_wrapper(&wrapper_path, &cargo_wrapper_log)?;
+        let path_with_wrapper = prepend_to_path(&wrapper_dir)?;
+
+        Ok(Self {
+            _temp_dir: temp_dir,
+            cargo_home,
+            workspace_dir,
+            _server: server,
+            cargo_wrapper_log,
+            path_with_wrapper,
+        })
+    }
+
+    fn generate_lockfile(&mut self) {
+        let output = Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .output()
+            .expect("cargo generate-lockfile should run");
+
+        assert!(
+            output.status.success(),
+            "lockfile generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_cooldown(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .arg("check")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .env("COOLDOWN_NOW", NOW)
+            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("COOLDOWN_HTTP_RETRIES", "0")
+            .env("COOLDOWN_LOCKFILE_POLICY", "all")
+            .env("PATH", &self.path_with_wrapper)
+            .output()
+            .expect("cargo-cooldown should run")
+    }
+
+    fn lockfile_contents(&self) -> String {
+        fs::read_to_string(self.workspace_dir.join("Cargo.lock"))
+            .expect("lockfile should be readable")
+    }
+
+    fn cargo_log(&self) -> Vec<String> {
+        fs::read_to_string(&self.cargo_wrapper_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl DuplicateTransitiveBatchHarness {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_root = temp_dir.path().to_path_buf();
+        let cargo_home = temp_root.join("cargo-home");
+        let workspace_dir = temp_root.join("workspace");
+        let wrapper_dir = temp_root.join("wrapper-bin");
+        let cargo_wrapper_log = temp_root.join("cargo-invocations.log");
+        let wrapper_path = wrapper_dir.join(wrapper_binary_name());
+        let server = RegistryServer::with_crates(
+            vec![
+                PublishedCrate::new(
+                    DUP_ROOT_A_NAME,
+                    vec![
+                        PackageVersion::new(DUP_PARENT_OLD_VERSION, Some(OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                DUP_SHARED_NAME,
+                                DUP_V1_OLD_VERSION,
+                            )]),
+                        PackageVersion::new(DUP_PARENT_FRESH_VERSION, Some(FRESH_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                DUP_SHARED_NAME,
+                                DUP_V1_FRESH_VERSION,
+                            )]),
+                    ],
+                ),
+                PublishedCrate::new(
+                    DUP_ROOT_B_NAME,
+                    vec![
+                        PackageVersion::new(DUP_PARENT_OLD_VERSION, Some(OLD_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                DUP_SHARED_NAME,
+                                DUP_V2_OLD_VERSION,
+                            )]),
+                        PackageVersion::new(DUP_PARENT_FRESH_VERSION, Some(FRESH_PUBTIME), false)
+                            .with_dependencies(vec![RegistryDependency::exact(
+                                DUP_SHARED_NAME,
+                                DUP_V2_FRESH_VERSION,
+                            )]),
+                    ],
+                ),
+                PublishedCrate::new(
+                    DUP_SHARED_NAME,
+                    vec![
+                        PackageVersion::new(DUP_V1_OLD_VERSION, Some(OLD_PUBTIME), false),
+                        PackageVersion::new(
+                            DUP_V1_FRESH_VERSION,
+                            Some(DUP_TRANSITIVE_CURRENT_PUBTIME),
+                            false,
+                        ),
+                        PackageVersion::new(DUP_V2_OLD_VERSION, Some(OLD_PUBTIME), false),
+                        PackageVersion::new(
+                            DUP_V2_FRESH_VERSION,
+                            Some(DUP_TRANSITIVE_CURRENT_PUBTIME),
+                            false,
+                        ),
+                    ],
+                ),
+            ],
+            false,
+        )?;
+
+        fs::create_dir_all(&cargo_home)?;
+        fs::create_dir_all(&wrapper_dir)?;
+        create_workspace_with_dependencies(
+            &workspace_dir,
+            &server,
+            &[(DUP_ROOT_A_NAME, "1"), (DUP_ROOT_B_NAME, "1")],
+        )?;
+        write_registry_config(&cargo_home, &server)?;
+        write_cargo_wrapper(&wrapper_path, &cargo_wrapper_log)?;
+        let path_with_wrapper = prepend_to_path(&wrapper_dir)?;
+
+        Ok(Self {
+            _temp_dir: temp_dir,
+            cargo_home,
+            workspace_dir,
+            _server: server,
+            cargo_wrapper_log,
+            path_with_wrapper,
+        })
+    }
+
+    fn generate_lockfile(&mut self) {
+        let output = Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .output()
+            .expect("cargo generate-lockfile should run");
+
+        assert!(
+            output.status.success(),
+            "lockfile generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_cooldown(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .arg("check")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .env("COOLDOWN_NOW", NOW)
+            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("COOLDOWN_HTTP_RETRIES", "0")
+            .env("COOLDOWN_LOCKFILE_POLICY", "all")
+            .env("COOLDOWN_VERBOSE", "true")
+            .env("PATH", &self.path_with_wrapper)
+            .output()
+            .expect("cargo-cooldown should run")
+    }
+
+    fn lockfile_contents(&self) -> String {
+        fs::read_to_string(self.workspace_dir.join("Cargo.lock"))
+            .expect("lockfile should be readable")
+    }
+
+    fn locked_version(&self, crate_name: &str) -> String {
+        parse_lockfile_version(&self.lockfile_contents(), crate_name)
+            .expect("crate should exist in lockfile")
+    }
+
+    fn cargo_log(&self) -> Vec<String> {
+        fs::read_to_string(&self.cargo_wrapper_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
     }
 }
 
@@ -957,6 +2022,196 @@ struct ScopedConflictHarness {
     cargo_home: PathBuf,
     workspace_dir: PathBuf,
     _server: RegistryServer,
+}
+
+struct MultiPassBenchmarkHarness {
+    _temp_dir: TempDir,
+    cargo_home: PathBuf,
+    workspace_dir: PathBuf,
+    _server: RegistryServer,
+    cargo_wrapper_log: PathBuf,
+    path_with_wrapper: OsString,
+}
+
+impl MultiPassBenchmarkHarness {
+    fn new(crate_count: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_root = temp_dir.path().to_path_buf();
+        let cargo_home = temp_root.join("cargo-home");
+        let workspace_dir = temp_root.join("workspace");
+        let wrapper_dir = temp_root.join("wrapper-bin");
+        let cargo_wrapper_log = temp_root.join("cargo-invocations.log");
+        let wrapper_path = wrapper_dir.join(wrapper_binary_name());
+        let published_crates = benchmark_published_crates(crate_count);
+        let server = RegistryServer::with_crates(published_crates, false)?;
+
+        fs::create_dir_all(&cargo_home)?;
+        fs::create_dir_all(&wrapper_dir)?;
+        create_workspace_with_dependencies_owned(
+            &workspace_dir,
+            &server,
+            &benchmark_dependency_requirements(crate_count),
+        )?;
+        write_registry_config(&cargo_home, &server)?;
+        write_cargo_wrapper(&wrapper_path, &cargo_wrapper_log)?;
+        let path_with_wrapper = prepend_to_path(&wrapper_dir)?;
+
+        Ok(Self {
+            _temp_dir: temp_dir,
+            cargo_home,
+            workspace_dir,
+            _server: server,
+            cargo_wrapper_log,
+            path_with_wrapper,
+        })
+    }
+
+    fn generate_lockfile(&mut self) {
+        let output = Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .output()
+            .expect("cargo generate-lockfile should run");
+
+        assert!(
+            output.status.success(),
+            "lockfile generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_cooldown(&self, extra_env: &[(&str, &str)]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command
+            .arg("check")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .env("COOLDOWN_NOW", NOW)
+            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("COOLDOWN_HTTP_RETRIES", "0")
+            .env("COOLDOWN_LOCKFILE_POLICY", "all")
+            .env("PATH", &self.path_with_wrapper);
+
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+
+        command.output().expect("cargo-cooldown should run")
+    }
+
+    fn lockfile_contents(&self) -> String {
+        fs::read_to_string(self.workspace_dir.join("Cargo.lock"))
+            .expect("lockfile should be readable")
+    }
+
+    fn cargo_log(&self) -> Vec<String> {
+        fs::read_to_string(&self.cargo_wrapper_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl FeatureCoverageHarness {
+    fn new(
+        published_crates: Vec<PublishedCrate>,
+        files: Vec<(&str, String)>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let temp_dir = tempdir()?;
+        let temp_root = temp_dir.path().to_path_buf();
+        let cargo_home = temp_root.join("cargo-home");
+        let workspace_dir = temp_root.join("workspace");
+        let wrapper_dir = temp_root.join("wrapper-bin");
+        let cargo_wrapper_log = temp_root.join("cargo-invocations.log");
+        let wrapper_path = wrapper_dir.join(wrapper_binary_name());
+        let server = RegistryServer::with_crates(published_crates, false)?;
+
+        fs::create_dir_all(&cargo_home)?;
+        fs::create_dir_all(&wrapper_dir)?;
+        fs::create_dir_all(workspace_dir.join(".cargo"))?;
+        for (path, contents) in files {
+            let full_path = workspace_dir.join(path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(full_path, contents)?;
+        }
+        fs::write(
+            workspace_dir.join(".cargo/config.toml"),
+            format!(
+                r#"[registries.{registry_name}]
+index = "sparse+{base_url}/index/"
+"#,
+                registry_name = REGISTRY_NAME,
+                base_url = server.base_url(),
+            ),
+        )?;
+        write_registry_config(&cargo_home, &server)?;
+        write_cargo_wrapper(&wrapper_path, &cargo_wrapper_log)?;
+        let path_with_wrapper = prepend_to_path(&wrapper_dir)?;
+
+        Ok(Self {
+            _temp_dir: temp_dir,
+            cargo_home,
+            workspace_dir,
+            _server: server,
+            cargo_wrapper_log,
+            path_with_wrapper,
+        })
+    }
+
+    fn generate_lockfile(&mut self) {
+        let output = Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .output()
+            .expect("cargo generate-lockfile should run");
+
+        assert!(
+            output.status.success(),
+            "lockfile generation failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_cooldown(&self) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .arg("check")
+            .current_dir(&self.workspace_dir)
+            .env("CARGO_HOME", &self.cargo_home)
+            .env("CARGO_TERM_PROGRESS_WHEN", "never")
+            .env("COOLDOWN_NOW", NOW)
+            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("COOLDOWN_HTTP_RETRIES", "0")
+            .env("COOLDOWN_LOCKFILE_POLICY", "all")
+            .env("PATH", &self.path_with_wrapper)
+            .output()
+            .expect("cargo-cooldown should run")
+    }
+
+    fn lockfile_contents(&self) -> String {
+        fs::read_to_string(self.workspace_dir.join("Cargo.lock"))
+            .expect("lockfile should be readable")
+    }
+
+    fn locked_version(&self, crate_name: &str) -> String {
+        parse_lockfile_version(&self.lockfile_contents(), crate_name)
+            .expect("crate should exist in lockfile")
+    }
+
+    fn cargo_log(&self) -> Vec<String> {
+        fs::read_to_string(&self.cargo_wrapper_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 impl ScopedConflictHarness {
@@ -1304,6 +2559,7 @@ struct PackageVersion {
     pubtime: Option<String>,
     yanked: bool,
     dependencies: Vec<RegistryDependency>,
+    features: Vec<(String, Vec<String>)>,
 }
 
 impl PackageVersion {
@@ -1313,11 +2569,25 @@ impl PackageVersion {
             pubtime: pubtime.map(ToOwned::to_owned),
             yanked,
             dependencies: Vec::new(),
+            features: Vec::new(),
         }
     }
 
     fn with_dependencies(mut self, dependencies: Vec<RegistryDependency>) -> Self {
         self.dependencies = dependencies;
+        self
+    }
+
+    fn with_features(mut self, features: Vec<(&str, Vec<&str>)>) -> Self {
+        self.features = features
+            .into_iter()
+            .map(|(name, values)| {
+                (
+                    name.to_string(),
+                    values.into_iter().map(ToOwned::to_owned).collect(),
+                )
+            })
+            .collect();
         self
     }
 }
@@ -1326,14 +2596,34 @@ impl PackageVersion {
 struct RegistryDependency {
     name: String,
     requirement: String,
+    optional: bool,
+    target: Option<String>,
+    kind: Option<String>,
 }
 
 impl RegistryDependency {
-    fn exact(name: &str, version: &str) -> Self {
+    fn new(name: &str, requirement: &str) -> Self {
         Self {
             name: name.to_string(),
-            requirement: format!("={version}"),
+            requirement: requirement.to_string(),
+            optional: false,
+            target: None,
+            kind: None,
         }
+    }
+
+    fn exact(name: &str, version: &str) -> Self {
+        Self::new(name, &format!("={version}"))
+    }
+
+    fn optional(mut self) -> Self {
+        self.optional = true;
+        self
+    }
+
+    fn target(mut self, target: &str) -> Self {
+        self.target = Some(target.to_string());
+        self
     }
 }
 
@@ -1370,6 +2660,18 @@ index = "sparse+{base_url}/index/"
     )?;
 
     Ok(())
+}
+
+fn create_workspace_with_dependencies_owned(
+    workspace_dir: &Path,
+    server: &RegistryServer,
+    dependencies: &[(String, String)],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let refs = dependencies
+        .iter()
+        .map(|(crate_name, version_req)| (crate_name.as_str(), version_req.as_str()))
+        .collect::<Vec<_>>();
+    create_workspace_with_dependencies(workspace_dir, server, &refs)
 }
 
 fn write_root_manifest(
@@ -1409,6 +2711,36 @@ fn render_main_file(dependencies: &[(&str, &str)]) -> String {
         .join("\n");
 
     format!("fn main() {{\n{lines}\n}}\n")
+}
+
+fn root_package_files(dependency_section: &str) -> Vec<(&str, String)> {
+    vec![
+        (
+            "Cargo.toml",
+            format!(
+                r#"[package]
+name = "feature-coverage"
+version = "0.1.0"
+edition = "2024"
+
+{dependency_section}
+"#
+            ),
+        ),
+        ("src/main.rs", "fn main() {}\n".to_string()),
+    ]
+}
+
+fn assert_no_precise_updates(harness: &FeatureCoverageHarness) {
+    let precise_updates = harness
+        .cargo_log()
+        .into_iter()
+        .filter(|line| line.contains("--precise"))
+        .count();
+    assert_eq!(
+        precise_updates, 0,
+        "feature coverage cases should be cooled without per-crate cargo update --precise calls"
+    );
 }
 
 fn create_workspace_member_fixture(
@@ -1633,23 +2965,8 @@ fn create_crate_archive(
         .join(format!("{crate_name}-{}", version.version));
     let root_dir = format!("{crate_name}-{}", version.version);
     fs::create_dir_all(package_dir.join("src"))?;
-    let dependency_section = if version.dependencies.is_empty() {
-        String::new()
-    } else {
-        let entries = version
-            .dependencies
-            .iter()
-            .map(|dependency| {
-                format!(
-                    r#"{name} = {{ version = "{requirement}" }}"#,
-                    name = dependency.name,
-                    requirement = dependency.requirement,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        format!("\n[dependencies]\n{entries}\n")
-    };
+    let dependency_section = render_crate_dependency_sections(&version.dependencies);
+    let feature_section = render_feature_section(&version.features);
     fs::write(
         package_dir.join("Cargo.toml"),
         format!(
@@ -1661,10 +2978,12 @@ edition = "2024"
 [lib]
 path = "src/lib.rs"
 {dependency_section}
+{feature_section}
 "#,
             crate_name = crate_name,
             version = version.version,
             dependency_section = dependency_section,
+            feature_section = feature_section,
         ),
     )?;
     fs::write(
@@ -1694,6 +3013,94 @@ path = "src/lib.rs"
     drop(builder);
 
     Ok(encoder.finish()?)
+}
+
+fn render_crate_dependency_sections(dependencies: &[RegistryDependency]) -> String {
+    let mut normal = Vec::new();
+    let mut dev = Vec::new();
+    let mut target_sections = HashMap::<String, Vec<String>>::new();
+
+    for dependency in dependencies {
+        let entry = render_registry_dependency_entry(dependency, false);
+        if let Some(target) = &dependency.target {
+            target_sections
+                .entry(target.clone())
+                .or_default()
+                .push(render_registry_dependency_entry(dependency, false));
+        } else if dependency.kind.as_deref() == Some("dev") {
+            dev.push(entry);
+        } else {
+            normal.push(entry);
+        }
+    }
+
+    let mut sections = String::new();
+    if !normal.is_empty() {
+        sections.push_str("\n[dependencies]\n");
+        sections.push_str(&normal.join("\n"));
+        sections.push('\n');
+    }
+    if !dev.is_empty() {
+        sections.push_str("\n[dev-dependencies]\n");
+        sections.push_str(&dev.join("\n"));
+        sections.push('\n');
+    }
+
+    let mut target_keys = target_sections.keys().cloned().collect::<Vec<_>>();
+    target_keys.sort();
+    for target in target_keys {
+        if let Some(entries) = target_sections.get(&target) {
+            sections.push_str(&format!("\n[target.'{target}'.dependencies]\n"));
+            sections.push_str(&entries.join("\n"));
+            sections.push('\n');
+        }
+    }
+
+    sections
+}
+
+fn render_registry_dependency_entry(
+    dependency: &RegistryDependency,
+    include_registry: bool,
+) -> String {
+    let registry = if include_registry {
+        format!(r#", registry = "{REGISTRY_NAME}""#)
+    } else {
+        String::new()
+    };
+    let optional = if dependency.optional {
+        ", optional = true"
+    } else {
+        ""
+    };
+
+    format!(
+        r#"{name} = {{ version = "{requirement}"{registry}{optional} }}"#,
+        name = dependency.name,
+        requirement = dependency.requirement,
+        registry = registry,
+        optional = optional,
+    )
+}
+
+fn render_feature_section(features: &[(String, Vec<String>)]) -> String {
+    if features.is_empty() {
+        return String::new();
+    }
+
+    let mut entries = features
+        .iter()
+        .map(|(name, values)| {
+            let values = values
+                .iter()
+                .map(|value| format!(r#""{value}""#))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{name} = [{values}]")
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    format!("\n[features]\n{}\n", entries.join("\n"))
 }
 
 fn build_registry_paths(
@@ -1772,14 +3179,24 @@ fn build_index_body(
                     "name": dependency.name,
                     "req": dependency.requirement,
                     "features": [],
-                    "optional": false,
+                    "optional": dependency.optional,
                     "default_features": true,
-                    "target": serde_json::Value::Null,
-                    "kind": serde_json::Value::Null,
+                    "target": dependency
+                        .target
+                        .clone()
+                        .map_or(serde_json::Value::Null, serde_json::Value::String),
+                    "kind": dependency
+                        .kind
+                        .clone()
+                        .map_or(serde_json::Value::Null, serde_json::Value::String),
                 }))
                 .collect::<Vec<_>>(),
             "cksum": checksum,
-            "features": {},
+            "features": version
+                .features
+                .iter()
+                .map(|(name, values)| (name.clone(), values.clone()))
+                .collect::<HashMap<_, _>>(),
             "yanked": version.yanked,
         });
         if let Some(pubtime) = &version.pubtime {
@@ -1833,9 +3250,59 @@ fn parse_lockfile_version(lockfile: &str, crate_name: &str) -> Option<String> {
     None
 }
 
+fn sorted_lockfile_versions(lockfile: &str, crate_name: &str) -> Vec<String> {
+    let mut versions = Vec::new();
+    let mut in_block = false;
+    for line in lockfile.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[package]]" {
+            in_block = false;
+            continue;
+        }
+        if trimmed == format!("name = \"{crate_name}\"") {
+            in_block = true;
+            continue;
+        }
+        if in_block
+            && trimmed.starts_with("version = ")
+            && let Some(version) = trimmed
+                .strip_prefix("version = \"")
+                .and_then(|value| value.strip_suffix('"'))
+        {
+            versions.push(version.to_string());
+        }
+    }
+    versions.sort_unstable();
+    versions
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn benchmark_crate_name(index: usize) -> String {
+    format!("benchdep{index:02}")
+}
+
+fn benchmark_dependency_requirements(crate_count: usize) -> Vec<(String, String)> {
+    (0..crate_count)
+        .map(|index| (benchmark_crate_name(index), "1".to_string()))
+        .collect()
+}
+
+fn benchmark_published_crates(crate_count: usize) -> Vec<PublishedCrate> {
+    (0..crate_count)
+        .map(|index| {
+            PublishedCrate::new(
+                &benchmark_crate_name(index),
+                vec![
+                    PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                    PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                ],
+            )
+        })
+        .collect()
 }
 
 impl RegistryMode {

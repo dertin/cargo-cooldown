@@ -1,4 +1,4 @@
-mod allowlist;
+mod allow_rules;
 mod cache;
 mod config;
 mod executor;
@@ -7,12 +7,14 @@ mod lockfile;
 mod metadata;
 mod project;
 mod registry;
+mod resolution_state;
 mod resolver;
 mod ui;
 
 use std::ffi::OsString;
 use std::io::Write;
 use std::process::{Command, Output};
+use std::time::Instant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -297,7 +299,13 @@ fn write_captured_output(output: &Output) {
 
 fn run_initial_cargo_update(forwarded_args: &[OsString]) -> Result<std::process::ExitStatus> {
     debug!("refreshing lockfile via cargo update before applying cooldown");
+    let started = Instant::now();
     let output = Command::new("cargo").args(forwarded_args).output()?;
+    debug!(
+        target: "cargo_cooldown::timing",
+        elapsed_ms = started.elapsed().as_millis(),
+        "cooldown timing: initial cargo update"
+    );
     if !output.status.success() {
         write_captured_output(&output);
     }
@@ -438,20 +446,26 @@ mod tests {
             "cargo-cooldown",
             "cooldown",
             "--manifest-path",
-            "examples/demo/Cargo.toml",
+            "examples/crates-io-smoke-workspace/Cargo.toml",
             "build",
         ]);
 
         let cli = parse_cli(&raw);
         assert_eq!(
             cli.manifest.manifest_path,
-            Some(PathBuf::from("examples/demo/Cargo.toml"))
+            Some(PathBuf::from(
+                "examples/crates-io-smoke-workspace/Cargo.toml"
+            ))
         );
 
         let forwarded = assemble_cargo_args(&cli, &cargo_args(&cli));
         assert_eq!(
             to_string_vec(&forwarded),
-            vec!["build", "--manifest-path", "examples/demo/Cargo.toml"]
+            vec![
+                "build",
+                "--manifest-path",
+                "examples/crates-io-smoke-workspace/Cargo.toml"
+            ]
         );
     }
 
@@ -461,7 +475,7 @@ mod tests {
             "cargo-cooldown",
             "cooldown",
             "--manifest-path",
-            "examples/demo/Cargo.toml",
+            "examples/crates-io-smoke-workspace/Cargo.toml",
             "update",
         ]);
 
@@ -529,7 +543,7 @@ mod tests {
             "cargo-cooldown",
             "cooldown",
             "--manifest-path",
-            "examples/demo/Cargo.toml",
+            "examples/crates-io-smoke-workspace/Cargo.toml",
             "--package",
             "demo",
             "--workspace",
@@ -550,7 +564,7 @@ mod tests {
             vec![
                 "check",
                 "--manifest-path",
-                "examples/demo/Cargo.toml",
+                "examples/crates-io-smoke-workspace/Cargo.toml",
                 "--package",
                 "demo",
                 "--workspace",
@@ -571,17 +585,23 @@ mod tests {
             "cargo-cooldown",
             "check",
             "--manifest-path",
-            "examples/demo/Cargo.toml",
+            "examples/crates-io-smoke-workspace/Cargo.toml",
         ]);
 
         let cli = parse_cli(&raw);
         assert_eq!(
             cli.manifest.manifest_path,
-            Some(PathBuf::from("examples/demo/Cargo.toml"))
+            Some(PathBuf::from(
+                "examples/crates-io-smoke-workspace/Cargo.toml"
+            ))
         );
         assert_eq!(
             to_string_vec(&assemble_cargo_args(&cli, &cargo_args(&cli))),
-            vec!["check", "--manifest-path", "examples/demo/Cargo.toml",]
+            vec![
+                "check",
+                "--manifest-path",
+                "examples/crates-io-smoke-workspace/Cargo.toml",
+            ]
         );
     }
 
@@ -633,7 +653,7 @@ mod tests {
             "cargo-cooldown",
             "cooldown",
             "--manifest-path",
-            "examples/demo/Cargo.toml",
+            "examples/crates-io-smoke-workspace/Cargo.toml",
             "init",
         ]);
 

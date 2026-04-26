@@ -1,0 +1,4 @@
+cooldown_minutes = 86400
+mode = "best_effort"
+lockfile_policy = "all"
+verbose = false

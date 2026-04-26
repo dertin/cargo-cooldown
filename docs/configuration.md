@@ -66,6 +66,9 @@ contain the values that genuinely differ from the workspace defaults.
 - `skip_registries`
 - `allow`
 
+`cooldown.toml` accepts the lowercase keys shown above. Unknown keys and
+invalid values fail configuration loading.
+
 `verbose = true` enables `DEBUG` logs for cooldown internals such as release-age
 inspection, candidate selection, and per-pass scan summaries. User-facing
 output stays compact: repeated pin attempts stay in `DEBUG`, and cooldown ends
@@ -74,6 +77,14 @@ update` with any cooldown adjustments in a Cargo-style format, plus any fresh
 versions that had to remain.
 When stderr is an interactive terminal, cooldown also shows a resolver progress
 bar and colored status labels.
+
+Cooldown selects older candidates for multiple fresh registry crates, expands
+compatible local dependency components from registry metadata, rewrites those
+entries in `Cargo.lock`, and validates the whole batch with Cargo. Local package
+identities include the current locked version, so multiple versions of the same
+crate can be cooled in one component when the current Cargo graph maps a
+dependency unambiguously. Validation retry budgets scale with the batch size and
+stop early when Cargo is only pruning a sparse blocker set.
 
 `skip_registries` can be written as:
 
@@ -208,10 +219,17 @@ COOLDOWN_LOCKFILE_POLICY=all cargo cooldown check
 - when a freshly updated package can be pinned back to a version that was
   already present in the baseline lockfile, that baseline version remains a
   valid pin target even if it is still inside the cooldown window
+- cooldown never downgrades a version that was already present in the
+  pre-update lockfile; that version becomes the minimum allowed version for the
+  package during the update run
 - if cooling one of those newly updated versions would require degrading
   baseline-protected, already exhausted earlier in the run, or otherwise
   cooldown-exempt dependencies, `best_effort` keeps the fresh version and warns
   at the end, while `strict` fails and restores the original lockfile
+
+With `lockfile_policy = "all"`, the pre-update lockfile is not used as an
+exemption. Existing locked versions can be cooled when they are inside the
+cooldown window and Cargo accepts the lower compatible version.
 
 For `build`, `check`, `test`, or `run`, Cargo usually reuses the existing
 lockfile. Those commands do not proactively refresh dependencies on their own.

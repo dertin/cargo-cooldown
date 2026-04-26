@@ -1,2 +1,5 @@
-demo/Cargo.lock
+crates-io-smoke-workspace/Cargo.lock
+crates-io-smoke-workspace/target/
+crates-io-large-benchmark-workspace/Cargo.lock
+crates-io-large-benchmark-workspace/target/
 .cooldown-cache

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use semver::Version;
 use serde::Deserialize;
 
 use crate::registry::{RegistryStore, is_registry_source};
@@ -38,6 +39,7 @@ impl LockfileSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct LockfileBaseline {
     packages: HashSet<LockfilePackageKey>,
+    versions_by_package: BTreeMap<String, BTreeMap<String, Vec<Version>>>,
 }
 
 impl LockfileBaseline {
@@ -48,6 +50,7 @@ impl LockfileBaseline {
         let lockfile: RawLockfile =
             toml::from_str(contents).context("failed to parse lockfile baseline")?;
         let mut packages = HashSet::new();
+        let mut versions_by_package = BTreeMap::new();
 
         for package in lockfile.package {
             let Some(source_id) = package.source else {
@@ -61,19 +64,51 @@ impl LockfileBaseline {
                 .context_for_source(&source_id)?
                 .effective_index_url
                 .clone();
+            let name = package.name;
+            let version = package.version;
+            if let Ok(parsed_version) = Version::parse(&version) {
+                versions_by_package
+                    .entry(name.clone())
+                    .or_insert_with(BTreeMap::new)
+                    .entry(registry.clone())
+                    .or_insert_with(Vec::new)
+                    .push(parsed_version);
+            }
             packages.insert(LockfilePackageKey {
-                name: package.name,
+                name,
                 registry,
-                version: package.version,
+                version,
             });
         }
 
-        Ok(Self { packages })
+        for registries in versions_by_package.values_mut() {
+            for versions in registries.values_mut() {
+                versions.sort();
+                versions.dedup();
+            }
+        }
+
+        Ok(Self {
+            packages,
+            versions_by_package,
+        })
     }
 
     pub fn contains_registry_version(&self, name: &str, registry: &str, version: &str) -> bool {
         self.packages
             .contains(&LockfilePackageKey::new(name, registry, version))
+    }
+
+    pub fn newest_version_at_or_below(
+        &self,
+        name: &str,
+        registry: &str,
+        current_version: &str,
+    ) -> Option<Version> {
+        let versions = self.versions_by_package.get(name)?.get(registry)?;
+        let current = Version::parse(current_version).ok()?;
+        let index = versions.partition_point(|version| version <= &current);
+        index.checked_sub(1).map(|index| versions[index].clone())
     }
 
     pub fn version_inventory(&self) -> BTreeMap<(String, String), Vec<String>> {
@@ -126,7 +161,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use crate::allowlist::Allowlist;
+    use crate::allow_rules::AllowRules;
     use crate::config::{Config, LockfilePolicy, Mode};
 
     fn config_fixture() -> Config {
@@ -140,7 +175,7 @@ mod tests {
             http_retries: 0,
             verbose: false,
             skip_registries: Vec::new(),
-            allowlist: Allowlist::default(),
+            allow_rules: AllowRules::default(),
         }
     }
 

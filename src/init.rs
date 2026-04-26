@@ -134,7 +134,7 @@ fn prompt_base_template() -> Result<ConfigTemplate> {
     let lockfile_policy = select_lockfile_policy("Lockfile policy", "changed")?;
     let skip_registries =
         prompt_registry_list("Registries to skip (comma-separated, leave blank for none)")?;
-    let include_allow_examples = prompt_confirm("Include commented allowlist examples?", true)?;
+    let include_allow_examples = prompt_confirm("Include commented allow rule examples?", true)?;
 
     Ok(ConfigTemplate {
         cooldown_minutes: Some(cooldown_minutes),
@@ -150,7 +150,7 @@ fn prompt_member_template(member: &ProjectMember) -> Result<Option<ConfigTemplat
     eprintln!("Configuring member override for `{}`", member.name);
     let customize_config = prompt_confirm("Customize this member now?", true)?;
     let include_allow_examples = prompt_confirm(
-        "Include commented allowlist examples for this member?",
+        "Include commented allow rule examples for this member?",
         true,
     )?;
 
@@ -231,7 +231,7 @@ fn render_config_file(template: &ConfigTemplate, is_override: bool) -> String {
         if !output.ends_with("\n\n") {
             output.push('\n');
         }
-        output.push_str("# Optional allowlist rules.\n");
+        output.push_str("# Optional allow rules.\n");
         output.push_str("# Add as many `allow.exact` and `allow.package` entries as you need.\n");
         output.push_str("# `allow.exact` fully allows one exact crate version.\n");
         output.push_str("# `allow.package` lowers the cooldown for one crate name.\n");

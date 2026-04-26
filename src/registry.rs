@@ -10,6 +10,7 @@ use reqwest::blocking::Client;
 use semver::VersionReq;
 use serde::{Deserialize, Serialize};
 use tame_index::index::{FileLock, IndexCache, IndexConfig, IndexLocation, IndexUrl};
+use tame_index::krate::DependencyKind;
 use tame_index::utils::canonicalize_url;
 use tame_index::{IndexKrate, PathBuf as TamePathBuf};
 
@@ -66,6 +67,8 @@ impl ReleaseTimeline {
 pub struct ReleaseDependency {
     pub crate_name: String,
     pub requirement: VersionReq,
+    pub optional: bool,
+    pub target_specific: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +108,7 @@ pub struct RegistryStore {
     registries: HashMap<String, RegistryContext>,
     timelines: HashMap<(String, String), ReleaseTimeline>,
     index_krates: HashMap<(String, String), Option<IndexKrate>>,
+    release_metadata: HashMap<(String, String, String), Option<LocalReleaseMetadata>>,
     skip_registries: Vec<String>,
 }
 
@@ -118,7 +122,7 @@ impl RegistryStore {
 
         let http = Client::builder()
             .timeout(Duration::from_secs(10))
-            .user_agent("cargo-cooldown/0.3")
+            .user_agent(concat!("cargo-cooldown/", env!("CARGO_PKG_VERSION")))
             .build()?;
 
         Ok(Self {
@@ -128,6 +132,7 @@ impl RegistryStore {
             registries: HashMap::new(),
             timelines: HashMap::new(),
             index_krates: HashMap::new(),
+            release_metadata: HashMap::new(),
             skip_registries: config.skip_registries.clone(),
         })
     }
@@ -197,6 +202,15 @@ impl RegistryStore {
         crate_name: &str,
         version: &str,
     ) -> Result<Option<LocalReleaseMetadata>> {
+        let metadata_key = (
+            source_id.to_string(),
+            crate_name.to_string(),
+            version.to_string(),
+        );
+        if let Some(cached) = self.release_metadata.get(&metadata_key) {
+            return Ok(cached.clone());
+        }
+
         let cache_key = (source_id.to_string(), crate_name.to_string());
         if !self.index_krates.contains_key(&cache_key) {
             let context = self.context_for_source(source_id)?.clone();
@@ -209,6 +223,7 @@ impl RegistryStore {
             .get(&cache_key)
             .and_then(|cached| cached.as_ref())
         else {
+            self.release_metadata.insert(metadata_key, None);
             return Ok(None);
         };
         let Some(release) = krate
@@ -216,13 +231,14 @@ impl RegistryStore {
             .iter()
             .find(|candidate| candidate.version == version)
         else {
+            self.release_metadata.insert(metadata_key, None);
             return Ok(None);
         };
 
         let dependencies = release
             .dependencies()
             .iter()
-            .filter(|dependency| !dependency.is_optional() && dependency.target().is_none())
+            .filter(|dependency| dependency.kind() != DependencyKind::Dev)
             .map(|dependency| {
                 let requirement = dependency.req.parse::<VersionReq>().with_context(|| {
                     format!(
@@ -236,14 +252,18 @@ impl RegistryStore {
                 Ok(ReleaseDependency {
                     crate_name: dependency.crate_name().to_string(),
                     requirement,
+                    optional: dependency.is_optional(),
+                    target_specific: dependency.target().is_some(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Ok(Some(LocalReleaseMetadata {
+        let metadata = Some(LocalReleaseMetadata {
             dependencies,
             checksum: checksum_hex(release.checksum()),
-        }))
+        });
+        self.release_metadata.insert(metadata_key, metadata.clone());
+        Ok(metadata)
     }
 
     fn fetch_api_versions(

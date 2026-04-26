@@ -1,9 +1,9 @@
 [package]
-name = "cooldown-demo"
+name = "cooldown-crates-io-smoke-workspace"
 version = "0.1.0"
 edition = "2024"
 authors = ["cargo-cooldown maintainers"]
-description = "Sample workspace used to exercise cargo-cooldown locally"
+description = "Small crates.io-backed workspace used by smoke scripts and the default benchmark"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }

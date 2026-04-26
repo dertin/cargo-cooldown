@@ -7,9 +7,9 @@ At a high level:
 
 1. snapshot the initial `Cargo.lock`;
 2. read Cargo's current resolved graph;
-3. inspect reachable registry packages that are not skipped or allowlisted;
+3. inspect reachable registry packages that are not skipped or covered by allow rules;
 4. by default, apply cooldown only to new or version-changed lockfile entries;
-5. try older compatible versions with `cargo update --precise`;
+5. solve older compatible versions in a verified lockfile batch;
 6. restore the original `Cargo.lock` if the cooldown run fails after Cargo has
    already rewritten it;
 7. run the requested Cargo command once the graph is acceptable.
@@ -24,8 +24,10 @@ Key behavior:
 - the local registry index cache is used first, with per-crate HTTP fallback
   only when `pubtime` is missing;
 - unchanged lockfile entries are skipped by default;
-- `lockfile_policy = "all"` (or `COOLDOWN_LOCKFILE_POLICY=all`) restores the
-  previous "cool every eligible locked package" behavior;
+- `cargo cooldown update` protects pre-update lockfile versions by default, and
+  `lockfile_policy = "all"` opts into checking those versions too;
+- `lockfile_policy = "all"` (or `COOLDOWN_LOCKFILE_POLICY=all`) checks every
+  eligible locked package, including unchanged lockfile entries;
 - `mode = "strict"` is fail-closed and restores the original lockfile if any
   resolver-constrained fresh versions remain;
 - `mode = "best_effort"` keeps the best lockfile it could produce and warns

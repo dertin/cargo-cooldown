@@ -78,12 +78,21 @@ Supported `cooldown.toml` keys:
 - `verbose`
 - `skip_registries`
 
+`cooldown.toml` accepts the lowercase keys shown above. Unknown keys and
+invalid values fail configuration loading.
+
 Set `verbose = true` when you want `DEBUG` logs for cooldown internals. Normal
 user-facing output stays compact: cooldown prints one final summary block with
 Cargo-style version lines that merge the net `Cargo.lock` changes from `cargo
 update` with any cooldown adjustments, plus any fresh versions that had to
 remain. On interactive terminals, cooldown also shows a resolver progress bar
 and colored Cargo-style status labels.
+
+Cooldown uses one verified lockfile batch path by default. It reads local
+registry dependency metadata, solves compatible dependency components, rewrites
+the selected `Cargo.lock` entries, and then asks Cargo to validate the final
+graph. Duplicate package names are eligible because cooldown tracks packages by
+current locked version and validates the result with Cargo.
 
 Define allow rules in `cooldown.toml`:
 
@@ -154,7 +163,9 @@ mode and becomes a warning in `best_effort` mode.
 - `cargo cooldown update`
   snapshots the current `Cargo.lock`, runs `cargo update`, and then cools only
   the versions that are new relative to that pre-update baseline when
-  `lockfile_policy = "changed"`
+  `lockfile_policy = "changed"`; versions that were already locked before the
+  update act as the minimum allowed version. With `lockfile_policy = "all"`,
+  every eligible locked package is checked against the cooldown window.
 
 `cargo cooldown init` is reserved for the cooldown configuration wizard rather
 than forwarding to Cargo's own `init`.
@@ -177,9 +188,17 @@ In a workspace, the recommended layout is:
 
 ## Examples
 
-- `examples/demo/` contains a small crates.io-backed workspace for manual runs.
-- `examples/smoke-test-crates-io.sh` exercises a few non-deterministic scenarios
+- `examples/crates-io-smoke-workspace/` contains a small crates.io-backed
+  workspace for manual runs and the default benchmark.
+- `examples/crates-io-large-benchmark-workspace/` contains a larger
+  crates.io-backed workspace for the aggressive 60-day benchmark.
+- `examples/run-crates-io-smoke.sh` exercises a few non-deterministic scenarios
   against the current crates.io state.
+- `examples/run-crates-io-benchmark.sh` is the shared wall-clock benchmark
+  runner; it reports average time and registry API fallback usage.
+- `cargo bench --bench crates_io_cooldown -- --scenario large-60d` runs the
+  same benchmark runner through Cargo's benchmark command.
+- `examples/README.md` maps every examples workspace to the scripts that use it.
 - the deterministic integration suite lives in `./tests`.
   It generates its registry and workspace fixtures at runtime instead of relying
   on committed snapshots under `examples/fixtures`.

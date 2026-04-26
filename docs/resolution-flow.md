@@ -34,12 +34,12 @@ flowchart TD
     NextPkg --> DoneScan{More packages?}
     Queue --> DoneScan
     DoneScan -->|Yes| Scan
-    DoneScan -->|No| PinLoop[Pick candidate and try cargo update --precise]
-    PinLoop --> Applied{Pin applied?}
-    Applied -->|Yes| Metadata
-    Applied -->|No, blockers found| Requeue[Requeue blockers]
-    Requeue --> PinLoop
-    Applied -->|No, no candidate| Fail([Fail by policy])
+    DoneScan -->|No| Batch[Build local batch assignment]
+    Batch --> Validate[Validate with Cargo metadata]
+    Validate -->|Applied| Metadata
+    Validate -->|Rejected| Policy[Report unresolved fresh packages by mode]
+    Policy -->|strict| Fail([Restore original lockfile and fail])
+    Policy -->|best_effort| Done([Keep best valid lockfile])
 ```
 
 ## 1. Execution boundary
@@ -87,18 +87,22 @@ That means `cargo cooldown update` has this exact shape:
 5. pin only the newly introduced or version-changed fresh entries, but allow
    them to return to an exact version from the original snapshot even if that
    baseline version is still fresher than the cutoff;
-6. if the cooldown step fails in `strict` mode, restore the original lockfile.
+6. with `lockfile_policy = "changed"`, reject any cooldown assignment that would
+   downgrade a package below the newest version of that package already present
+   in the original snapshot;
+7. if the cooldown step fails in `strict` mode, restore the original lockfile.
 
 ## 2. Graph scan and release-age inspection
 
 On each outer pass, `cargo-cooldown` runs `cargo metadata` and rebuilds the
-current resolved graph.
+derived cooldown state from Cargo's current resolved graph.
 
-For each registry package in that graph:
+For each registry package in the selected dependency closure:
 
 1. resolve the effective registry location from Cargo's own configuration;
 2. skip the package immediately if its registry is in `skip_registries`;
-3. skip the package if it is exact-allowlisted or its effective cooldown is `0`;
+3. skip the package if it matches an exact allow rule or its effective cooldown
+   is `0`;
 4. if `lockfile_policy = "changed"`, skip the package when the exact locked
    `(registry, crate, version)` was already present in the initial lockfile
    baseline;
@@ -109,7 +113,10 @@ pre-update snapshot. So a version that was already in `Cargo.lock` before the
 update remains exempt, while a version introduced by `cargo update` is eligible
 for cooldown. If `cargo update` moves `foo 1.2.3` to `foo 1.2.4`, cooldown may
 pin `foo` back to `1.2.3` even when `1.2.3` is still fresh, because that exact
-version was already part of the baseline snapshot.
+version was already part of the baseline snapshot. With the default
+`lockfile_policy = "changed"`, it will not pin `foo` below `1.2.3` during that
+update run. With `lockfile_policy = "all"`, the pre-update snapshot is not an
+exemption, so `foo` can be cooled below `1.2.3` when Cargo accepts the result.
 
 The age inspection itself works like this:
 
@@ -140,7 +147,23 @@ cutoff:
    - and is either older than the cutoff or already present in the initial
      lockfile baseline when `lockfile_policy = "changed"`.
 
-Fresh packages are queued and pinned one at a time with `cargo update --precise`.
+Fresh packages are first considered for one bulk lockfile assignment. Cooldown
+selects older candidates, builds local dependency components from registry
+metadata, follows both dependencies and current reverse dependents that would be
+broken by a lower version, and searches a bounded set of compatible
+assignments. Local solver identities are `(registry, crate, current locked
+version)`, and candidate dependencies are mapped through Cargo's current
+resolved `PackageId` graph before falling back to semver matching. That lets
+components include multiple locked versions of the same crate, such as
+`getrandom 0.2` and `getrandom 0.3`, without conflating their constraints. It
+then rewrites those package entries in `Cargo.lock` and asks Cargo to validate
+the result. The fast validation starts with a locked metadata pass; if Cargo
+only needs to refresh lockfile dependency entries, cooldown allows one normal
+metadata pass and then checks the result with locked metadata again. If Cargo
+rejects the batch, cooldown restores the previous lockfile and prunes the
+reported blockers. The retry budget grows logarithmically with batch size and
+stops early for broad batches where each rejection removes too little of the
+candidate set to converge cheaply.
 
 If Cargo rejects a pin because another package blocks it, the blocker is queued
 and the resolver keeps working inside that same pass.
@@ -155,9 +178,9 @@ Two details matter here:
   run, or otherwise cooldown-exempt, the resolver keeps the currently
   locked version, emits a warning, and continues cooling the rest of the graph.
 
-If a pin succeeds, the resolver restarts from `cargo metadata` so Cargo can
-re-resolve the graph from the new lockfile state. Best-effort skips stay tied
-to the exact `(registry, crate, version)` that was skipped, so the same fresh
+If a batch succeeds, the resolver restarts from `cargo metadata` so Cargo can
+re-resolve the graph from the new lockfile state. Best-effort skips stay tied to
+the exact `(registry, crate, version)` that was skipped, so the same fresh
 version is not requeued again through blocker propagation after a restart. The
 initial baseline does not change, so any package that moves to a version not
 present in that baseline becomes eligible for cooldown on the next pass.
@@ -167,15 +190,14 @@ resolver also restarts from `cargo metadata` once so those skipped versions are
 left out of the next freshness queue instead of ending in a generic fixed-point
 error immediately.
 
-Before giving up on the remaining best-effort set, cooldown now runs one more
+Before giving up on the remaining best-effort set, cooldown runs one more
 bounded pass for small resolver-constrained bundles. It groups fresh crates that
 kept blocking each other, searches a small set of mutually compatible older
 versions using local index dependency metadata, rewrites that bundle in
 `Cargo.lock` as one coordinated candidate state, and asks Cargo to validate the
 result. This helps for tightly coupled stacks such as `js-sys` /
-`wasm-bindgen*` / `web-sys`, where no single `cargo update --precise` can make
-progress from the current lockfile but a coordinated older bundle is still
-valid.
+`wasm-bindgen*` / `web-sys`, where no single-package downgrade can make progress
+from the current lockfile but a coordinated older bundle is still valid.
 
 At the end of the run, cooldown emits one user-facing summary block. For cooled
 packages, it renders Cargo-style lines from the initial `Cargo.lock` version to
@@ -194,24 +216,7 @@ That final distinction also drives the mode policy:
 - `best_effort` keeps the resulting lockfile and prints one warning block with
   those remaining fresh versions
 
-That is the main remaining cost today: the resolved graph is still rebuilt after
-each successful pin, even though the registry timelines and many locked-version
-inspections are already cached.
-
-## Next optimization level
-
-The next step is more complex: stop rescanning the whole resolved graph after
-every successful pin.
-
-The efficient model is an incremental frontier:
-
-1. keep the reverse dependency graph in memory;
-2. after a pin, identify only the package IDs whose locked versions changed;
-3. invalidate freshness and candidate state for those packages plus their
-   reverse dependents;
-4. recompute only that affected slice instead of rebuilding the full set of
-   fresh packages from scratch.
-
-That should reduce the repeated full-graph passes seen in large cooldown runs,
-but it needs careful bookkeeping to avoid stale semver constraints and blocker
-propagation bugs.
+The main scalability goal of the batch solver is to avoid one Cargo resolver
+invocation per independent fresh crate. The bulk path handles the common case
+where many packages can be cooled together while keeping Cargo as the final
+validator for the resulting graph.

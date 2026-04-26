@@ -1,6 +1,6 @@
-# Baseline demo settings; individual runs override values via environment variables.
+# Baseline smoke-workspace settings; individual runs override values via environment variables.
 cooldown_minutes = 720
-mode = "enforce"
+mode = "strict"
 ttl_seconds = 86400
 http_retries = 2
 verbose = true

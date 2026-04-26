@@ -31,8 +31,10 @@ in the graph.
 Possible reasons:
 
 - no older compatible version exists before the cutoff;
-- the package is allowlisted;
+- the package matches an allow rule;
 - the package comes from a skipped registry;
+- `cargo cooldown update` with `lockfile_policy = "changed"` would have to go
+  below a version that was already in the pre-update lockfile;
 - Cargo rejected the candidate because of blockers elsewhere in the graph.
 
 ## A member-specific config file was ignored

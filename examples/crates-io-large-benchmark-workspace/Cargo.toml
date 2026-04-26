@@ -1,0 +1,47 @@
+[package]
+name = "cooldown-crates-io-large-benchmark-workspace"
+version = "0.1.0"
+edition = "2024"
+authors = ["cargo-cooldown maintainers"]
+description = "Large crates.io-backed workspace used by the aggressive 60-day cooldown benchmark"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+bytes = "1"
+camino = "1"
+cargo_metadata = "0.19"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+config = { version = "0.15", default-features = false, features = ["toml"] }
+futures = "0.3"
+hashbrown = "0.15"
+ignore = "0.4"
+indexmap = { version = "2", features = ["serde"] }
+itertools = "0.14"
+jsonschema = { version = "0.30", default-features = false }
+notify = "8"
+parking_lot = "0.12"
+petgraph = "0.8"
+prost = "0.14"
+rand = "0.8"
+rayon = "1"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "charset", "system-proxy", "json", "multipart", "blocking", "stream", "gzip", "brotli", "zstd", "deflate", "cookies", "socks", "hickory-dns"] }
+semver = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "sqlite", "macros", "chrono", "uuid", "json"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+tower = { version = "0.5", features = ["util", "timeout", "limit", "load-shed"] }
+tower-http = { version = "0.6", features = ["compression-full", "cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+walkdir = "2"
