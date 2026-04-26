@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -34,7 +35,14 @@ impl LockfileSnapshot {
     /// crate, effective registry URL, and version. The returned snapshot can be
     /// queried during resolution and later restored byte-for-byte.
     pub fn capture(path: &Path, registry_store: &mut RegistryStore) -> Result<Self> {
-        let contents = fs::read_to_string(path).ok();
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => Some(contents),
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to read lockfile {}", path.display()));
+            }
+        };
         let baseline = LockfileBaseline::from_contents(contents.as_deref(), registry_store)?;
         Ok(Self { baseline, contents })
     }
@@ -313,5 +321,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         snapshot.restore(&path).unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn capture_fails_when_existing_lockfile_cannot_be_read_as_text() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("Cargo.lock");
+        fs::write(&path, [0xff]).unwrap();
+        let mut registry_store = RegistryStore::new(&config_fixture()).unwrap();
+
+        let err = LockfileSnapshot::capture(&path, &mut registry_store).unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("failed to read lockfile"),
+            "{err:#}"
+        );
+        assert!(path.exists());
     }
 }
