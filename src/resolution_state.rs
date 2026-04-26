@@ -300,7 +300,7 @@ impl ResolutionState {
             .config
             .allow_rules
             .is_exact_allowed(package.name.as_str(), &current_version);
-        let baseline_exempt = !ctx.config.lockfile_policy.applies_to_existing_lockfile()
+        let baseline_exempt = ctx.config.lockfile_baseline.uses_initial_lockfile_floor()
             && ctx.initial_lockfile.baseline().contains_registry_version(
                 package.name.as_str(),
                 &context.effective_index_url,
@@ -706,14 +706,14 @@ fn find_manifest_dependency<'a>(
 mod tests {
     use super::*;
     use crate::allow_rules::AllowRules;
-    use crate::config::{Config, LockfilePolicy, Mode};
+    use crate::config::{Config, LockfileBaselineMode, Mode};
     use serde_json::json;
 
     fn config_fixture() -> Config {
         Config {
             cooldown_minutes: 60,
             mode: Mode::Strict,
-            lockfile_policy: LockfilePolicy::All,
+            lockfile_baseline: LockfileBaselineMode::Ignore,
             now_override: None,
             ttl_seconds: 60,
             cache_dir: None,

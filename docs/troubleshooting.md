@@ -9,9 +9,9 @@ Meaning:
 - Cargo still required those fresh versions
 - `strict` mode restored the original `Cargo.lock`
 
-This is different from `lockfile_policy`.
+This is different from `lockfile_baseline`.
 
-- `lockfile_policy = "all"` lets cooldown try to downgrade packages that were
+- `lockfile_baseline = "ignore"` lets cooldown try to downgrade packages that were
   already in the initial lockfile.
 - `mode = "strict"` still fails if any fresh version remains after those
   attempts.
@@ -40,9 +40,9 @@ cargo update -p icu_normalizer --precise 2.0.0
 Cargo's error usually names the manifest or transitive dependency that prevents
 the downgrade.
 
-## A Fresh Version Remains With `lockfile_policy = "all"`
+## A Fresh Version Remains With `lockfile_baseline = "ignore"`
 
-`lockfile_policy = "all"` removes the initial lockfile protection. It does not
+`lockfile_baseline = "ignore"` removes the initial lockfile protection. It does not
 override Cargo's resolver.
 
 A fresh version can remain when:
@@ -62,7 +62,7 @@ Possible reasons:
 - Cargo rejected every older candidate
 - an allow rule applies
 - the package comes from a skipped registry
-- `lockfile_policy = "changed"` protects the version from the initial lockfile
+- `lockfile_baseline = "floor"` protects the version from the initial lockfile
 
 ## "missing release timestamp"
 

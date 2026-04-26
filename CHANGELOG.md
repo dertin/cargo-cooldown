@@ -14,8 +14,8 @@ Migration guide:
 - index-first release-time resolution from Cargo's local registry cache
 - per-crate HTTP fallback when `pubtime` is missing
 - explicit `skip_registries` / `COOLDOWN_SKIP_REGISTRIES`
-- explicit `lockfile_policy` / `COOLDOWN_LOCKFILE_POLICY` to choose between
-  cooling only changed lockfile entries or cooling all eligible entries
+- explicit `lockfile_baseline` / `COOLDOWN_LOCKFILE_BASELINE` to choose between
+  using the initial lockfile as a version floor or ignoring that floor
 - `cargo cooldown update` to refresh the lockfile first and then cool only the
   versions that changed relative to the pre-update baseline
 - `cargo cooldown init` to scaffold `cooldown.toml` interactively for crates
@@ -57,7 +57,7 @@ for the upgrade steps.
   fail because metadata is incomplete
 - cooldown now restores the original `Cargo.lock` if Cargo re-resolves during
   inspection and the cooldown run ultimately fails
-- `lockfile_policy = "changed"` now allows `cargo cooldown update` to pin a
+- `lockfile_baseline = "floor"` now allows `cargo cooldown update` to pin a
   freshly updated crate back to an exact version from the initial baseline,
   even when that baseline version is still inside the cooldown window
 - cooldown now treats blockers or parent constraints that were already

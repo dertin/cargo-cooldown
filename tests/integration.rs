@@ -29,7 +29,7 @@ const FRESHER_PUBTIME: &str = "2026-04-02T18:00:00Z";
 const NOW: &str = "2026-04-03T00:00:00Z";
 const COOLDOWN_MINUTES: &str = "1440";
 const REGISTRY_NAME: &str = "cool-reg";
-const LOCKFILE_POLICY_ALL: (&str, &str) = ("COOLDOWN_LOCKFILE_POLICY", "all");
+const LOCKFILE_BASELINE_IGNORE: (&str, &str) = ("COOLDOWN_LOCKFILE_BASELINE", "ignore");
 const CHAIN_A_NAME: &str = "chaina";
 const CHAIN_A_OLD_VERSION: &str = "1.2.2";
 const CHAIN_A_FRESH_VERSION: &str = "1.2.3";
@@ -89,7 +89,7 @@ fn existing_lockfile_fresh_dependency_is_ignored_by_default() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("cooldown: inspected"),
-        "default lockfile policy should not inspect unchanged baseline versions: {stderr}"
+        "default lockfile baseline should not inspect unchanged baseline versions: {stderr}"
     );
     assert!(
         !stderr.contains("cooldown finished with fresh versions remaining."),
@@ -104,7 +104,7 @@ fn uses_index_pubtime_without_hitting_api() {
     assert_eq!(harness.locked_version(), FRESH_VERSION);
 
     harness.server.reset_counts();
-    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_VERBOSE", "true")]);
+    let output = harness.run_cooldown(&[LOCKFILE_BASELINE_IGNORE, ("COOLDOWN_VERBOSE", "true")]);
     assert!(
         output.status.success(),
         "cooldown should succeed: {}",
@@ -128,7 +128,7 @@ fn fills_missing_pubtime_via_fallback_api() {
     assert_eq!(harness.locked_version(), FRESH_VERSION);
 
     harness.server.reset_counts();
-    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_VERBOSE", "true")]);
+    let output = harness.run_cooldown(&[LOCKFILE_BASELINE_IGNORE, ("COOLDOWN_VERBOSE", "true")]);
     assert!(
         output.status.success(),
         "cooldown should succeed: {}",
@@ -150,7 +150,7 @@ fn fails_closed_when_registry_lacks_release_time_metadata() {
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");
     harness.generate_lockfile();
 
-    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL]);
+    let output = harness.run_cooldown(&[LOCKFILE_BASELINE_IGNORE]);
     assert!(!output.status.success(), "cooldown should fail closed");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("missing release timestamp"), "{stderr}");
@@ -163,7 +163,8 @@ fn best_effort_mode_continues_when_registry_lacks_release_time_metadata() {
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");
     harness.generate_lockfile();
 
-    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_MODE", "best_effort")]);
+    let output =
+        harness.run_cooldown(&[LOCKFILE_BASELINE_IGNORE, ("COOLDOWN_MODE", "best_effort")]);
     assert!(
         output.status.success(),
         "best_effort mode should continue: {}",
@@ -179,7 +180,7 @@ fn skips_registry_from_start_by_name() {
     harness.generate_lockfile();
 
     let output = harness.run_cooldown(&[
-        LOCKFILE_POLICY_ALL,
+        LOCKFILE_BASELINE_IGNORE,
         ("COOLDOWN_SKIP_REGISTRIES", REGISTRY_NAME),
     ]);
     assert!(
@@ -198,7 +199,7 @@ fn skips_registry_from_start_by_effective_url() {
     let skip_value = format!("sparse+{}/index/", harness.server.base_url());
 
     let output = harness.run_cooldown(&[
-        LOCKFILE_POLICY_ALL,
+        LOCKFILE_BASELINE_IGNORE,
         ("COOLDOWN_SKIP_REGISTRIES", &skip_value),
     ]);
     assert!(
@@ -216,7 +217,7 @@ fn mode_off_skips_cooldown_checks_entirely() {
     harness.generate_lockfile();
     harness.server.reset_counts();
 
-    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_MODE", "off")]);
+    let output = harness.run_cooldown(&[LOCKFILE_BASELINE_IGNORE, ("COOLDOWN_MODE", "off")]);
     assert!(
         output.status.success(),
         "mode=off should bypass cooldown: {}",
@@ -274,7 +275,7 @@ fn honors_manifest_path_in_cargo_style_order_from_external_cwd() {
     let output = harness.run_command_in(
         &runner_dir,
         &["check", "--manifest-path", manifest_path.as_str()],
-        &[LOCKFILE_POLICY_ALL],
+        &[LOCKFILE_BASELINE_IGNORE],
     );
     assert!(
         output.status.success(),
@@ -295,7 +296,7 @@ fn honors_manifest_path_before_subcommand_from_external_cwd() {
     let output = harness.run_command_in(
         &runner_dir,
         &["--manifest-path", manifest_path.as_str(), "check"],
-        &[LOCKFILE_POLICY_ALL],
+        &[LOCKFILE_BASELINE_IGNORE],
     );
     assert!(
         output.status.success(),
@@ -369,7 +370,7 @@ fn exact_allow_rule_keeps_fresh_version_pinned() {
     fs::write(
         &config,
         format!(
-            "cooldown_minutes = 1440\nlockfile_policy = \"all\"\n\n[[allow.exact]]\ncrate = \"{CRATE_NAME}\"\nversion = \"{FRESH_VERSION}\"\n"
+            "cooldown_minutes = 1440\nlockfile_baseline = \"ignore\"\n\n[[allow.exact]]\ncrate = \"{CRATE_NAME}\"\nversion = \"{FRESH_VERSION}\"\n"
         ),
     )
     .expect("config should be writable");
@@ -384,7 +385,7 @@ fn exact_allow_rule_keeps_fresh_version_pinned() {
 }
 
 #[test]
-fn cooldown_update_keeps_existing_baseline_versions_under_changed_policy() {
+fn cooldown_update_keeps_existing_baseline_versions_with_floor_baseline() {
     let harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
     let mut harness = harness;
     harness.generate_lockfile();
@@ -553,8 +554,8 @@ fn cooldown_update_does_not_downgrade_existing_fresh_lockfile_versions() {
 }
 
 #[test]
-fn cooldown_update_all_policy_can_cool_existing_lockfile_versions() {
-    assert_cooldown_update_with_existing_fresh_lockfile_version(&[LOCKFILE_POLICY_ALL], true);
+fn cooldown_update_ignore_baseline_can_cool_existing_lockfile_versions() {
+    assert_cooldown_update_with_existing_fresh_lockfile_version(&[LOCKFILE_BASELINE_IGNORE], true);
 }
 
 fn assert_cooldown_update_with_existing_fresh_lockfile_version(
@@ -652,7 +653,7 @@ fn assert_cooldown_update_with_existing_fresh_lockfile_version(
     if expect_success {
         assert!(
             output.status.success(),
-            "all policy should cool both existing and newly introduced fresh versions: {}",
+            "ignore baseline should cool both existing and newly introduced fresh versions: {}",
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(
@@ -692,7 +693,7 @@ fn coordinated_bundle_resolution_cools_exactly_coupled_transitives() {
         BUNDLE_FRESH_VERSION
     );
 
-    let output = harness.run_cooldown(&[LOCKFILE_POLICY_ALL, ("COOLDOWN_VERBOSE", "true")]);
+    let output = harness.run_cooldown(&[LOCKFILE_BASELINE_IGNORE, ("COOLDOWN_VERBOSE", "true")]);
     assert!(
         output.status.success(),
         "coordinated bundle resolution should cool the coupled transitive crates: {}",
@@ -1642,7 +1643,7 @@ impl BacktrackingBundleHarness {
             .env("COOLDOWN_NOW", NOW)
             .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
             .env("COOLDOWN_HTTP_RETRIES", "0")
-            .env("COOLDOWN_LOCKFILE_POLICY", "all")
+            .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
             .env("PATH", &self.path_with_wrapper)
             .output()
             .expect("cargo-cooldown should run")
@@ -1747,7 +1748,7 @@ impl DuplicateNameBatchHarness {
             .env("COOLDOWN_NOW", NOW)
             .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
             .env("COOLDOWN_HTTP_RETRIES", "0")
-            .env("COOLDOWN_LOCKFILE_POLICY", "all")
+            .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
             .env("PATH", &self.path_with_wrapper)
             .output()
             .expect("cargo-cooldown should run")
@@ -1875,7 +1876,7 @@ impl DuplicateTransitiveBatchHarness {
             .env("COOLDOWN_NOW", NOW)
             .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
             .env("COOLDOWN_HTTP_RETRIES", "0")
-            .env("COOLDOWN_LOCKFILE_POLICY", "all")
+            .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
             .env("COOLDOWN_VERBOSE", "true")
             .env("PATH", &self.path_with_wrapper)
             .output()
@@ -2094,7 +2095,7 @@ impl MultiPassBenchmarkHarness {
             .env("COOLDOWN_NOW", NOW)
             .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
             .env("COOLDOWN_HTTP_RETRIES", "0")
-            .env("COOLDOWN_LOCKFILE_POLICY", "all")
+            .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
             .env("PATH", &self.path_with_wrapper);
 
         for (key, value) in extra_env {
@@ -2191,7 +2192,7 @@ index = "sparse+{base_url}/index/"
             .env("COOLDOWN_NOW", NOW)
             .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
             .env("COOLDOWN_HTTP_RETRIES", "0")
-            .env("COOLDOWN_LOCKFILE_POLICY", "all")
+            .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
             .env("PATH", &self.path_with_wrapper)
             .output()
             .expect("cargo-cooldown should run")
@@ -2271,7 +2272,7 @@ impl ScopedConflictHarness {
             .env("COOLDOWN_NOW", NOW)
             .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
             .env("COOLDOWN_HTTP_RETRIES", "0")
-            .env("COOLDOWN_LOCKFILE_POLICY", "all");
+            .env("COOLDOWN_LOCKFILE_BASELINE", "ignore");
 
         if let Some(mode) = mode {
             command.env("COOLDOWN_MODE", mode);

@@ -13,7 +13,7 @@ use crate::project::{ProjectContext, ProjectKind, ProjectMember};
 struct ConfigTemplate {
     cooldown_minutes: Option<u64>,
     mode: Option<String>,
-    lockfile_policy: Option<String>,
+    lockfile_baseline: Option<String>,
     skip_registries: Vec<String>,
     include_allow_examples: bool,
 }
@@ -139,7 +139,7 @@ fn build_workspace_plan(project: &ProjectContext) -> Result<InitPlan> {
 fn prompt_base_template() -> Result<ConfigTemplate> {
     let cooldown_minutes = prompt_u64("Cooldown minutes", 1440)?;
     let mode = select_mode("Mode", "strict")?;
-    let lockfile_policy = select_lockfile_policy("Lockfile policy", "changed")?;
+    let lockfile_baseline = select_lockfile_baseline("Cargo.lock baseline", "floor")?;
     let skip_registries =
         prompt_registry_list("Registries to skip (comma-separated, leave blank for none)")?;
     let include_allow_examples = prompt_confirm("Include commented allow rule examples?", true)?;
@@ -147,7 +147,7 @@ fn prompt_base_template() -> Result<ConfigTemplate> {
     Ok(ConfigTemplate {
         cooldown_minutes: Some(cooldown_minutes),
         mode: Some(mode),
-        lockfile_policy: Some(lockfile_policy),
+        lockfile_baseline: Some(lockfile_baseline),
         skip_registries,
         include_allow_examples,
     })
@@ -172,8 +172,8 @@ fn prompt_member_template(member: &ProjectMember) -> Result<Option<ConfigTemplat
     } else {
         None
     };
-    let lockfile_policy = if customize_config {
-        select_optional_lockfile_policy("Override lockfile policy (leave blank to inherit)")?
+    let lockfile_baseline = if customize_config {
+        select_optional_lockfile_baseline("Override Cargo.lock baseline (leave blank to inherit)")?
     } else {
         None
     };
@@ -185,7 +185,7 @@ fn prompt_member_template(member: &ProjectMember) -> Result<Option<ConfigTemplat
 
     if cooldown_minutes.is_none()
         && mode.is_none()
-        && lockfile_policy.is_none()
+        && lockfile_baseline.is_none()
         && skip_registries.is_empty()
         && !include_allow_examples
     {
@@ -195,7 +195,7 @@ fn prompt_member_template(member: &ProjectMember) -> Result<Option<ConfigTemplat
     Ok(Some(ConfigTemplate {
         cooldown_minutes,
         mode,
-        lockfile_policy,
+        lockfile_baseline,
         skip_registries,
         include_allow_examples,
     }))
@@ -220,8 +220,11 @@ fn render_config_file(template: &ConfigTemplate, is_override: bool) -> String {
     if let Some(mode) = &template.mode {
         writeln!(&mut output, "mode = \"{mode}\"").expect("writing to String should not fail");
     }
-    if let Some(lockfile_policy) = &template.lockfile_policy {
-        writeln!(&mut output, "lockfile_policy = \"{lockfile_policy}\"")
+    if let Some(lockfile_baseline) = &template.lockfile_baseline {
+        output.push_str(
+            "# `floor` keeps initial Cargo.lock versions as the minimum; `ignore` allows lower versions.\n",
+        );
+        writeln!(&mut output, "lockfile_baseline = \"{lockfile_baseline}\"")
             .expect("writing to String should not fail");
     }
     if !template.skip_registries.is_empty() {
@@ -450,24 +453,28 @@ fn select_optional_mode(prompt: &str) -> Result<Option<String>> {
     }
 }
 
-fn select_lockfile_policy(prompt: &str, default: &str) -> Result<String> {
-    let options = ["changed", "all"];
-    let default_index = options
+fn select_lockfile_baseline(prompt: &str, default: &str) -> Result<String> {
+    let values = ["floor", "ignore"];
+    let labels = [
+        "floor - use initial Cargo.lock versions as the minimum floor",
+        "ignore - allow cooldown below initial Cargo.lock versions",
+    ];
+    let default_index = values
         .iter()
         .position(|value| *value == default)
         .unwrap_or(0);
-    Ok(options[prompt_select(prompt, &options, default_index)?].to_string())
+    Ok(values[prompt_select(prompt, &labels, default_index)?].to_string())
 }
 
-fn select_optional_lockfile_policy(prompt: &str) -> Result<Option<String>> {
+fn select_optional_lockfile_baseline(prompt: &str) -> Result<Option<String>> {
     loop {
         let input = prompt_input(prompt, Some(""))?;
         if input.is_empty() {
             return Ok(None);
         }
         match input.as_str() {
-            "changed" | "all" => return Ok(Some(input)),
-            _ => eprintln!("Please enter `changed`, `all`, or leave the field blank."),
+            "floor" | "ignore" => return Ok(Some(input)),
+            _ => eprintln!("Please enter `floor`, `ignore`, or leave the field blank."),
         }
     }
 }
@@ -505,7 +512,7 @@ mod tests {
             &ConfigTemplate {
                 cooldown_minutes: Some(1440),
                 mode: Some("strict".to_string()),
-                lockfile_policy: Some("changed".to_string()),
+                lockfile_baseline: Some("floor".to_string()),
                 skip_registries: vec!["crates-io".to_string()],
                 include_allow_examples: true,
             },
@@ -523,7 +530,7 @@ mod tests {
             &ConfigTemplate {
                 cooldown_minutes: None,
                 mode: None,
-                lockfile_policy: None,
+                lockfile_baseline: None,
                 skip_registries: Vec::new(),
                 include_allow_examples: false,
             },

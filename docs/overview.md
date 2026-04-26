@@ -28,7 +28,7 @@ For `cargo cooldown update`:
 
 - `cooldown_minutes` defines what "fresh" means.
 - `mode` decides whether remaining fresh versions are an error or a warning.
-- `lockfile_policy` decides whether versions already present in the initial
+- `lockfile_baseline` decides whether versions already present in the initial
   `Cargo.lock` are protected.
 - `skip_registries` excludes whole registries from cooldown processing.
 - Allow rules intentionally reduce the cooldown window for selected crates.
@@ -37,7 +37,7 @@ For `cargo cooldown update`:
 
 ```toml
 mode = "strict"
-lockfile_policy = "changed"
+lockfile_baseline = "floor"
 ```
 
 In human terms:
@@ -47,7 +47,7 @@ In human terms:
 - fail and restore the original `Cargo.lock` if the updated graph still needs a
   fresh version
 
-Use `lockfile_policy = "all"` when you also want to try cooling versions that
+Use `lockfile_baseline = "ignore"` when you also want to try cooling versions that
 were already locked before the command started.
 
 Use `mode = "best_effort"` when you want to keep Cargo's best valid lockfile and
@@ -55,7 +55,7 @@ only warn about fresh versions that could not be cooled.
 
 ## Why Fresh Versions Can Remain
 
-A fresh version can remain even with `lockfile_policy = "all"` because Cargo may
+A fresh version can remain even with `lockfile_baseline = "ignore"` because Cargo may
 not accept any older graph. Common causes:
 
 - the current manifests require a fresh version range

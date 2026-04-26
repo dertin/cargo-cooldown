@@ -33,24 +33,24 @@ impl Mode {
     }
 }
 
-/// Scope of lockfile entries that may participate in cooldown.
+/// Whether the initial lockfile is used as a minimum version baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LockfilePolicy {
-    Changed,
-    All,
+pub enum LockfileBaselineMode {
+    Floor,
+    Ignore,
 }
 
-impl LockfilePolicy {
+impl LockfileBaselineMode {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
-            "changed" => Ok(LockfilePolicy::Changed),
-            "all" => Ok(LockfilePolicy::All),
-            _ => bail!("invalid lockfile policy `{value}`; expected one of: changed, all"),
+            "floor" => Ok(LockfileBaselineMode::Floor),
+            "ignore" => Ok(LockfileBaselineMode::Ignore),
+            _ => bail!("invalid lockfile baseline `{value}`; expected one of: floor, ignore"),
         }
     }
 
-    pub fn applies_to_existing_lockfile(self) -> bool {
-        matches!(self, LockfilePolicy::All)
+    pub fn uses_initial_lockfile_floor(self) -> bool {
+        matches!(self, LockfileBaselineMode::Floor)
     }
 }
 
@@ -59,7 +59,7 @@ impl LockfilePolicy {
 pub struct Config {
     pub cooldown_minutes: u64,
     pub mode: Mode,
-    pub lockfile_policy: LockfilePolicy,
+    pub lockfile_baseline: LockfileBaselineMode,
     pub now_override: Option<DateTime<Utc>>,
     pub ttl_seconds: u64,
     pub cache_dir: Option<PathBuf>,
@@ -97,7 +97,7 @@ impl Config {
 struct CooldownFile {
     cooldown_minutes: Option<u64>,
     mode: Option<String>,
-    lockfile_policy: Option<String>,
+    lockfile_baseline: Option<String>,
     now: Option<String>,
     ttl_seconds: Option<u64>,
     cache_dir: Option<PathBuf>,
@@ -112,7 +112,7 @@ struct CooldownFile {
 struct MergedConfig {
     cooldown_minutes: Option<u64>,
     mode: Option<Mode>,
-    lockfile_policy: Option<LockfilePolicy>,
+    lockfile_baseline: Option<LockfileBaselineMode>,
     now_override: Option<DateTime<Utc>>,
     ttl_seconds: Option<u64>,
     cache_dir: Option<PathBuf>,
@@ -134,8 +134,8 @@ impl MergedConfig {
         if let Some(mode) = file.data.mode.as_deref() {
             self.mode = Some(Mode::parse(mode)?);
         }
-        if let Some(policy) = file.data.lockfile_policy.as_deref() {
-            self.lockfile_policy = Some(LockfilePolicy::parse(policy)?);
+        if let Some(baseline) = file.data.lockfile_baseline.as_deref() {
+            self.lockfile_baseline = Some(LockfileBaselineMode::parse(baseline)?);
         }
         if let Some(now) = file.data.now.as_deref() {
             self.now_override = Some(parse_datetime(now)?);
@@ -172,8 +172,8 @@ impl MergedConfig {
         if let Ok(value) = env::var("COOLDOWN_MODE") {
             self.mode = Some(Mode::parse(&value)?);
         }
-        if let Ok(value) = env::var("COOLDOWN_LOCKFILE_POLICY") {
-            self.lockfile_policy = Some(LockfilePolicy::parse(&value)?);
+        if let Ok(value) = env::var("COOLDOWN_LOCKFILE_BASELINE") {
+            self.lockfile_baseline = Some(LockfileBaselineMode::parse(&value)?);
         }
         if let Ok(value) = env::var("COOLDOWN_NOW") {
             self.now_override = Some(parse_datetime(&value)?);
@@ -203,7 +203,9 @@ impl MergedConfig {
         Config {
             cooldown_minutes: self.cooldown_minutes.unwrap_or(0),
             mode: self.mode.unwrap_or(Mode::Strict),
-            lockfile_policy: self.lockfile_policy.unwrap_or(LockfilePolicy::Changed),
+            lockfile_baseline: self
+                .lockfile_baseline
+                .unwrap_or(LockfileBaselineMode::Floor),
             now_override: self.now_override,
             ttl_seconds: self.ttl_seconds.unwrap_or(86_400),
             cache_dir: self.cache_dir,
@@ -412,11 +414,11 @@ mod tests {
     }
 
     #[test]
-    fn lockfile_policy_supports_all_env() {
-        with_env_var("COOLDOWN_LOCKFILE_POLICY", Some("all"), || {
+    fn lockfile_baseline_supports_ignore_env() {
+        with_env_var("COOLDOWN_LOCKFILE_BASELINE", Some("ignore"), || {
             let root = TempDir::new().unwrap();
             let config = Config::load(&project_fixture(root.path(), None)).unwrap();
-            assert_eq!(config.lockfile_policy, LockfilePolicy::All);
+            assert_eq!(config.lockfile_baseline, LockfileBaselineMode::Ignore);
         });
     }
 
@@ -444,7 +446,7 @@ mod tests {
             .write_str(
                 r#"cooldown_minutes = 15
 mode = "best_effort"
-lockfile_policy = "all"
+lockfile_baseline = "ignore"
 skip_registries = ["crates-io", "mirror"]
 verbose = true
 
@@ -459,7 +461,7 @@ version = "1.2.3"
 
         assert_eq!(config.cooldown_minutes, 15);
         assert_eq!(config.mode, Mode::BestEffort);
-        assert_eq!(config.lockfile_policy, LockfilePolicy::All);
+        assert_eq!(config.lockfile_baseline, LockfileBaselineMode::Ignore);
         assert_eq!(
             config.skip_registries,
             vec!["crates-io".to_string(), "mirror".to_string()]
@@ -519,32 +521,32 @@ http_retries = 3
         root.child("cooldown.toml")
             .write_str(
                 r#"mode = "best_effort"
-lockfile_policy = "all"
+lockfile_baseline = "ignore"
 skip_registries = ["from-file"]
 "#,
             )
             .unwrap();
 
         let original_mode = env::var("COOLDOWN_MODE").ok();
-        let original_lockfile_policy = env::var("COOLDOWN_LOCKFILE_POLICY").ok();
+        let original_lockfile_baseline = env::var("COOLDOWN_LOCKFILE_BASELINE").ok();
         let original_skips = env::var("COOLDOWN_SKIP_REGISTRIES").ok();
 
         unsafe { env::set_var("COOLDOWN_MODE", "off") };
-        unsafe { env::set_var("COOLDOWN_LOCKFILE_POLICY", "changed") };
+        unsafe { env::set_var("COOLDOWN_LOCKFILE_BASELINE", "floor") };
         unsafe { env::set_var("COOLDOWN_SKIP_REGISTRIES", "from-env") };
 
         let config = Config::load(&project_fixture(root.path(), None)).unwrap();
         assert_eq!(config.mode, Mode::Off);
-        assert_eq!(config.lockfile_policy, LockfilePolicy::Changed);
+        assert_eq!(config.lockfile_baseline, LockfileBaselineMode::Floor);
         assert_eq!(config.skip_registries, vec!["from-env".to_string()]);
 
         match original_mode {
             Some(val) => unsafe { env::set_var("COOLDOWN_MODE", val) },
             None => unsafe { env::remove_var("COOLDOWN_MODE") },
         }
-        match original_lockfile_policy {
-            Some(val) => unsafe { env::set_var("COOLDOWN_LOCKFILE_POLICY", val) },
-            None => unsafe { env::remove_var("COOLDOWN_LOCKFILE_POLICY") },
+        match original_lockfile_baseline {
+            Some(val) => unsafe { env::set_var("COOLDOWN_LOCKFILE_BASELINE", val) },
+            None => unsafe { env::remove_var("COOLDOWN_LOCKFILE_BASELINE") },
         }
         match original_skips {
             Some(val) => unsafe { env::set_var("COOLDOWN_SKIP_REGISTRIES", val) },
@@ -587,16 +589,16 @@ skip_registries = ["from-file"]
     }
 
     #[test]
-    fn rejects_unknown_lockfile_policy_value() {
+    fn rejects_unknown_lockfile_baseline_value() {
         let _guard = env_lock().lock().unwrap();
         let root = TempDir::new().unwrap();
         root.child("cooldown.toml")
-            .write_str(r#"lockfile_policy = "everything""#)
+            .write_str(r#"lockfile_baseline = "everything""#)
             .unwrap();
 
         let err = Config::load(&project_fixture(root.path(), None)).unwrap_err();
         assert!(
-            format!("{err:#}").contains("invalid lockfile policy `everything`"),
+            format!("{err:#}").contains("invalid lockfile baseline `everything`"),
             "{err:#}"
         );
     }

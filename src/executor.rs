@@ -81,7 +81,7 @@ pub fn run_pinning_flow(
 ///
 /// The snapshot stores the file contents and an index of registry package
 /// versions. Later phases use it to restore the exact starting state on failure
-/// and, under the default `changed` policy, to avoid downgrading versions that
+/// and, under the default `floor` baseline, to avoid downgrading versions that
 /// were already locked before this command started.
 pub fn capture_initial_lockfile(config: &Config, manifest: &Manifest) -> Result<LockfileSnapshot> {
     let mut registry_store = RegistryStore::new(config)?;
@@ -112,7 +112,7 @@ pub fn run_pinning_flow_with_snapshot(
     let mut ui = UserOutput::new(config.verbose);
     let result = (|| {
         // Missing lockfiles are created only after the initial snapshot exists, so the
-        // default policy always compares against the pre-run lockfile state.
+        // default baseline always compares against the pre-run lockfile state.
         ui.set_phase("Preparing cooldown scan...");
         ensure_lockfile(manifest, &lockfile_path)?;
         let now = config.now_override.unwrap_or_else(Utc::now);
@@ -1330,7 +1330,7 @@ struct CooldownBatchSolverCtx<'a> {
 /// Try to cool many fresh crates with one validated lockfile rewrite.
 ///
 /// For each fresh crate this builds a candidate pin from registry metadata,
-/// applies any baseline floor required by `lockfile_policy = "changed"`, asks
+/// applies any baseline floor required by `lockfile_baseline = "floor"`, asks
 /// the local dependency solver to add coupled transitive pins, and then validates
 /// the whole batch with Cargo. It returns fresh `cargo metadata` when Cargo
 /// accepted the assignment, or `None` when this pass should fall back to smaller
@@ -2491,11 +2491,11 @@ fn version_matches_requirements(version: &str, requirements: &[VersionReq]) -> b
         .all(|requirement| requirement.matches(&parsed))
 }
 
-/// Convert the initial lockfile version into a semver floor when policy requires it.
+/// Convert the initial lockfile version into a semver floor when baseline mode requires it.
 ///
-/// Under `lockfile_policy = "changed"`, an already locked version becomes the
+/// Under `lockfile_baseline = "floor"`, an already locked version becomes the
 /// minimum acceptable candidate for the same crate and registry. Returning
-/// `None` means the current policy allows normal cooldown downgrades.
+/// `None` means the current baseline mode allows normal cooldown downgrades.
 fn baseline_floor_requirement(
     initial_lockfile: &LockfileSnapshot,
     config: &Config,
@@ -2503,11 +2503,11 @@ fn baseline_floor_requirement(
     name: &str,
     current_version: &str,
 ) -> Option<VersionReq> {
-    if config.lockfile_policy.applies_to_existing_lockfile() {
+    if !config.lockfile_baseline.uses_initial_lockfile_floor() {
         return None;
     }
 
-    // Default policy treats the pre-run lockfile as the minimum effective
+    // Default baseline treats the pre-run lockfile as the minimum effective
     // version, preventing accidental downgrades of already locked packages.
     let floor =
         initial_lockfile
@@ -2532,7 +2532,7 @@ fn baseline_allows_candidate(
     name: &str,
     version: &str,
 ) -> bool {
-    !config.lockfile_policy.applies_to_existing_lockfile()
+    config.lockfile_baseline.uses_initial_lockfile_floor()
         && initial_lockfile
             .baseline()
             .contains_registry_version(name, registry, version)
@@ -3336,7 +3336,7 @@ fn record_dependency_requirements(
 mod tests {
     use super::*;
     use crate::allow_rules::AllowRules;
-    use crate::config::{Config, LockfilePolicy, Mode};
+    use crate::config::{Config, LockfileBaselineMode, Mode};
     use serde_json::json;
 
     fn dependency_with(rename: Option<&str>, req: &str) -> cargo_metadata::Dependency {
@@ -4303,7 +4303,7 @@ mod tests {
         let config = Config {
             cooldown_minutes: 60,
             mode: Mode::Strict,
-            lockfile_policy: LockfilePolicy::Changed,
+            lockfile_baseline: LockfileBaselineMode::Floor,
             now_override: None,
             ttl_seconds: 60,
             cache_dir: None,

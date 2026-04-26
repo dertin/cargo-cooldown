@@ -7,7 +7,7 @@ The authoritative automated suite lives in `./tests`.
 - index-first resolution using local `pubtime`
 - per-crate HTTP fallback when `pubtime` is missing
 - default baseline behavior for unchanged lockfile entries
-- opt-in `lockfile_policy = "all"` behavior
+- opt-in `lockfile_baseline = "ignore"` behavior
 - fail-closed behavior for registries without release-time metadata
 - `best_effort` mode behavior for the same condition
 - `skip_registries` by name and by URL

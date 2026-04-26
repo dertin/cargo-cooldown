@@ -33,13 +33,13 @@ not re-cooled.
 If you want the previous "cool every eligible locked package" behavior, use:
 
 ```toml
-lockfile_policy = "all"
+lockfile_baseline = "ignore"
 ```
 
 or:
 
 ```bash
-COOLDOWN_LOCKFILE_POLICY=all
+COOLDOWN_LOCKFILE_BASELINE=ignore
 ```
 
 ### Allow rules are embedded in `cooldown.toml`
@@ -141,7 +141,7 @@ See also:
 - package-scoped runs now cool only the selected workspace members and their
   dependency closure;
 - unchanged lockfile entries are skipped by default unless
-  `lockfile_policy = "all"` is enabled;
+  `lockfile_baseline = "ignore"` is enabled;
 - configuration discovery now starts from the effective Cargo root instead of
   implicitly following the current directory;
 - allow rules now live inside `cooldown.toml`;

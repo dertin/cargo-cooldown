@@ -2,7 +2,7 @@
 //!
 //! Cooldown rewrites lockfiles speculatively, so every attempt starts from a
 //! snapshot that can be restored exactly. The same snapshot also records which
-//! registry versions were already present, allowing the default policy to avoid
+//! registry versions were already present, allowing the default baseline to avoid
 //! accidental downgrades of existing locked dependencies.
 
 use std::collections::{BTreeMap, HashSet};
@@ -19,7 +19,7 @@ use crate::registry::{RegistryStore, is_registry_source};
 ///
 /// A snapshot is intentionally both bytes and meaning: the original file text is
 /// needed to restore the workspace exactly, while the parsed baseline is used by
-/// cooldown policy to understand which registry versions were already present.
+/// cooldown baseline to understand which registry versions were already present.
 #[derive(Debug, Clone)]
 pub struct LockfileSnapshot {
     baseline: LockfileBaseline,
@@ -62,7 +62,7 @@ impl LockfileSnapshot {
 
 /// Registry-package index used to protect or compare the initial lockfile state.
 ///
-/// The index answers two policy questions quickly: whether an exact
+/// The index answers two baseline questions quickly: whether an exact
 /// name/registry/version was already locked, and which already locked version is
 /// the newest floor below a current candidate.
 #[derive(Debug, Clone, Default)]
@@ -95,7 +95,7 @@ impl LockfileBaseline {
                 .clone();
             let name = package.name;
             let version = package.version;
-            // Keep a sorted parsed-version index so default policy can find the
+            // Keep a sorted parsed-version index so the default baseline can find the
             // pre-run floor without reparsing the whole lockfile on each lookup.
             if let Ok(parsed_version) = Version::parse(&version) {
                 versions_by_package
@@ -133,7 +133,7 @@ impl LockfileBaseline {
 
     /// Find the newest captured version that is not greater than the current one.
     ///
-    /// This is used as the effective minimum under the default lockfile policy:
+    /// This is used as the effective minimum under the default lockfile baseline:
     /// cooldown may block future upgrades, but it should not downgrade versions
     /// the user already had locked before the command started.
     pub fn newest_version_at_or_below(
@@ -205,13 +205,13 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::allow_rules::AllowRules;
-    use crate::config::{Config, LockfilePolicy, Mode};
+    use crate::config::{Config, LockfileBaselineMode, Mode};
 
     fn config_fixture() -> Config {
         Config {
             cooldown_minutes: 60,
             mode: Mode::Strict,
-            lockfile_policy: LockfilePolicy::Changed,
+            lockfile_baseline: LockfileBaselineMode::Floor,
             now_override: None,
             ttl_seconds: 60,
             cache_dir: None,

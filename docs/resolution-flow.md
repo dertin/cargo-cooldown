@@ -20,7 +20,7 @@ flowchart TD
     Metadata --> Scan[Scan resolved registry packages]
     Scan --> Skip{Skipped or exempt?}
     Skip -->|Yes| NextPkg[Next package]
-    Skip -->|No| BaselineCheck{Present in initial lockfile and policy=changed?}
+    Skip -->|No| BaselineCheck{Present in initial lockfile and baseline=floor?}
     BaselineCheck -->|Yes| NextPkg
     BaselineCheck -->|No| Inspect[Inspect locked version age]
     Inspect --> TimelineCache{Timeline cached?}
@@ -85,12 +85,12 @@ That means `cargo cooldown update` has this exact shape:
 1. read and snapshot the current `Cargo.lock`;
 2. run `cargo update`;
 3. inspect the updated lockfile;
-4. with `lockfile_policy = "changed"`, exempt any `(registry, crate, version)`
+4. with `lockfile_baseline = "floor"`, exempt any `(registry, crate, version)`
    that was already present in the original snapshot;
 5. pin only the newly introduced or version-changed fresh entries, but allow
    them to return to an exact version from the original snapshot even if that
    baseline version is still fresher than the cutoff;
-6. with `lockfile_policy = "changed"`, reject any cooldown assignment that would
+6. with `lockfile_baseline = "floor"`, reject any cooldown assignment that would
    downgrade a package below the newest version of that package already present
    in the original snapshot;
 7. if the cooldown step fails in `strict` mode, restore the original lockfile.
@@ -106,7 +106,7 @@ For each registry package in the selected dependency closure:
 2. skip the package immediately if its registry is in `skip_registries`;
 3. skip the package if it matches an exact allow rule or its effective cooldown
    is `0`;
-4. if `lockfile_policy = "changed"`, skip the package when the exact locked
+4. if `lockfile_baseline = "floor"`, skip the package when the exact locked
    `(registry, crate, version)` was already present in the initial lockfile
    baseline;
 5. inspect the locked version age.
@@ -117,8 +117,8 @@ update remains exempt, while a version introduced by `cargo update` is eligible
 for cooldown. If `cargo update` moves `foo 1.2.3` to `foo 1.2.4`, cooldown may
 pin `foo` back to `1.2.3` even when `1.2.3` is still fresh, because that exact
 version was already part of the baseline snapshot. With the default
-`lockfile_policy = "changed"`, it will not pin `foo` below `1.2.3` during that
-update run. With `lockfile_policy = "all"`, the pre-update snapshot is not an
+`lockfile_baseline = "floor"`, it will not pin `foo` below `1.2.3` during that
+update run. With `lockfile_baseline = "ignore"`, the pre-update snapshot is not an
 exemption, so `foo` can be cooled below `1.2.3` when Cargo accepts the result.
 
 The age inspection itself works like this:
@@ -148,7 +148,7 @@ cutoff:
    - is lower than the locked version;
    - satisfies every observed requirement;
    - and is either older than the cutoff or already present in the initial
-     lockfile baseline when `lockfile_policy = "changed"`.
+     lockfile baseline when `lockfile_baseline = "floor"`.
 
 Fresh packages are first considered for one bulk lockfile assignment. Cooldown
 selects older candidates, builds local dependency components from registry

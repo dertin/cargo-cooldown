@@ -14,14 +14,15 @@ cargo cooldown init
 ```toml
 cooldown_minutes = 1440
 mode = "strict"
-lockfile_policy = "changed"
+lockfile_baseline = "floor"
 ```
 
 Meaning:
 
 - `cooldown_minutes`: releases newer than this window are considered fresh
 - `mode`: fail or warn when fresh versions remain
-- `lockfile_policy`: protect or re-check versions already in `Cargo.lock`
+- `lockfile_baseline`: whether the initial `Cargo.lock` is used as a version
+  floor
 
 ## Resolution Order
 
@@ -56,7 +57,7 @@ They do not apply to workspace-wide runs such as `--workspace`,
 
 - `cooldown_minutes`
 - `mode`
-- `lockfile_policy`
+- `lockfile_baseline`
 - `now`
 - `ttl_seconds`
 - `cache_dir`
@@ -69,7 +70,7 @@ Environment variables:
 
 - `COOLDOWN_MINUTES`
 - `COOLDOWN_MODE`
-- `COOLDOWN_LOCKFILE_POLICY`
+- `COOLDOWN_LOCKFILE_BASELINE`
 - `COOLDOWN_NOW`
 - `COOLDOWN_TTL_SECONDS`
 - `COOLDOWN_CACHE_DIR`
@@ -106,17 +107,16 @@ or:
 COOLDOWN_MODE=best_effort cargo cooldown update
 ```
 
-## `lockfile_policy`
+## `lockfile_baseline`
 
-`lockfile_policy` controls which locked versions cooldown is allowed to try to
-cool.
+`lockfile_baseline` controls whether cooldown may go below versions already
+present in the initial `Cargo.lock`.
 
 Values:
 
-- `changed` (default): protect versions that were already present in the
-  initial `Cargo.lock`
-- `all`: also check versions that were already present in the initial
-  `Cargo.lock`
+- `floor` (default): use the initial `Cargo.lock` as the minimum version floor
+- `ignore`: ignore that floor and allow cooldown below initial `Cargo.lock`
+  versions
 
 With `cargo cooldown update`, the initial lockfile means the file that existed
 before `cargo update` ran.
@@ -124,16 +124,16 @@ before `cargo update` ran.
 Example:
 
 ```toml
-lockfile_policy = "all"
+lockfile_baseline = "ignore"
 ```
 
 or:
 
 ```bash
-COOLDOWN_LOCKFILE_POLICY=all cargo cooldown update
+COOLDOWN_LOCKFILE_BASELINE=ignore cargo cooldown update
 ```
 
-Important: `lockfile_policy = "all"` is not a force downgrade mode. Cooldown
+Important: `lockfile_baseline = "ignore"` is not a force downgrade mode. Cooldown
 still asks Cargo to validate the final graph. If Cargo rejects every older
 assignment, the fresh version remains unresolved.
 
@@ -143,10 +143,10 @@ Use this table as the main mental model:
 
 | Config | Human meaning |
 | --- | --- |
-| `lockfile_policy = "changed"` + `mode = "strict"` | Default. Keep the pre-run lockfile as the floor. Cool only versions added or changed by this run. Fail if any new fresh version remains. |
-| `lockfile_policy = "changed"` + `mode = "best_effort"` | Same lockfile protection as the default, but keep the best valid result and warn if some fresh versions remain. |
-| `lockfile_policy = "all"` + `mode = "strict"` | Try to cool every eligible locked registry package, including packages already in `Cargo.lock`. Fail if any fresh version still cannot be cooled. |
-| `lockfile_policy = "all"` + `mode = "best_effort"` | Try to cool every eligible locked registry package, keep Cargo's best valid result, and warn about the remaining fresh versions. |
+| `lockfile_baseline = "floor"` + `mode = "strict"` | Default. Keep the pre-run lockfile as the floor. Cool only versions added or changed by this run. Fail if any new fresh version remains. |
+| `lockfile_baseline = "floor"` + `mode = "best_effort"` | Same lockfile protection as the default, but keep the best valid result and warn if some fresh versions remain. |
+| `lockfile_baseline = "ignore"` + `mode = "strict"` | Try to cool every eligible locked registry package, including packages already in `Cargo.lock`. Fail if any fresh version still cannot be cooled. |
+| `lockfile_baseline = "ignore"` + `mode = "best_effort"` | Try to cool every eligible locked registry package, keep Cargo's best valid result, and warn about the remaining fresh versions. |
 
 Why can a fresh version remain?
 
@@ -155,7 +155,7 @@ Why can a fresh version remain?
 - features or target-specific dependencies activate a newer package
 - a group of crates has no older combination that Cargo accepts
 - an allow rule or skipped registry exempts the package
-- `lockfile_policy = "changed"` protects the pre-run lockfile floor
+- `lockfile_baseline = "floor"` protects the pre-run lockfile floor
 
 ## Allow Rules
 

@@ -23,7 +23,7 @@ fn init_creates_cooldown_toml_for_crate_root() {
         .expect("init should create cooldown.toml");
     assert!(config.contains("cooldown_minutes = 1440"));
     assert!(config.contains("mode = \"strict\""));
-    assert!(config.contains("lockfile_policy = \"changed\""));
+    assert!(config.contains("lockfile_baseline = \"floor\""));
     assert!(config.contains("[allow.global]"));
 }
 
