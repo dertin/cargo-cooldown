@@ -13,8 +13,8 @@ flowchart TD
     Start([Start cargo-cooldown]) --> Config[Load cooldown.toml and embedded allow rules]
     Config --> Command{Requested command}
     Command -->|update| IsolateUpdate[Copy workspace to temp dir and hold real Cargo.lock]
-    Command -->|build/check/test/run with cooldown enabled| IsolateGuard[Copy workspace to temp dir and hold real Cargo.lock]
-    Command -->|build/check/test/run with cooldown disabled| DoneNoCooldown([Run Cargo without cooldown rewrites])
+    Command -->|other forwarded command with cooldown enabled| IsolateGuard[Copy workspace to temp dir and hold real Cargo.lock]
+    Command -->|other forwarded command with cooldown disabled| DoneNoCooldown([Run Cargo without cooldown rewrites])
     IsolateUpdate --> Baseline[Snapshot temp Cargo.lock from initial real lockfile]
     IsolateGuard --> Baseline
     Baseline --> UpdateOrExisting{Update command?}
@@ -104,9 +104,15 @@ the real workspace can be left with the sentinel plus the
 The baseline snapshot is taken before any Cargo command is allowed to rewrite
 the temp lockfile.
 
-- for `cargo cooldown build|check|test|run`, the snapshot happens before
+- for forwarded commands other than `update`, the snapshot happens before
   `cargo metadata` and before any fallback `cargo generate-lockfile` when the
-  lockfile is missing;
+  lockfile is missing. The intended supply-chain guard commands are
+  `check`, `build`, `test`, and `run`, because they consume the lockfile before
+  Cargo downloads, compiles, tests, or runs dependency code. With the default
+  `lockfile_baseline = "floor"`, versions already present in that snapshot are
+  protected as the baseline and are not cooled. Set `lockfile_baseline` to
+  `"ignore"` when these commands should inspect and cool the current lockfile
+  itself before Cargo consumes it;
 - for `cargo cooldown update`, the snapshot happens before `cargo update`.
   `cargo update` then writes its result to the temp `Cargo.lock`, not to the
   user-visible lockfile. The later cooldown pass evaluates that post-update temp

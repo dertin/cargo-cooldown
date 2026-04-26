@@ -27,11 +27,21 @@ Run a Cargo command through cooldown:
 cargo cooldown check
 ```
 
+`check`, `build`, `test`, and `run` are guard-style commands: cooldown runs a
+pre-command lockfile pass before Cargo downloads, compiles, tests, or runs code
+from the dependency graph. With the default `lockfile_baseline = "floor"`,
+versions already present in the initial `Cargo.lock` are treated as the
+protected baseline; use `lockfile_baseline = "ignore"` when these commands
+should also try to cool already-locked versions before Cargo consumes them.
+
 Update dependencies under cooldown:
 
 ```bash
 cargo cooldown update
 ```
+
+`update` is the lockfile-refresh command: Cargo resolves the newest graph first,
+then cooldown cools the updated lockfile before it is kept.
 
 `cargo cooldown init` is cargo-cooldown's setup wizard. To create a new Cargo
 package, use Cargo's own command:

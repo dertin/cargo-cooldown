@@ -10,7 +10,27 @@ graphs are valid.
 
 ## What Happens
 
-For `cargo cooldown check`, `build`, `test`, or `run`:
+`cargo cooldown update` and `cargo cooldown check|build|test|run` protect
+different moments in the dependency lifecycle.
+
+- `cargo cooldown update` protects lockfile refreshes. It lets Cargo compute an
+  updated graph, then cools that updated lockfile before publishing it.
+- `cargo cooldown check|build|test|run` protect lockfile consumption. They run a
+  pre-command lockfile pass before Cargo downloads, compiles, tests, or runs code
+  from the resolved dependency graph.
+
+This matters for supply-chain risk: freshly published crate source is not
+downloaded or compiled just because a lockfile exists. The higher-risk moment is
+when a later Cargo command consumes that lockfile and needs crate contents,
+especially commands that compile dependencies or execute build scripts.
+
+With the default `lockfile_baseline = "floor"`, guard-style commands treat
+versions already present in the initial `Cargo.lock` as the protected baseline.
+Use `lockfile_baseline = "ignore"` when `cargo cooldown check`, `build`, `test`,
+or `run` should also try to cool already-locked versions before Cargo consumes
+them.
+
+For guard-style commands:
 
 1. copy the workspace to a temporary directory when cooldown is enabled
 2. hold the real root `Cargo.lock` with a backup plus sentinel
@@ -21,6 +41,22 @@ For `cargo cooldown check`, `build`, `test`, or `run`:
 7. ask Cargo to validate the resulting lockfile
 8. publish the final temp `Cargo.lock` back to the real workspace
 9. run the requested Cargo command when the graph is acceptable
+
+The practical effect by command is:
+
+| Command | What cooldown adds |
+| --- | --- |
+| `cargo cooldown check` | Runs the pre-command guard before Cargo downloads missing dependency sources and performs check-mode compilation. |
+| `cargo cooldown build` | Runs the pre-command guard before Cargo compiles dependencies and runs dependency build scripts. |
+| `cargo cooldown test` | Runs the pre-command guard before Cargo compiles test/dev-dependency graphs and runs tests. |
+| `cargo cooldown run` | Runs the pre-command guard before Cargo builds and then executes the selected binary. |
+| `cargo cooldown update` | Refreshes the lockfile in an isolated workspace, then cools the updated graph before publishing the final `Cargo.lock`. |
+
+The current implementation applies the same pre-command guard to any forwarded
+Cargo subcommand except `update` when cooldown is enabled. The documented
+supply-chain workflows are `check`, `build`, `test`, `run`, and `update`; use
+plain Cargo for commands that should not be preceded by a lockfile cooldown
+pass.
 
 For `cargo cooldown update`:
 

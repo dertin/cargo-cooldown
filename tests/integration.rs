@@ -98,6 +98,40 @@ fn existing_lockfile_fresh_dependency_is_ignored_by_default() {
 }
 
 #[test]
+fn guard_commands_cool_current_lockfile_when_baseline_ignore_is_enabled() {
+    for command in ["check", "build", "test", "run"] {
+        let mut harness =
+            TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
+        harness.generate_lockfile();
+        assert_eq!(harness.locked_version(), FRESH_VERSION);
+
+        let output = harness.run_command(&[command], &[LOCKFILE_BASELINE_IGNORE]);
+        assert!(
+            output.status.success(),
+            "cargo cooldown {command} should cool the current lockfile before forwarding to Cargo: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            harness.locked_version(),
+            OLD_VERSION,
+            "cargo cooldown {command} should leave the consumed lockfile cooled"
+        );
+
+        if command == "run" {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains(OLD_VERSION),
+                "run should execute the cooled dependency version: {stdout}"
+            );
+            assert!(
+                !stdout.contains(FRESH_VERSION),
+                "run should not execute the fresh dependency version after cooldown: {stdout}"
+            );
+        }
+    }
+}
+
+#[test]
 fn uses_index_pubtime_without_hitting_api() {
     let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
     harness.generate_lockfile();
@@ -242,6 +276,29 @@ fn generates_lockfile_before_running_cooldown() {
     assert!(
         output.status.success(),
         "cooldown should generate a lockfile and continue: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+}
+
+#[test]
+fn guard_command_cools_dependency_added_by_manifest_change() {
+    let mut harness = TestHarness::new_without_dependencies(RegistryMode::PubtimeOnly)
+        .expect("harness should build");
+    harness.generate_lockfile();
+    let initial_lockfile = fs::read_to_string(harness.workspace_dir.join("Cargo.lock"))
+        .expect("initial lockfile should be readable");
+    assert!(
+        parse_lockfile_version(&initial_lockfile, CRATE_NAME).is_none(),
+        "fixture should start with a lockfile that does not contain {CRATE_NAME}"
+    );
+
+    harness.set_dependency_requirement("1");
+    let output = harness.run_cooldown(&[]);
+
+    assert!(
+        output.status.success(),
+        "cooldown should cool a dependency introduced by a manifest change before Cargo consumes it: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), OLD_VERSION);
@@ -1361,9 +1418,20 @@ impl TestHarness {
         Self::new_with_dependency_req(mode, "1")
     }
 
+    fn new_without_dependencies(mode: RegistryMode) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_dependencies(mode, &[])
+    }
+
     fn new_with_dependency_req(
         mode: RegistryMode,
         version_req: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_dependencies(mode, &[(CRATE_NAME, version_req)])
+    }
+
+    fn new_with_dependencies(
+        mode: RegistryMode,
+        dependencies: &[(&str, &str)],
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = tempdir()?;
         let server = RegistryServer::new(mode)?;
@@ -1372,7 +1440,7 @@ impl TestHarness {
         let workspace_dir = temp_root.join("workspace");
 
         fs::create_dir_all(&cargo_home)?;
-        create_workspace_with_dependency(&workspace_dir, &server, CRATE_NAME, version_req)?;
+        create_workspace_with_dependencies(&workspace_dir, &server, dependencies)?;
         write_registry_config(&cargo_home, &server)?;
 
         Ok(Self {

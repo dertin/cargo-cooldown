@@ -2,6 +2,7 @@
 name = "cargo-cooldown"
 version = "0.3.0"
 edition = "2024"
+rust-version = "1.91.1"
 description = "Cargo wrapper that enforces a cooldown window for freshly published crates on crates.io for improved supply chain security."
 keywords =["cargo", "cooldown"]
 categories = ["development-tools::cargo-plugins"]
@@ -22,7 +23,7 @@ toml = "1.1.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 semver = "1"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 clap-cargo = { version = "0.18.3", features = ["cargo_metadata"] }
 indicatif = "0.18.4"
 tempfile = "3"
