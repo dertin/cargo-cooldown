@@ -799,6 +799,7 @@ fn collect_multi_version_notices(
 
     let mut removed = inventory_difference(baseline_inventory, end_inventory);
     removed.sort_by(compare_versions_asc);
+    let has_removed_versions = !removed.is_empty();
     notices.extend(removed.into_iter().map(|from_version| CooledVersionNotice {
         action: CooledVersionAction::Removing,
         name: key.name.clone(),
@@ -844,13 +845,13 @@ fn collect_multi_version_notices(
             .get_mut(&lane)
             .and_then(VecDeque::pop_front)
             .filter(|version| version != &to_version);
-        if let Some(latest_version) = latest_version {
+        if has_removed_versions || latest_version.is_some() {
             notices.push(CooledVersionNotice {
                 action: CooledVersionAction::Keeping,
                 name: key.name.clone(),
                 from_version: Some(to_version.clone()),
                 to_version: Some(to_version),
-                latest_version: Some(latest_version),
+                latest_version,
                 registry: key.registry.clone(),
             });
         }
@@ -4263,6 +4264,40 @@ mod tests {
                     latest_version: Some("0.7.3".to_string()),
                     registry: "crates-io".to_string(),
                 },
+            ]
+        );
+    }
+
+    #[test]
+    fn collect_cooled_versions_keeps_preserved_version_after_multi_version_removals() {
+        let key = InventoryKey {
+            name: "windows-targets".to_string(),
+            registry_id: "https://github.com/rust-lang/crates.io-index".to_string(),
+            registry: "crates-io".to_string(),
+        };
+        let baseline = BTreeMap::from([(
+            key.clone(),
+            vec![
+                "0.53.0".to_string(),
+                "0.52.6".to_string(),
+                "0.48.5".to_string(),
+            ],
+        )]);
+        let start = baseline.clone();
+        let end = BTreeMap::from([(key, vec!["0.52.6".to_string()])]);
+
+        let notices = collect_cooled_versions(&baseline, &start, &end);
+        let rendered = notices
+            .iter()
+            .map(|entry| format_cooled_version_notice(entry, false))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec![
+                "    Removing windows-targets v0.48.5".to_string(),
+                "    Removing windows-targets v0.53.0".to_string(),
+                "     Keeping windows-targets 0.52.6".to_string(),
             ]
         );
     }
