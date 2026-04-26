@@ -538,8 +538,13 @@ fn merge_timelines(
         yanked: version.yanked,
         source: ReleaseSource::Api,
     }));
+    sort_releases_chronologically(&mut releases);
 
     ReleaseTimeline { releases }
+}
+
+fn sort_releases_chronologically(releases: &mut [Release]) {
+    releases.sort_by(|left, right| left.published_at.cmp(&right.published_at));
 }
 
 fn load_index_api(index_root: &TamePathBuf, is_crates_io: bool) -> Result<Option<Url>> {
@@ -749,6 +754,41 @@ mod tests {
         assert_eq!(
             merged.release("1.0.0").map(|release| release.source),
             Some(ReleaseSource::Api)
+        );
+    }
+
+    #[test]
+    fn merge_keeps_api_only_releases_chronological() {
+        let local = ReleaseTimeline {
+            releases: vec![Release {
+                version: "2.0.0".to_string(),
+                published_at: Some(Utc.with_ymd_and_hms(2026, 2, 1, 0, 0, 0).unwrap()),
+                yanked: false,
+                source: ReleaseSource::Index,
+            }],
+        };
+        let api = vec![
+            ApiVersion {
+                created_at: Utc.with_ymd_and_hms(2026, 1, 20, 0, 0, 0).unwrap(),
+                yanked: false,
+                num: "1.9.0".to_string(),
+            },
+            ApiVersion {
+                created_at: Utc.with_ymd_and_hms(2026, 1, 10, 0, 0, 0).unwrap(),
+                yanked: false,
+                num: "1.10.0".to_string(),
+            },
+        ];
+
+        let merged = merge_timelines(Some(local), Some(api));
+
+        assert_eq!(
+            merged
+                .releases
+                .iter()
+                .map(|release| release.version.as_str())
+                .collect::<Vec<_>>(),
+            vec!["1.10.0", "1.9.0", "2.0.0"]
         );
     }
 

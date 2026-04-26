@@ -30,6 +30,7 @@ pub struct ProjectContext {
     pub cwd: PathBuf,
     pub kind: ProjectKind,
     pub workspace_root: PathBuf,
+    pub target_directory: PathBuf,
     pub members: Vec<ProjectMember>,
     pub active_member: Option<ProjectMember>,
 }
@@ -111,6 +112,7 @@ impl ProjectContext {
             cwd,
             kind,
             workspace_root,
+            target_directory: metadata.target_directory.clone().into_std_path_buf(),
             members,
             active_member,
         })
@@ -342,6 +344,7 @@ mod tests {
             cwd: PathBuf::from("/tmp/workspace"),
             kind: ProjectKind::Workspace,
             workspace_root: PathBuf::from("/tmp/workspace"),
+            target_directory: PathBuf::from("/tmp/workspace/target"),
             members: Vec::new(),
             active_member: Some(ProjectMember {
                 name: "root".to_string(),

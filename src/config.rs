@@ -411,6 +411,7 @@ mod tests {
             cwd: root.to_path_buf(),
             kind: ProjectKind::Workspace,
             workspace_root: root.to_path_buf(),
+            target_directory: root.join("target"),
             members: member
                 .map(|path| {
                     vec![ProjectMember {

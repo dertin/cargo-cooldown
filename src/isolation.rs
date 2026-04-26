@@ -41,7 +41,11 @@ impl IsolatedWorkspace {
             .tempdir()
             .context("failed to create temporary cooldown workspace")?;
         let workspace_root = temp_dir.path().join("workspace");
-        copy_workspace(&project.workspace_root, &workspace_root)?;
+        copy_workspace(
+            &project.workspace_root,
+            &workspace_root,
+            &project.target_directory,
+        )?;
 
         let current_dir = map_current_dir(project, &workspace_root)?;
         let manifest = map_manifest(project, manifest, &workspace_root)?;
@@ -437,29 +441,38 @@ fn ensure_no_existing_lockfile_hold(lockfile_path: &Path) -> Result<()> {
     }
 }
 
-fn copy_workspace(source: &Path, destination: &Path) -> Result<()> {
+fn copy_workspace(source: &Path, destination: &Path, target_directory: &Path) -> Result<()> {
     fs::create_dir_all(destination).with_context(|| {
         format!(
             "failed to create temporary workspace root {}",
             destination.display()
         )
     })?;
+    let target_directory = target_directory_to_skip(source, target_directory);
 
     for entry in fs::read_dir(source)
         .with_context(|| format!("failed to read workspace root {}", source.display()))?
     {
         let entry =
             entry.with_context(|| format!("failed to read entry in {}", source.display()))?;
-        if should_skip_workspace_entry(&entry.file_name()) {
+        if should_skip_top_level_workspace_entry(&entry.file_name()) {
             continue;
         }
-        copy_entry(&entry.path(), &destination.join(entry.file_name()))?;
+        copy_entry(
+            &entry.path(),
+            &destination.join(entry.file_name()),
+            target_directory.as_deref(),
+        )?;
     }
 
     Ok(())
 }
 
-fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
+fn copy_entry(source: &Path, destination: &Path, target_directory: Option<&Path>) -> Result<()> {
+    if target_directory.is_some_and(|target_directory| source == target_directory) {
+        return Ok(());
+    }
+
     let metadata = fs::symlink_metadata(source)
         .with_context(|| format!("failed to inspect {}", source.display()))?;
     let file_type = metadata.file_type();
@@ -474,10 +487,11 @@ fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
         {
             let entry =
                 entry.with_context(|| format!("failed to read entry in {}", source.display()))?;
-            if should_skip_workspace_entry(&entry.file_name()) {
-                continue;
-            }
-            copy_entry(&entry.path(), &destination.join(entry.file_name()))?;
+            copy_entry(
+                &entry.path(),
+                &destination.join(entry.file_name()),
+                target_directory,
+            )?;
         }
         Ok(())
     } else if file_type.is_file() {
@@ -494,8 +508,19 @@ fn copy_entry(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
-fn should_skip_workspace_entry(name: &OsStr) -> bool {
-    matches!(name.to_str(), Some(".git" | "target"))
+fn should_skip_top_level_workspace_entry(name: &OsStr) -> bool {
+    matches!(name.to_str(), Some(".git"))
+}
+
+fn target_directory_to_skip(workspace_root: &Path, target_directory: &Path) -> Option<PathBuf> {
+    let target_directory = if target_directory.is_absolute() {
+        target_directory.to_path_buf()
+    } else {
+        workspace_root.join(target_directory)
+    };
+    target_directory
+        .starts_with(workspace_root)
+        .then_some(target_directory)
 }
 
 #[cfg(unix)]
@@ -558,6 +583,51 @@ mod tests {
         assert!(
             format!("{err:#}").contains("previous interrupted run"),
             "{err:#}"
+        );
+    }
+
+    #[test]
+    fn workspace_copy_skips_cargo_metadata_target_directory() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let source = temp_dir.path().join("source");
+        let destination = temp_dir.path().join("destination");
+        let target_directory = source.join("target");
+        fs::create_dir_all(source.join(".git")).expect("top-level git dir should be creatable");
+        fs::create_dir_all(source.join("target"))
+            .expect("top-level target dir should be creatable");
+        fs::create_dir_all(source.join("fixtures/target"))
+            .expect("nested target dir should be creatable");
+        fs::write(source.join(".git/config"), "").expect("git config should be writable");
+        fs::write(source.join("target/cache"), "").expect("target cache should be writable");
+        fs::write(source.join("fixtures/target/keep.txt"), "keep")
+            .expect("nested fixture should be writable");
+
+        copy_workspace(&source, &destination, &target_directory).expect("workspace should copy");
+
+        assert!(!destination.join(".git").exists());
+        assert!(!destination.join("target").exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("fixtures/target/keep.txt")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[test]
+    fn workspace_copy_keeps_target_directory_when_cargo_target_is_external() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let source = temp_dir.path().join("source");
+        let destination = temp_dir.path().join("destination");
+        let external_target_directory = temp_dir.path().join("shared-target");
+        fs::create_dir_all(source.join("target")).expect("project target dir should be creatable");
+        fs::write(source.join("target/fixture.txt"), "keep")
+            .expect("project target fixture should be writable");
+
+        copy_workspace(&source, &destination, &external_target_directory)
+            .expect("workspace should copy");
+
+        assert_eq!(
+            fs::read_to_string(destination.join("target/fixture.txt")).unwrap(),
+            "keep"
         );
     }
 }
