@@ -15,6 +15,22 @@ Install:
 cargo install --locked cargo-cooldown
 ```
 
+For CI jobs that only need the `cargo-cooldown` binary, install from the
+project's prebuilt GitHub release artifacts with `cargo-binstall`:
+
+```bash
+cargo install cargo-binstall --locked
+cargo binstall cargo-cooldown --no-confirm
+```
+
+Releases include `SHA256SUMS` and GitHub Artifact Attestations. After
+downloading an archive from a release, verify its provenance with:
+
+```bash
+gh attestation verify cargo-cooldown-x86_64-unknown-linux-gnu-vX.Y.Z.tgz \
+  -R dertin/cargo-cooldown
+```
+
 Create a project config:
 
 ```bash
@@ -167,6 +183,7 @@ Member overrides apply only when the command targets exactly one member.
 - [Registries](docs/registries.md)
 - [Resolution Flow](docs/resolution-flow.md)
 - [Migration Guide](docs/migration-guide.md)
+- [Releasing](docs/releasing.md)
 - [Testing](docs/testing.md)
 
 ## Examples

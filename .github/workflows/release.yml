@@ -1,0 +1,173 @@
+name: Release
+run-name: Release ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish, for example v0.3.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  BIN_NAME: cargo-cooldown
+  CARGO_TERM_COLOR: always
+  CARGO_TARGET_DIR: target
+  RELEASE_TAG: ${{ inputs.tag }}
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable
+          rustup default stable
+
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            v[0-9]*.[0-9]*.[0-9]*)
+              ;;
+            *)
+              echo "Release tag must look like vX.Y.Z; got ${RELEASE_TAG}" >&2
+              exit 1
+              ;;
+          esac
+          tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+          head_commit="$(git rev-parse HEAD)"
+          if [ "$tag_commit" != "$head_commit" ]; then
+            echo "Checked-out commit ${head_commit} does not match tag ${RELEASE_TAG} (${tag_commit})" >&2
+            exit 1
+          fi
+          manifest_version="$(cargo pkgid | sed 's/.*#//')"
+          tag_version="${RELEASE_TAG#v}"
+          if [ "$manifest_version" != "$tag_version" ]; then
+            echo "Tag v${tag_version} does not match Cargo.toml version ${manifest_version}" >&2
+            exit 1
+          fi
+
+      - name: Run tests
+        run: cargo test --locked --bins --tests
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+
+    env:
+      TARGET: ${{ matrix.target }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+
+      - name: Install stable Rust toolchain
+        shell: bash
+        run: |
+          rustup set profile minimal
+          rustup toolchain install stable
+          rustup default stable
+          rustup target add "$TARGET"
+
+      - name: Build release binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          asset_dir="${BIN_NAME}-${TARGET}-v${version}"
+          mkdir -p "dist/${asset_dir}"
+          cp "target/${TARGET}/release/${BIN_NAME}" "dist/${asset_dir}/"
+          tar -C dist -czf "dist/${asset_dir}.tgz" "${asset_dir}"
+          rm -rf "dist/${asset_dir}"
+
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          $assetDir = "$env:BIN_NAME-$env:TARGET-v$version"
+          New-Item -ItemType Directory -Path "dist\$assetDir" -Force
+          Copy-Item "target\$env:TARGET\release\$env:BIN_NAME.exe" "dist\$assetDir\"
+          Compress-Archive -Path "dist\$assetDir" -DestinationPath "dist\$assetDir.zip" -Force
+          Remove-Item "dist\$assetDir" -Recurse -Force
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum * > SHA256SUMS
+
+      - name: Generate artifact attestations
+        uses: actions/attest@v4
+        with:
+          subject-path: release-assets/*
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" release-assets/* --clobber
+          else
+            gh release create "$tag" release-assets/* --verify-tag --generate-notes
+          fi

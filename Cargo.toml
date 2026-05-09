@@ -10,6 +10,15 @@ repository = "https://github.com/dertin/cargo-cooldown"
 authors = ["Guillermo Céspedes Tabárez <dev.dertin@gmail.com>"]
 license = "Apache-2.0 OR MIT"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }-v{ version }{ archive-suffix }"
+bin-dir = "{ name }-{ target }-v{ version }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+disabled-strategies = ["quick-install"]
+
+[package.metadata.binstall.overrides.'cfg(windows)']
+pkg-fmt = "zip"
+
 [dependencies]
 anyhow = "1"
 cargo_metadata = "0.23.1"
