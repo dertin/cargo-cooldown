@@ -84,27 +84,42 @@ enum CooldownCommand {
     Init,
     #[command(about = "Print cargo-cooldown's version.")]
     Version,
-    #[command(about = "Cool the dependency graph, then run `cargo check`.")]
+    #[command(
+        about = "Cool the dependency graph, then run `cargo check`.",
+        disable_help_flag = true
+    )]
     Check {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
-    #[command(about = "Cool the dependency graph, then run `cargo build`.")]
+    #[command(
+        about = "Cool the dependency graph, then run `cargo build`.",
+        disable_help_flag = true
+    )]
     Build {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
-    #[command(about = "Cool the dependency graph, then run `cargo test`.")]
+    #[command(
+        about = "Cool the dependency graph, then run `cargo test`.",
+        disable_help_flag = true
+    )]
     Test {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
-    #[command(about = "Cool the dependency graph, then run `cargo run`.")]
+    #[command(
+        about = "Cool the dependency graph, then run `cargo run`.",
+        disable_help_flag = true
+    )]
     Run {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
     },
-    #[command(about = "Run `cargo update`, then cool the updated dependency graph.")]
+    #[command(
+        about = "Run `cargo update`, then cool the updated dependency graph.",
+        disable_help_flag = true
+    )]
     Update {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<OsString>,
@@ -345,6 +360,20 @@ fn is_update_command(cargo_args: &[OsString]) -> bool {
     )
 }
 
+fn is_cargo_help_request(cargo_args: &[OsString]) -> bool {
+    if matches!(
+        cargo_args.first().and_then(|value| value.to_str()),
+        Some("help")
+    ) {
+        return true;
+    }
+
+    cargo_args
+        .iter()
+        .take_while(|arg| arg.to_str() != Some("--"))
+        .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
+}
+
 /// Canonicalize the Cargo invocation so the subcommand leads and the selectors
 /// parsed by clap-cargo (`--manifest-path`, `--package`, feature flags, etc.)
 /// are re-applied in the order that upstream `cargo` expects.
@@ -576,15 +605,20 @@ fn main() -> Result<()> {
             let cargo_args = command
                 .cargo_args(&cli.forwarded_cargo_args)
                 .expect("non-wrapper command should provide Cargo args");
-            let project = ProjectContext::discover_for_runtime(&cli.manifest, &cli.workspace)?;
-            let config = config::Config::load(&project)?;
-            init_logging(config.verbose);
-
             let forwarded_args = assemble_cargo_args(&cli, &cargo_args);
             if forwarded_args.is_empty() {
                 eprintln!("Usage: cargo cooldown <cargo-command> [args...]");
                 exit_with(2);
             }
+
+            if is_cargo_help_request(&forwarded_args) {
+                let status = Command::new("cargo").args(&forwarded_args).status()?;
+                exit_with(status.code().unwrap_or(1));
+            }
+
+            let project = ProjectContext::discover_for_runtime(&cli.manifest, &cli.workspace)?;
+            let config = config::Config::load(&project)?;
+            init_logging(config.verbose);
 
             if is_update_command(&cargo_args) {
                 let phase = PhaseStatus::new(config.verbose);
@@ -636,7 +670,8 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         CooldownCommand, assemble_cargo_args, init_looks_like_forwarded_cargo_init,
-        init_uses_runtime_selectors, is_update_command, parse_cli, split_features,
+        init_uses_runtime_selectors, is_cargo_help_request, is_update_command, parse_cli,
+        split_features,
     };
     use clap::CommandFactory;
     use std::ffi::OsString;
@@ -739,6 +774,39 @@ mod tests {
             "update"
         );
         assert!(is_update_command(&cargo_args(&cli)));
+    }
+
+    #[test]
+    fn parse_preserves_wrapped_command_help_for_cargo() {
+        for (raw, expected) in [
+            (
+                &["cargo-cooldown", "cooldown", "check", "--help"][..],
+                &["check", "--help"][..],
+            ),
+            (
+                &["cargo-cooldown", "cooldown", "build", "-h"][..],
+                &["build", "-h"][..],
+            ),
+            (
+                &["cargo-cooldown", "cooldown", "update", "--help"][..],
+                &["update", "--help"][..],
+            ),
+            (
+                &["cargo-cooldown", "cooldown", "help", "check"][..],
+                &["help", "check"][..],
+            ),
+        ] {
+            let cli = parse_cli(&to_os_vec(raw));
+            let forwarded = assemble_cargo_args(&cli, &cargo_args(&cli));
+            assert_eq!(to_string_vec(&forwarded), expected);
+            assert!(is_cargo_help_request(&forwarded));
+        }
+    }
+
+    #[test]
+    fn cargo_help_detection_ignores_args_after_double_dash() {
+        let args = to_os_vec(&["test", "--", "--help"]);
+        assert!(!is_cargo_help_request(&args));
     }
 
     #[test]

@@ -67,3 +67,44 @@ fn version_flag_prints_tool_version_without_project_discovery() {
         format!("cargo-cooldown {}", env!("CARGO_PKG_VERSION"))
     );
 }
+
+#[test]
+fn wrapped_check_help_is_forwarded_without_project_discovery() {
+    let output = run_cooldown_without_project(&["check", "--help"]);
+
+    assert!(
+        output.status.success(),
+        "check --help should be forwarded directly to Cargo: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Usage: cargo check"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn wrapped_update_help_is_forwarded_without_running_update_flow() {
+    let output = run_cooldown_without_project(&["update", "--help"]);
+
+    assert!(
+        output.status.success(),
+        "update --help should be forwarded directly to Cargo: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Usage: cargo update"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+fn run_cooldown_without_project(args: &[&str]) -> std::process::Output {
+    let temp_dir = tempdir().expect("tempdir should be creatable");
+    Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .args(args)
+        .current_dir(temp_dir.path())
+        .output()
+        .expect("cargo-cooldown should spawn")
+}
