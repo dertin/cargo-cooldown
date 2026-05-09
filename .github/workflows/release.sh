@@ -16,8 +16,10 @@ if [[ ! "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
 fi
 
 cargo_manifest_version() {
-  cargo metadata --no-deps --format-version 1 |
-    python3 -c 'import json, sys; metadata = json.load(sys.stdin); members = metadata["workspace_default_members"]; len(members) == 1 or sys.exit("expected exactly one default workspace member"); packages = {package["id"]: package for package in metadata["packages"]}; print(packages[members[0]]["version"])'
+  local pkgid
+  pkgid="$(cargo pkgid)"
+  pkgid="${pkgid##*#}"
+  printf '%s\n' "${pkgid##*@}"
 }
 
 manifest_version="$(cargo_manifest_version)"

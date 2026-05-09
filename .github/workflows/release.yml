@@ -49,10 +49,9 @@ jobs:
             echo "Checked-out commit ${head_commit} does not match tag ${RELEASE_TAG} (${tag_commit})" >&2
             exit 1
           fi
-          manifest_version="$(
-            cargo metadata --no-deps --format-version 1 |
-              python3 -c 'import json, sys; metadata = json.load(sys.stdin); members = metadata["workspace_default_members"]; len(members) == 1 or sys.exit("expected exactly one default workspace member"); packages = {package["id"]: package for package in metadata["packages"]}; print(packages[members[0]]["version"])'
-          )"
+          pkgid="$(cargo pkgid)"
+          manifest_version="${pkgid##*#}"
+          manifest_version="${manifest_version##*@}"
           tag_version="${RELEASE_TAG#v}"
           if [ "$manifest_version" != "$tag_version" ]; then
             echo "Tag v${tag_version} does not match Cargo.toml version ${manifest_version}" >&2
