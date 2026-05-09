@@ -544,7 +544,7 @@ fn merge_timelines(
 }
 
 fn sort_releases_chronologically(releases: &mut [Release]) {
-    releases.sort_by(|left, right| left.published_at.cmp(&right.published_at));
+    releases.sort_by_key(|release| release.published_at);
 }
 
 fn load_index_api(index_root: &TamePathBuf, is_crates_io: bool) -> Result<Option<Url>> {

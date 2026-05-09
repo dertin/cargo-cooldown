@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.1 - Unreleased
+
+### Added
+
+- `cargo cooldown --help` now lists the documented `version`, `check`, `build`,
+  `test`, `run`, and `update` commands while continuing to forward any other
+  Cargo command through cooldown.
+- `cargo cooldown --version` now prints the cargo-cooldown version directly.
+
+### Fixed
+
+- `cargo cooldown version` now only prints the cargo-cooldown version and no
+  longer runs cooldown or forwards to `cargo version`.
+
 ## 0.3.0 - 2026-04-26
 
 This is an intentionally breaking release.
