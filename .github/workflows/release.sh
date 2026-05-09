@@ -10,16 +10,17 @@ fi
 version="$1"
 tag="v${version}"
 
-case "$version" in
-  [0-9]*.[0-9]*.[0-9]*)
-    ;;
-  *)
-    echo "Version must look like X.Y.Z; got ${version}" >&2
-    exit 2
-    ;;
-esac
+if [[ ! "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+  echo "Version must look like X.Y.Z; got ${version}" >&2
+  exit 2
+fi
 
-manifest_version="$(cargo pkgid | sed 's/.*#//')"
+cargo_manifest_version() {
+  cargo metadata --no-deps --format-version 1 |
+    python3 -c 'import json, sys; metadata = json.load(sys.stdin); members = metadata["workspace_default_members"]; len(members) == 1 or sys.exit("expected exactly one default workspace member"); packages = {package["id"]: package for package in metadata["packages"]}; print(packages[members[0]]["version"])'
+}
+
+manifest_version="$(cargo_manifest_version)"
 if [ "$manifest_version" != "$version" ]; then
   echo "Cargo.toml version ${manifest_version} does not match ${version}" >&2
   exit 1
@@ -55,10 +56,44 @@ if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; t
   exit 1
 fi
 
-cargo publish --locked
+cargo publish --locked --dry-run
 
 git tag -s "$tag" -m "cargo-cooldown ${tag}"
-git push origin "$tag"
+if ! git push origin "$tag"; then
+  git tag -d "$tag" >/dev/null 2>&1 || true
+  echo "Failed to push ${tag}; removed the local tag and did not publish the crate." >&2
+  exit 1
+fi
+
+if ! cargo publish --locked; then
+  echo "cargo publish failed after ${tag} was pushed. Inspect crates.io before retrying or deleting the tag." >&2
+  exit 1
+fi
 
 gh workflow run release.yml --ref main -f "tag=${tag}"
-gh run watch
+
+run_id=""
+for _ in {1..30}; do
+  run_id="$(
+    gh run list \
+      --workflow release.yml \
+      --event workflow_dispatch \
+      --branch main \
+      --commit "$remote_head" \
+      --json databaseId,displayTitle \
+      --jq ".[] | select(.displayTitle == \"Release ${tag}\") | .databaseId" \
+      --limit 20 |
+      head -n 1
+  )"
+  if [ -n "$run_id" ]; then
+    break
+  fi
+  sleep 2
+done
+
+if [ -z "$run_id" ]; then
+  echo "Could not find the release workflow run for ${tag}" >&2
+  exit 1
+fi
+
+gh run watch "$run_id" --exit-status

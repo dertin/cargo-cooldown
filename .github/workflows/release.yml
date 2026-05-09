@@ -39,21 +39,20 @@ jobs:
       - name: Verify tag matches Cargo.toml version
         run: |
           set -euo pipefail
-          case "$RELEASE_TAG" in
-            v[0-9]*.[0-9]*.[0-9]*)
-              ;;
-            *)
-              echo "Release tag must look like vX.Y.Z; got ${RELEASE_TAG}" >&2
-              exit 1
-              ;;
-          esac
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+            echo "Release tag must look like vX.Y.Z; got ${RELEASE_TAG}" >&2
+            exit 1
+          fi
           tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
           head_commit="$(git rev-parse HEAD)"
           if [ "$tag_commit" != "$head_commit" ]; then
             echo "Checked-out commit ${head_commit} does not match tag ${RELEASE_TAG} (${tag_commit})" >&2
             exit 1
           fi
-          manifest_version="$(cargo pkgid | sed 's/.*#//')"
+          manifest_version="$(
+            cargo metadata --no-deps --format-version 1 |
+              python3 -c 'import json, sys; metadata = json.load(sys.stdin); members = metadata["workspace_default_members"]; len(members) == 1 or sys.exit("expected exactly one default workspace member"); packages = {package["id"]: package for package in metadata["packages"]}; print(packages[members[0]]["version"])'
+          )"
           tag_version="${RELEASE_TAG#v}"
           if [ "$manifest_version" != "$tag_version" ]; then
             echo "Tag v${tag_version} does not match Cargo.toml version ${manifest_version}" >&2
