@@ -12,20 +12,22 @@ cargo cooldown init
 ## Minimal File
 
 ```toml
-cooldown_minutes = 1440
-enforcement = "cargo_compatible"
-cargo_compatible_accept = "prompt"
-lockfile_baseline = "floor"
+[cooldown]
+incompatible-publish-age = "deny"
+lockfile-baseline = "floor"
+
+[registry]
+global-min-publish-age = "14 days"
 ```
 
 Meaning:
 
-- `cooldown_minutes`: releases newer than this window are considered fresh
-- `enforcement`: what cooldown does when Cargo still requires fresh versions
-- `cargo_compatible_accept`: whether to prompt before accepting fresh versions
-  Cargo still requires
-- `lockfile_baseline`: whether the initial `Cargo.lock` is used as a version
-  floor
+- `[registry].global-min-publish-age`: releases newer than this window are
+  considered fresh
+- `[cooldown].incompatible-publish-age`: what cooldown does when Cargo still
+  requires fresh versions
+- `[cooldown].lockfile-baseline`: whether the initial `Cargo.lock` is used as a
+  version floor
 
 ## Resolution Order
 
@@ -58,10 +60,13 @@ They do not apply to workspace-wide runs such as `--workspace`,
 
 `cooldown.toml` supports:
 
-- `cooldown_minutes`
-- `enforcement`
-- `cargo_compatible_accept`
-- `lockfile_baseline`
+- `[registry].global-min-publish-age`
+- `[registry].min-publish-age`
+- `[registries.<name>].min-publish-age`
+- `[registries.<name>].index`
+- `[cooldown].incompatible-publish-age`
+- `[cooldown].fallback-accept`
+- `[cooldown].lockfile-baseline`
 - `now`
 - `ttl_seconds`
 - `cache_dir`
@@ -72,9 +77,11 @@ They do not apply to workspace-wide runs such as `--workspace`,
 
 Environment variables:
 
-- `COOLDOWN_MINUTES`
-- `COOLDOWN_ENFORCEMENT`
-- `COOLDOWN_CARGO_COMPATIBLE_ACCEPT`
+- `CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE`
+- `CARGO_REGISTRY_MIN_PUBLISH_AGE`
+- `CARGO_REGISTRIES_<name>_MIN_PUBLISH_AGE`
+- `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE`
+- `COOLDOWN_FALLBACK_ACCEPT`
 - `COOLDOWN_LOCKFILE_BASELINE`
 - `COOLDOWN_NOW`
 - `COOLDOWN_TTL_SECONDS`
@@ -86,64 +93,119 @@ Environment variables:
 Unknown keys and invalid values fail configuration loading.
 
 Set `verbose = true` or `COOLDOWN_VERBOSE=1` for debug logs. Normal output stays
-compact and ends with one Cargo-style summary of lockfile changes.
+compact and ends with one Cargo-style summary of `Cargo.lock` changes.
 
-## `enforcement`
+## Min Publish Age
 
-`enforcement` controls what happens after cooldown tries to make the dependency
-graph old enough. This matters because cooldown is a supply-chain safety guard:
-it reduces the chance that a normal Cargo command downloads a crate version that
-was published very recently and may still be in the highest-risk window for a
-supply-chain attack.
+The canonical 0.3.1+ policy uses RFC-style duration strings:
+
+```toml
+[registry]
+global-min-publish-age = "14 days"
+```
+
+Durations accept `0` or `N seconds`, `minutes`, `hours`, `days`, `weeks`, or
+`months`. In cargo-cooldown, `months` is a fixed 30-day unit.
+
+Per-registry overrides reduce or replace the global policy for a registry:
+
+```toml
+[registry]
+global-min-publish-age = "14 days"
+min-publish-age = "5 days"
+
+[registries.internal]
+index = "sparse+https://example.com/index/"
+min-publish-age = "0"
+```
+
+Effective order:
+
+1. crates.io uses `[registry].min-publish-age`, when present.
+2. other registries use `[registries.<name>].min-publish-age`, matched by
+   `index` first, or by resolving `<name>` through Cargo's existing registry
+   config.
+3. `[registry].global-min-publish-age`.
+4. default `0`.
+
+cargo-cooldown does not read `.cargo/config.toml` for policy values. It only
+uses Cargo's existing registry configuration to resolve real registry names and
+effective indexes.
+
+Environment variables:
+
+```bash
+CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE="14 days"
+CARGO_REGISTRY_MIN_PUBLISH_AGE="5 days"
+CARGO_REGISTRIES_INTERNAL_MIN_PUBLISH_AGE="0"
+```
+
+Policy environment overrides stay in cargo-cooldown's namespace:
+
+```bash
+COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=fallback
+COOLDOWN_FALLBACK_ACCEPT=prompt
+```
+
+## Cooldown Policy
+
+`[cooldown].incompatible-publish-age` controls what happens after cooldown
+tries to make the dependency graph old enough. This matters because cooldown is
+a supply-chain safety guard: it reduces the chance that a normal Cargo command
+downloads a crate version that was published very recently and may still be in
+the highest-risk window for a supply-chain attack.
 
 Values:
 
-- `strict`: fail and restore the original `Cargo.lock` if any fresh version
+- `deny`: fail and restore the original `Cargo.lock` if any fresh version
   still cannot be replaced with an older version accepted by Cargo
-- `cargo_compatible`: try to cool every eligible registry package, keep the best
-  Cargo-valid lockfile that cooldown can produce, and warn about fresh versions
-  that Cargo still requires
-- `off`: skip cooldown entirely
+- `fallback`: try to cool every eligible registry package, keep the best
+  `Cargo.lock` that Cargo accepts, and warn about fresh versions that Cargo
+  still requires
+- `allow`: skip cooldown entirely
 
-If `enforcement` is omitted, config loading defaults to `strict`. New files
-generated by `cargo cooldown init` default to `cargo_compatible`.
+If `[cooldown].incompatible-publish-age` is omitted, config loading defaults to
+`deny`. New files generated by `cargo cooldown init` also default to `deny`.
 
-`cargo_compatible_accept` controls the unresolved fresh-version prompt:
+`[cooldown].fallback-accept` controls the unresolved fresh-version prompt:
 
 - `prompt` (default): ask before keeping fresh versions that Cargo still
   requires. The prompt lists each crate, version, registry, and publish date.
-- `auto`: do not ask; keep the best Cargo-valid lockfile and warn.
+- `auto`: do not ask; keep the best `Cargo.lock` that Cargo accepts and warn.
 
 Use `auto` for non-interactive workflows that intentionally accept the
-Cargo-compatible result:
+fallback result:
 
 ```toml
-cargo_compatible_accept = "auto"
+[cooldown]
+fallback-accept = "auto"
 ```
 
 or:
 
 ```bash
-COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto cargo cooldown update
+COOLDOWN_FALLBACK_ACCEPT=auto cargo cooldown update
 ```
 
 Example:
 
 ```toml
-enforcement = "cargo_compatible"
+[cooldown]
+incompatible-publish-age = "fallback"
 ```
 
 or:
 
 ```bash
-COOLDOWN_ENFORCEMENT=cargo_compatible cargo cooldown update
+COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=fallback cargo cooldown update
 ```
 
-`cargo_compatible` is still protective: it cools every package Cargo can accept
+`fallback` is still protective: it cools every package Cargo can accept
 without producing an invalid `Cargo.lock`. It is flexible only at the point where
 Cargo's resolver requires a fresh version. In that case, cooldown keeps the best
-valid lockfile it found and prints the remaining fresh versions for review.
-It also downgrades release-time metadata failures to warnings; use `strict` if a
+`Cargo.lock` that Cargo accepts and prints the remaining fresh versions for
+review.
+It also downgrades release-time metadata failures to warnings; use `deny` if a
 registry that cannot prove release ages should fail closed.
 
 Common reasons Cargo may still require a fresh version:
@@ -154,19 +216,20 @@ Common reasons Cargo may still require a fresh version:
 - enabled features or target-specific dependencies activate a newer dependency
   path
 - several crates must move together, but no older compatible set exists
-- `lockfile_baseline = "floor"` protects the pre-run lockfile floor
+- `[cooldown].lockfile-baseline = "floor"` protects the pre-run `Cargo.lock`
+  floor
 - an allow rule or skipped registry intentionally exempts the package from
   normal cooldown handling
 
-Use `strict` when unresolved fresh downloads should be blocked entirely. This
+Use `deny` when unresolved fresh downloads should be blocked entirely. This
 version does not ask interactively before later Cargo commands download a
 resolver-constrained fresh version that was not already present in the initial
-`Cargo.lock`; `strict` is the fail-closed choice for that workflow.
+`Cargo.lock`; `deny` is the fail-closed choice for that workflow.
 
-## `lockfile_baseline`
+## Cargo.lock Baseline
 
-`lockfile_baseline` controls whether cooldown may go below versions already
-present in the initial `Cargo.lock`.
+`[cooldown].lockfile-baseline` controls whether cooldown may go below versions
+already present in the initial `Cargo.lock`.
 
 Values:
 
@@ -174,13 +237,14 @@ Values:
 - `ignore`: ignore that floor and allow cooldown below initial `Cargo.lock`
   versions
 
-With `cargo cooldown update`, the initial lockfile means the real file that
+With `cargo cooldown update`, the initial `Cargo.lock` means the real file that
 existed before the isolated temp-workspace `cargo update` ran.
 
 Example:
 
 ```toml
-lockfile_baseline = "ignore"
+[cooldown]
+lockfile-baseline = "ignore"
 ```
 
 or:
@@ -189,7 +253,7 @@ or:
 COOLDOWN_LOCKFILE_BASELINE=ignore cargo cooldown update
 ```
 
-Important: `lockfile_baseline = "ignore"` is not a force downgrade setting.
+Important: `lockfile-baseline = "ignore"` is not a force downgrade setting.
 Cooldown still asks Cargo to validate the final graph. If Cargo rejects every
 older assignment, the fresh version remains unresolved.
 
@@ -199,10 +263,10 @@ Use this table as the main mental model:
 
 | Config | Human meaning |
 | --- | --- |
-| `lockfile_baseline = "floor"` + `enforcement = "cargo_compatible"` | `cargo cooldown init` default. Keep the pre-run lockfile as the floor. Cool only versions added or changed by this run. Ask before accepting any remaining fresh version unless `cargo_compatible_accept = "auto"` is set. |
-| `lockfile_baseline = "floor"` + `enforcement = "strict"` | Fail-closed policy. Keep the pre-run lockfile as the floor. Cool only versions added or changed by this run. Fail if any new fresh version remains. |
-| `lockfile_baseline = "ignore"` + `enforcement = "strict"` | Try to cool every eligible locked registry package, including packages already in `Cargo.lock`. Fail if any fresh version still cannot be cooled. |
-| `lockfile_baseline = "ignore"` + `enforcement = "cargo_compatible"` | Try to cool every eligible locked registry package, keep Cargo's best valid result, and warn about the remaining fresh versions. |
+| `lockfile-baseline = "floor"` + `incompatible-publish-age = "deny"` | `cargo cooldown init` default and RFC-aligned fail-closed policy. Keep the pre-run `Cargo.lock` as the floor. Cool only versions added or changed by this run. Fail if any new fresh version remains. |
+| `lockfile-baseline = "floor"` + `incompatible-publish-age = "fallback"` | Keep the pre-run `Cargo.lock` as the floor. Cool only versions added or changed by this run. Ask before accepting any remaining fresh version unless `fallback-accept = "auto"` is set. Useful for long min-publish-age windows or benchmark runs. |
+| `lockfile-baseline = "ignore"` + `incompatible-publish-age = "deny"` | Try to cool every eligible locked registry package, including packages already in `Cargo.lock`. Fail if any fresh version still cannot be cooled. |
+| `lockfile-baseline = "ignore"` + `incompatible-publish-age = "fallback"` | Try to cool every eligible locked registry package, keep the best `Cargo.lock` that Cargo accepts, and warn about the remaining fresh versions. |
 
 Why can a fresh version remain?
 
@@ -211,7 +275,8 @@ Why can a fresh version remain?
 - features or target-specific dependencies activate a newer package
 - a group of crates has no older combination that Cargo accepts
 - an allow rule or skipped registry exempts the package
-- `lockfile_baseline = "floor"` protects the pre-run lockfile floor
+- `[cooldown].lockfile-baseline = "floor"` protects the pre-run `Cargo.lock`
+  floor
 
 ## Allow Rules
 
@@ -239,7 +304,7 @@ Rules:
 - `[allow.global]`: define a shorter default cooldown for all registry crates
 
 `allow.global` and `allow.package` only reduce the effective cooldown. They do
-not increase it above `cooldown_minutes`.
+not increase it above the configured min publish age.
 
 Workspace merge behavior:
 

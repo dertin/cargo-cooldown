@@ -21,10 +21,10 @@ fn init_creates_cooldown_toml_for_crate_root() {
 
     let config = fs::read_to_string(temp_dir.path().join("cooldown.toml"))
         .expect("init should create cooldown.toml");
-    assert!(config.contains("cooldown_minutes = 1440"));
-    assert!(config.contains("enforcement = \"cargo_compatible\""));
-    assert!(config.contains("cargo_compatible_accept = \"prompt\""));
-    assert!(config.contains("lockfile_baseline = \"floor\""));
+    assert!(config.contains("[registry]\nglobal-min-publish-age = \"14 days\""));
+    assert!(config.contains("[cooldown]\nincompatible-publish-age = \"deny\""));
+    assert!(!config.contains("fallback-accept"));
+    assert!(config.contains("lockfile-baseline = \"floor\""));
     assert!(config.contains("[allow.global]"));
 }
 
@@ -42,13 +42,14 @@ fn init_creates_workspace_root_and_selected_member_override() {
 
     let workspace_config = fs::read_to_string(temp_dir.path().join("cooldown.toml"))
         .expect("workspace config should exist");
-    assert!(workspace_config.contains("cooldown_minutes = 1440"));
+    assert!(workspace_config.contains("[cooldown]\nincompatible-publish-age = \"deny\""));
+    assert!(workspace_config.contains("[registry]\nglobal-min-publish-age = \"14 days\""));
     assert!(workspace_config.contains("[allow.global]"));
 
     let member_override = fs::read_to_string(members[0].join("cooldown.toml"))
         .expect("selected member override should exist");
     assert!(member_override.contains("overrides the workspace defaults"));
-    assert!(!member_override.contains("cooldown_minutes ="));
+    assert!(!member_override.contains("global-min-publish-age ="));
     assert!(member_override.contains("[allow.global]"));
 
     assert!(
@@ -80,8 +81,11 @@ fn init_refuses_to_overwrite_existing_config() {
     let temp_dir = tempdir().expect("tempdir should be creatable");
     write_crate_fixture(temp_dir.path());
     let config_path = temp_dir.path().join("cooldown.toml");
-    fs::write(&config_path, "enforcement = \"cargo_compatible\"\n")
-        .expect("fixture config should be writable");
+    fs::write(
+        &config_path,
+        "[cooldown]\nincompatible-publish-age = \"fallback\"\n",
+    )
+    .expect("fixture config should be writable");
 
     let output = run_init(temp_dir.path(), "\n\n\n\n\n\n");
     assert!(
@@ -95,7 +99,7 @@ fn init_refuses_to_overwrite_existing_config() {
     );
     assert_eq!(
         fs::read_to_string(&config_path).expect("existing config should still exist"),
-        "enforcement = \"cargo_compatible\"\n"
+        "[cooldown]\nincompatible-publish-age = \"fallback\"\n"
     );
 }
 

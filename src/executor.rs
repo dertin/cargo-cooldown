@@ -20,7 +20,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use semver::{Comparator, Op, Version, VersionReq};
 use tracing::{debug, trace};
 
-use crate::config::{CargoCompatibleAccept, Config, Enforcement};
+use crate::config::{Config, FallbackAccept, IncompatiblePublishAgePolicy};
 use crate::lockfile::LockfileSnapshot;
 use crate::metadata::{read_metadata, read_metadata_locked};
 use crate::registry::{RegistryStore, ensure_timeline_available};
@@ -98,7 +98,7 @@ pub fn run_pinning_flow_with_snapshot(
         ui.set_phase("Preparing cooldown scan...");
         ensure_lockfile(manifest, &lockfile_path)?;
         let now = config.now_override.unwrap_or_else(Utc::now);
-        let mut cargo_compatible_skips: HashMap<String, String> = HashMap::new();
+        let mut fallback_skips: HashMap<String, String> = HashMap::new();
         let mut constraint_edges: HashMap<String, HashSet<String>> = HashMap::new();
         let mut inspection_cache: HashMap<ReleaseInspectionKey, ReleaseInspection> = HashMap::new();
         ui.set_phase("Capturing cooldown baseline...");
@@ -140,15 +140,15 @@ pub fn run_pinning_flow_with_snapshot(
                     &initial_lockfile,
                     &mut registry_store,
                     &mut inspection_cache,
-                    &cargo_compatible_skips,
+                    &fallback_skips,
                     now,
                 )
             })?;
 
-            // Keep cargo-compatible decisions only for crate versions that are still fresh in the
+            // Keep fallback decisions only for crate versions that are still fresh in the
             // current lockfile. If a successful pin changes a crate version, the next pass
             // should reconsider the new version instead of inheriting stale skip state.
-            cargo_compatible_skips.retain(|key, _| state.fresh_keys_present.contains(key));
+            fallback_skips.retain(|key, _| state.fresh_keys_present.contains(key));
             refresh_constraint_edges(
                 &mut constraint_edges,
                 &state.crate_states,
@@ -157,25 +157,25 @@ pub fn run_pinning_flow_with_snapshot(
             );
 
             debug!(
-                "cooldown: scan_summary registry_packages={} inspected={} fresh={} baseline_exempt={} cargo_compatible_skipped={} skipped_registries={} exact_allowed={} zero_minutes={}",
+                "cooldown: scan_summary registry_packages={} inspected={} fresh={} baseline_exempt={} fallback_skipped={} skipped_registries={} exact_allowed={} zero_min_publish_age={}",
                 state.scan_summary.registry_packages,
                 state.scan_summary.inspected,
                 state.scan_summary.fresh,
                 state.scan_summary.baseline_exempt,
-                state.scan_summary.cargo_compatible_skipped,
+                state.scan_summary.fallback_skipped,
                 state.scan_summary.skipped,
                 state.scan_summary.exact_allowed,
-                state.scan_summary.zero_minutes,
+                state.scan_summary.zero_min_publish_age,
             );
             ui.update_resolver_progress(
                 pass,
                 state.scan_summary.registry_packages,
                 state.scan_summary.inspected,
-                state.scan_summary.fresh + state.scan_summary.cargo_compatible_skipped,
+                state.scan_summary.fresh + state.scan_summary.fallback_skipped,
             );
 
             let mut fresh_entries = state.fresh_entries_vec();
-            let cargo_compatible_fresh_entries = state.cargo_compatible_entries_vec();
+            let fallback_fresh_entries = state.fallback_entries_vec();
             let crate_states = &state.crate_states;
             let equality_dependents = &state.equality_dependents;
             let requirement_origins = &state.requirement_origins;
@@ -183,8 +183,8 @@ pub fn run_pinning_flow_with_snapshot(
 
             if fresh_entries.is_empty() {
                 // Single-package pins cannot handle every exact-version bundle.
-                // Try one small coordinated pass before deciding whether enforcement should fail.
-                if !cargo_compatible_fresh_entries.is_empty()
+                // Try one small coordinated pass before deciding whether deny policy should fail.
+                if !fallback_fresh_entries.is_empty()
                     && attempt_coordinated_bundle_resolution(
                         &CoordinatedResolutionCtx {
                             manifest,
@@ -197,7 +197,7 @@ pub fn run_pinning_flow_with_snapshot(
                             now,
                         },
                         &mut registry_store,
-                        &cargo_compatible_fresh_entries,
+                        &fallback_fresh_entries,
                         &constraint_edges,
                     )?
                 {
@@ -215,7 +215,7 @@ pub fn run_pinning_flow_with_snapshot(
                     crate_states,
                     registry_store: &mut registry_store,
                     inspection_cache: &mut inspection_cache,
-                    cargo_compatible_skips: &cargo_compatible_skips,
+                    fallback_skips: &fallback_skips,
                     now,
                     success_message,
                 })?;
@@ -266,7 +266,7 @@ pub fn run_pinning_flow_with_snapshot(
                     "the cooldown batch solver could not find a Cargo-valid older assignment"
                         .to_string();
                 recorded_batch_limit |=
-                    record_cargo_compatible_skip(&mut cargo_compatible_skips, &key, reason.clone());
+                    record_fallback_skip(&mut fallback_skips, &key, reason.clone());
                 debug!(
                     crate = %fresh.name,
                     registry = %fresh.source_id,
@@ -309,11 +309,11 @@ struct FreshVersionNotice {
 }
 
 #[derive(Debug)]
-pub struct CargoCompatibleFreshVersionsNotAccepted {
+pub struct FallbackFreshVersionsNotAccepted {
     message: String,
 }
 
-impl CargoCompatibleFreshVersionsNotAccepted {
+impl FallbackFreshVersionsNotAccepted {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -321,16 +321,16 @@ impl CargoCompatibleFreshVersionsNotAccepted {
     }
 }
 
-impl std::fmt::Display for CargoCompatibleFreshVersionsNotAccepted {
+impl std::fmt::Display for FallbackFreshVersionsNotAccepted {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for CargoCompatibleFreshVersionsNotAccepted {}
+impl std::error::Error for FallbackFreshVersionsNotAccepted {}
 
-pub fn is_cargo_compatible_fresh_versions_not_accepted(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<CargoCompatibleFreshVersionsNotAccepted>()
+pub fn is_fallback_fresh_versions_not_accepted(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<FallbackFreshVersionsNotAccepted>()
         .is_some()
 }
 
@@ -390,7 +390,7 @@ struct FinalRunSummaryCtx<'a> {
     crate_states: &'a HashMap<PackageId, CrateState>,
     registry_store: &'a mut RegistryStore,
     inspection_cache: &'a mut HashMap<ReleaseInspectionKey, ReleaseInspection>,
-    cargo_compatible_skips: &'a HashMap<String, String>,
+    fallback_skips: &'a HashMap<String, String>,
     now: DateTime<Utc>,
     success_message: &'a str,
 }
@@ -411,7 +411,7 @@ fn emit_final_run_summary(ctx: &mut FinalRunSummaryCtx<'_>) -> Result<()> {
     for state in ctx.crate_states.values() {
         let key = crate_failure_key(&state.source_id, &state.name, &state.current_version);
         let baseline_candidate = state.baseline_exempt;
-        let resolver_candidate = ctx.cargo_compatible_skips.contains_key(&key);
+        let resolver_candidate = ctx.fallback_skips.contains_key(&key);
         if !baseline_candidate && !resolver_candidate {
             continue;
         }
@@ -470,22 +470,27 @@ fn emit_final_run_summary(ctx: &mut FinalRunSummaryCtx<'_>) -> Result<()> {
     report.baseline_fresh.sort();
     report.resolver_constrained_fresh.sort();
 
-    enforce_final_report_policy(ctx.config.enforcement, &report)?;
-    confirm_cargo_compatible_fresh_versions(ctx.config, &report, ctx.ui.use_color())?;
+    enforce_final_report_policy(ctx.config.incompatible_publish_age, &report)?;
+    confirm_fallback_fresh_versions(ctx.config, &report, ctx.ui.use_color())?;
 
     emit_final_summary(ctx.ui, &cooled_versions, &report, ctx.success_message);
     Ok(())
 }
 
-fn enforce_final_report_policy(enforcement: Enforcement, report: &FinalFreshReport) -> Result<()> {
-    if matches!(enforcement, Enforcement::Strict) && !report.resolver_constrained_fresh.is_empty() {
+fn enforce_final_report_policy(
+    incompatible_publish_age: IncompatiblePublishAgePolicy,
+    report: &FinalFreshReport,
+) -> Result<()> {
+    if matches!(incompatible_publish_age, IncompatiblePublishAgePolicy::Deny)
+        && !report.resolver_constrained_fresh.is_empty()
+    {
         bail!(
-            "strict enforcement blocked fresh versions that could not be cooled further:\n{}\n\n\
+            "`incompatible-publish-age = \"deny\"` blocked fresh versions that could not be cooled further:\n{}\n\n\
              These versions are still inside the configured cooldown window after \
-             cargo-cooldown tried older Cargo-valid lockfile assignments. Strict enforcement \
+             cargo-cooldown tried older Cargo-valid lockfile assignments. The deny policy \
              restores the original Cargo.lock instead of keeping them.\n\n\
              To keep Cargo's resolved lockfile and report these as warnings, use \
-             `COOLDOWN_ENFORCEMENT=cargo_compatible` or `enforcement = \"cargo_compatible\"`. To accept specific \
+             `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=fallback` or `[cooldown].incompatible-publish-age = \"fallback\"`. To accept specific \
              fresh releases intentionally, add `allow.package` or `allow.exact` rules.",
             format_fresh_notice_list(&report.resolver_constrained_fresh).join("\n")
         );
@@ -494,56 +499,51 @@ fn enforce_final_report_policy(enforcement: Enforcement, report: &FinalFreshRepo
     Ok(())
 }
 
-fn confirm_cargo_compatible_fresh_versions(
+fn confirm_fallback_fresh_versions(
     config: &Config,
     report: &FinalFreshReport,
     use_color: bool,
 ) -> Result<()> {
-    if !matches!(config.enforcement, Enforcement::CargoCompatible)
-        || report.resolver_constrained_fresh.is_empty()
-        || matches!(config.cargo_compatible_accept, CargoCompatibleAccept::Auto)
+    if !matches!(
+        config.incompatible_publish_age,
+        IncompatiblePublishAgePolicy::Fallback
+    ) || report.resolver_constrained_fresh.is_empty()
+        || matches!(config.fallback_accept, FallbackAccept::Auto)
     {
         return Ok(());
     }
 
-    eprintln!(
-        "{}",
-        format_cargo_compatible_acceptance_prompt(report, use_color)
-    );
+    eprintln!("{}", format_fallback_acceptance_prompt(report, use_color));
 
     if !io::stdin().is_terminal() {
-        return Err(anyhow::Error::new(
-            CargoCompatibleFreshVersionsNotAccepted::new(
-                "cargo_compatible enforcement requires confirmation for fresh versions that could not be cooled, but stdin is not interactive. Set `cargo_compatible_accept = \"auto\"` or `COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto` to accept them without prompting.",
-            ),
-        ));
+        return Err(anyhow::Error::new(FallbackFreshVersionsNotAccepted::new(
+            "fallback policy requires confirmation for fresh versions that could not be cooled, but stdin is not interactive. Set `[cooldown].fallback-accept = \"auto\"` or `COOLDOWN_FALLBACK_ACCEPT=auto` to accept them without prompting.",
+        )));
     }
 
     eprint!("Accept these fresh versions and continue? [y/N] ");
     io::stderr().flush().map_err(|err| {
-        anyhow::Error::new(CargoCompatibleFreshVersionsNotAccepted::new(format!(
-            "failed to prompt for cargo-compatible fresh version acceptance: {err}"
+        anyhow::Error::new(FallbackFreshVersionsNotAccepted::new(format!(
+            "failed to prompt for fallback fresh version acceptance: {err}"
         )))
     })?;
 
     let mut answer = String::new();
     io::stdin().read_line(&mut answer).map_err(|err| {
-        anyhow::Error::new(CargoCompatibleFreshVersionsNotAccepted::new(format!(
-            "failed to read cargo-compatible fresh version acceptance: {err}"
+        anyhow::Error::new(FallbackFreshVersionsNotAccepted::new(format!(
+            "failed to read fallback fresh version acceptance: {err}"
         )))
     })?;
 
     match answer.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => Ok(()),
-        _ => Err(anyhow::Error::new(
-            CargoCompatibleFreshVersionsNotAccepted::new(
-                "fresh versions that could not be cooled were not accepted; restored the original Cargo.lock",
-            ),
-        )),
+        _ => Err(anyhow::Error::new(FallbackFreshVersionsNotAccepted::new(
+            "fresh versions that could not be cooled were not accepted; restored the original Cargo.lock",
+        ))),
     }
 }
 
-fn format_cargo_compatible_acceptance_prompt(report: &FinalFreshReport, use_color: bool) -> String {
+fn format_fallback_acceptance_prompt(report: &FinalFreshReport, use_color: bool) -> String {
     let mut lines = vec![format_status_line(
         StatusKind::Warning,
         "Cargo requires fresh versions that cooldown could not replace.",
@@ -1116,19 +1116,19 @@ fn workspace_lockfile_path(manifest: &Manifest) -> Result<PathBuf> {
     Ok(workspace_root.join("Cargo.lock"))
 }
 
-fn record_cargo_compatible_skip(
-    cargo_compatible_skips: &mut HashMap<String, String>,
+fn record_fallback_skip(
+    fallback_skips: &mut HashMap<String, String>,
     key: &str,
     reason: String,
 ) -> bool {
-    if cargo_compatible_skips
+    if fallback_skips
         .get(key)
         .is_some_and(|existing| existing == &reason)
     {
         return false;
     }
 
-    cargo_compatible_skips.insert(key.to_string(), reason);
+    fallback_skips.insert(key.to_string(), reason);
     true
 }
 
@@ -1203,7 +1203,7 @@ struct LockedPackageInfo {
     name: String,
     source_id: String,
     current_version: String,
-    minimum_minutes: u64,
+    minimum_seconds: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1414,7 +1414,7 @@ struct CooldownBatchSolverCtx<'a> {
 /// Try to cool many fresh crates with one validated lockfile rewrite.
 ///
 /// For each fresh crate this builds a candidate pin from registry metadata,
-/// applies any baseline floor required by `lockfile_baseline = "floor"`, asks
+/// applies any baseline floor required by `[cooldown].lockfile-baseline = "floor"`, asks
 /// the local dependency solver to add coupled transitive pins, and then validates
 /// the whole batch with Cargo. It returns fresh `cargo metadata` when Cargo
 /// accepted the assignment, or `None` when this pass should fall back to smaller
@@ -1450,7 +1450,7 @@ fn attempt_cooldown_batch_solver(
                 &timeline,
                 &fresh.current_version,
                 &requirements,
-                fresh.minimum_minutes,
+                fresh.minimum_seconds,
                 ctx.now,
                 |version| {
                     baseline_allows_candidate(
@@ -1692,7 +1692,7 @@ fn locked_packages_by_identity(
             name: state.name.clone(),
             source_id: state.source_id.clone(),
             current_version: state.current_version.clone(),
-            minimum_minutes: state.minimum_minutes,
+            minimum_seconds: state.minimum_seconds,
         };
         packages
             .entry(LocalPackageKey::from_package(&info))
@@ -1904,7 +1904,7 @@ fn build_local_solver_plan(
                 &timeline,
                 &locked.current_version,
                 &external_requirements,
-                locked.minimum_minutes,
+                locked.minimum_seconds,
                 ctx.now,
                 |version| {
                     baseline_allows_candidate(
@@ -1933,7 +1933,7 @@ fn build_local_solver_plan(
                 &timeline,
                 &locked.current_version,
                 &requirements,
-                locked.minimum_minutes,
+                locked.minimum_seconds,
                 ctx.now,
                 |version| {
                     baseline_allows_candidate(
@@ -2577,7 +2577,7 @@ fn version_matches_requirements(version: &str, requirements: &[VersionReq]) -> b
 
 /// Convert the initial lockfile version into a semver floor when baseline mode requires it.
 ///
-/// Under `lockfile_baseline = "floor"`, an already locked version becomes the
+/// Under `[cooldown].lockfile-baseline = "floor"`, an already locked version becomes the
 /// minimum acceptable candidate for the same crate and registry. Returning
 /// `None` means the current baseline mode allows normal cooldown downgrades.
 fn baseline_floor_requirement(
@@ -2673,16 +2673,16 @@ struct CoordinatedResolutionCtx<'a> {
 ///
 /// Some packages cannot be cooled one at a time because they depend on each
 /// other with exact `=x.y.z` requirements. This receives the unresolved
-/// cargo-compatible entries, groups connected exact-requirement components, searches a
+/// fallback entries, groups connected exact-requirement components, searches a
 /// small compatible assignment, and applies it as one lockfile update. It returns
 /// `true` only when Cargo accepted a bundle and the outer loop should rescan.
 fn attempt_coordinated_bundle_resolution(
     ctx: &CoordinatedResolutionCtx<'_>,
     registry_store: &mut RegistryStore,
-    cargo_compatible_entries: &[FreshCrate],
+    fallback_entries: &[FreshCrate],
     constraint_edges: &HashMap<String, HashSet<String>>,
 ) -> Result<bool> {
-    let components = cargo_compatible_components(cargo_compatible_entries, constraint_edges);
+    let components = fallback_components(fallback_entries, constraint_edges);
 
     for component in components {
         if component.len() > MAX_COORDINATED_COMPONENT_SIZE {
@@ -2739,11 +2739,11 @@ fn attempt_coordinated_bundle_resolution(
     Ok(false)
 }
 
-fn cargo_compatible_components(
-    cargo_compatible_entries: &[FreshCrate],
+fn fallback_components(
+    fallback_entries: &[FreshCrate],
     constraint_edges: &HashMap<String, HashSet<String>>,
 ) -> Vec<Vec<FreshCrate>> {
-    let entries_by_key: HashMap<String, FreshCrate> = cargo_compatible_entries
+    let entries_by_key: HashMap<String, FreshCrate> = fallback_entries
         .iter()
         .cloned()
         .map(|entry| {
@@ -2844,7 +2844,7 @@ fn find_coordinated_assignment(
             &timeline,
             &fresh.current_version,
             &external_requirements,
-            fresh.minimum_minutes,
+            fresh.minimum_seconds,
             now,
             |version| {
                 baseline_allows_candidate(
@@ -3420,7 +3420,9 @@ fn record_dependency_requirements(
 mod tests {
     use super::*;
     use crate::allow_rules::AllowRules;
-    use crate::config::{CargoCompatibleAccept, Config, Enforcement, LockfileBaselineMode};
+    use crate::config::{
+        Config, FallbackAccept, IncompatiblePublishAgePolicy, LockfileBaselineMode,
+    };
     use serde_json::json;
 
     fn dependency_with(rename: Option<&str>, req: &str) -> cargo_metadata::Dependency {
@@ -3899,7 +3901,7 @@ mod tests {
             name: "demo".to_string(),
             source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
             current_version: "1.0.0".to_string(),
-            minimum_minutes: 60,
+            minimum_seconds: 60,
             exact_allowed: false,
             skipped: false,
             baseline_exempt: true,
@@ -3914,22 +3916,22 @@ mod tests {
     }
 
     #[test]
-    fn record_cargo_compatible_skip_only_reports_new_entries() {
-        let mut cargo_compatible_skips = HashMap::new();
+    fn record_fallback_skip_only_reports_new_entries() {
+        let mut fallback_skips = HashMap::new();
         let key = "registry+https://github.com/rust-lang/crates.io-index::demo@1.0.1";
 
-        assert!(record_cargo_compatible_skip(
-            &mut cargo_compatible_skips,
+        assert!(record_fallback_skip(
+            &mut fallback_skips,
             key,
             "reason".to_string()
         ));
-        assert!(!record_cargo_compatible_skip(
-            &mut cargo_compatible_skips,
+        assert!(!record_fallback_skip(
+            &mut fallback_skips,
             key,
             "reason".to_string()
         ));
-        assert!(record_cargo_compatible_skip(
-            &mut cargo_compatible_skips,
+        assert!(record_fallback_skip(
+            &mut fallback_skips,
             key,
             "different reason".to_string()
         ));
@@ -3951,7 +3953,7 @@ mod tests {
             name: name.to_string(),
             source_id: source_id.to_string(),
             current_version: "1.0.1".to_string(),
-            minimum_minutes: 60,
+            minimum_seconds: 60,
             exact_allowed: false,
             skipped: false,
             baseline_exempt: false,
@@ -4031,16 +4033,17 @@ mod tests {
     }
 
     #[test]
-    fn strict_enforcement_rejects_remaining_resolver_constrained_versions() {
+    fn deny_incompatible_publish_age_rejects_remaining_resolver_constrained_versions() {
         let report = FinalFreshReport {
             baseline_fresh: vec![fresh_notice("serde", "1.0.218")],
             resolver_constrained_fresh: vec![fresh_notice("web-sys", "0.3.94")],
         };
 
-        let err = enforce_final_report_policy(Enforcement::Strict, &report).unwrap_err();
+        let err =
+            enforce_final_report_policy(IncompatiblePublishAgePolicy::Deny, &report).unwrap_err();
         let message = format!("{err:#}");
         assert!(
-            message.contains("strict enforcement blocked fresh versions"),
+            message.contains("`incompatible-publish-age = \"deny\"` blocked fresh versions"),
             "{message}"
         );
         assert!(message.contains("web-sys 0.3.94"), "{message}");
@@ -4048,18 +4051,20 @@ mod tests {
     }
 
     #[test]
-    fn cargo_compatible_enforcement_allows_remaining_resolver_constrained_versions() {
+    fn fallback_policy_allows_remaining_resolver_constrained_versions() {
         let report = FinalFreshReport {
             baseline_fresh: Vec::new(),
             resolver_constrained_fresh: vec![fresh_notice("web-sys", "0.3.94")],
         };
 
-        assert!(enforce_final_report_policy(Enforcement::CargoCompatible, &report).is_ok());
+        assert!(
+            enforce_final_report_policy(IncompatiblePublishAgePolicy::Fallback, &report).is_ok()
+        );
     }
 
     #[test]
-    fn format_cargo_compatible_acceptance_prompt_includes_publish_dates() {
-        let prompt = format_cargo_compatible_acceptance_prompt(
+    fn format_fallback_acceptance_prompt_includes_publish_dates() {
+        let prompt = format_fallback_acceptance_prompt(
             &FinalFreshReport {
                 baseline_fresh: Vec::new(),
                 resolver_constrained_fresh: vec![fresh_notice("web-sys", "0.3.94")],
@@ -4349,7 +4354,7 @@ mod tests {
                     name: "webshim".to_string(),
                     source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
                     current_version: "1.1.0".to_string(),
-                    minimum_minutes: 60,
+                    minimum_seconds: 60,
                 },
                 candidates: vec![
                     BundleCandidate {
@@ -4376,7 +4381,7 @@ mod tests {
                     name: "futureshim".to_string(),
                     source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
                     current_version: "1.1.0".to_string(),
-                    minimum_minutes: 60,
+                    minimum_seconds: 60,
                 },
                 candidates: vec![BundleCandidate {
                     version: "1.0.0".to_string(),
@@ -4393,7 +4398,7 @@ mod tests {
                     name: "sharedshim".to_string(),
                     source_id: "registry+https://github.com/rust-lang/crates.io-index".to_string(),
                     current_version: "1.1.0".to_string(),
-                    minimum_minutes: 60,
+                    minimum_seconds: 60,
                 },
                 candidates: vec![
                     BundleCandidate {
@@ -4426,9 +4431,10 @@ mod tests {
     #[test]
     fn config_fixture_remains_constructible_for_executor_tests() {
         let config = Config {
-            cooldown_minutes: 60,
-            enforcement: Enforcement::Strict,
-            cargo_compatible_accept: CargoCompatibleAccept::Prompt,
+            min_publish_age_seconds: 60,
+            registry_min_publish_age: Default::default(),
+            incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,
+            fallback_accept: FallbackAccept::Prompt,
             lockfile_baseline: LockfileBaselineMode::Floor,
             now_override: None,
             ttl_seconds: 60,
@@ -4439,6 +4445,6 @@ mod tests {
             allow_rules: AllowRules::default(),
         };
 
-        assert_eq!(config.cooldown_minutes, 60);
+        assert_eq!(config.min_publish_age_seconds, 60);
     }
 }

@@ -14,6 +14,10 @@ The deterministic test suite builds local registries under `tests/`.
 
 `run-crates-io-benchmark.sh` is the canonical benchmark script. Preset scripts
 only set workload-specific environment variables before calling it.
+Benchmarks default to `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=fallback`
+because current crates.io graphs can contain fresh resolver-constrained groups;
+set `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=deny` when you intentionally want the
+fail-closed policy to make the run fail on unresolved fresh versions.
 
 The same runner is also exposed through Cargo's benchmark command:
 

@@ -1,27 +1,27 @@
 # Troubleshooting
 
-## "strict enforcement blocked fresh versions"
+## `incompatible-publish-age = "deny"` Blocked Fresh Versions
 
 Meaning:
 
 - the listed versions are still newer than the configured cooldown window
 - cooldown tried older versions that Cargo would accept
 - Cargo still required those fresh versions
-- `strict` enforcement restored the original `Cargo.lock`
+- the deny policy restored the original `Cargo.lock`
 
-This is different from `lockfile_baseline`.
+This is different from `[cooldown].lockfile-baseline`.
 
-- `lockfile_baseline = "ignore"` lets cooldown try to downgrade packages that were
-  already in the initial lockfile.
-- `enforcement = "strict"` still fails if any fresh version remains after those
-  attempts.
+- `lockfile-baseline = "ignore"` lets cooldown try to downgrade packages that
+  were already in the initial lockfile.
+- `incompatible-publish-age = "deny"` still fails if any fresh version remains
+  after those attempts.
 
 Options:
 
-- use `enforcement = "cargo_compatible"` to keep Cargo's best valid lockfile and
-  review the fresh versions in an interactive prompt
+- use `incompatible-publish-age = "fallback"` to keep Cargo's best
+  valid lockfile and review the fresh versions in an interactive prompt
 - add `allow.package` or `allow.exact` for releases you intentionally accept
-- reduce `cooldown_minutes` if the window is too strict
+- reduce `[registry].global-min-publish-age` if the window is too strict
 - inspect the dependency path that forces the fresh package
 
 Useful commands:
@@ -41,10 +41,10 @@ cargo update -p icu_normalizer --precise 2.0.0
 Cargo's error usually names the manifest or transitive dependency that prevents
 the downgrade.
 
-## A Fresh Version Remains With `lockfile_baseline = "ignore"`
+## A Fresh Version Remains With `lockfile-baseline = "ignore"`
 
-`lockfile_baseline = "ignore"` removes the initial lockfile protection. It does not
-override Cargo's resolver.
+`lockfile-baseline = "ignore"` removes the initial lockfile protection. It does
+not override Cargo's resolver.
 
 A fresh version can remain when:
 
@@ -63,7 +63,7 @@ Possible reasons:
 - Cargo rejected every older candidate
 - an allow rule applies
 - the package comes from a skipped registry
-- `lockfile_baseline = "floor"` protects the version from the initial lockfile
+- `lockfile-baseline = "floor"` protects the version from the initial lockfile
 
 ## "missing release timestamp"
 
@@ -76,8 +76,9 @@ Meaning:
 Options:
 
 - add the registry to `skip_registries`
-- use `enforcement = "cargo_compatible"` if warnings are acceptable
-- set `cargo_compatible_accept = "auto"` only if unresolved fresh versions
+- use `incompatible-publish-age = "fallback"` if warnings are
+  acceptable
+- set `fallback-accept = "auto"` only if unresolved fresh versions
   should be accepted without an interactive prompt
 - ensure the registry exposes either `pubtime` or a compatible API
 

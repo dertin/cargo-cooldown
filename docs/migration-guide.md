@@ -5,6 +5,46 @@ current registry-aware resolver.
 
 ## What changed
 
+### 0.3.1 adds RFC-style min publish age config
+
+The canonical 0.3.1+ global cooldown policy is:
+
+```toml
+[registry]
+global-min-publish-age = "14 days"
+```
+
+Per-registry policy is now available in `cooldown.toml`:
+
+```toml
+[registries.internal]
+index = "sparse+https://example.com/index/"
+min-publish-age = "0"
+```
+
+cargo-cooldown still does not read `.cargo/config.toml` for policy values; it
+only uses Cargo registry config to resolve actual registry names and indexes.
+
+### 0.3.0 compatibility aliases
+
+The 0.3.0 keys and variables still work in 0.3.1, but are deprecated and are
+planned for removal in the next major 0.4.x line:
+
+- `cooldown_minutes` -> `[registry].global-min-publish-age`
+- `COOLDOWN_MINUTES` -> `CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE`
+- root `enforcement = "strict"` -> `[cooldown].incompatible-publish-age = "deny"`
+- root `enforcement = "off"` -> `[cooldown].incompatible-publish-age = "allow"`
+- root `enforcement = "cargo_compatible"` -> `[cooldown].incompatible-publish-age = "fallback"`
+- `COOLDOWN_ENFORCEMENT=strict|off|cargo_compatible` ->
+  `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=deny|allow|fallback`
+- root `cargo_compatible_accept` -> `[cooldown].fallback-accept`
+- `COOLDOWN_CARGO_COMPATIBLE_ACCEPT` -> `COOLDOWN_FALLBACK_ACCEPT`
+- root `lockfile_baseline` -> `[cooldown].lockfile-baseline`
+
+If both the 0.3.0 form and the 0.3.1 form are present in the same layer with
+different effective values, config loading fails. New configs and scripts
+should use only the 0.3.1 names.
+
 ### Registry scoping is now opt-out
 
 The resolver now applies cooldown to every Cargo registry that appears in the
@@ -33,7 +73,8 @@ not re-cooled.
 If you want the previous "cool every eligible locked package" behavior, use:
 
 ```toml
-lockfile_baseline = "ignore"
+[cooldown]
+lockfile-baseline = "ignore"
 ```
 
 or:
@@ -63,8 +104,9 @@ minutes = 1440
 ```
 
 If an existing rule uses `minimum_release_age`, rename that key to `minutes`.
-Use lowercase TOML keys such as `cooldown_minutes`; environment variable names
-are only accepted from the environment.
+Use lowercase or dashed TOML keys such as
+`[registry].global-min-publish-age`; environment variable names are only
+accepted from the environment.
 
 For workspaces, put shared rules in the workspace root file and use
 member-local `cooldown.toml` overrides only for uniquely targeted member runs.
@@ -76,7 +118,7 @@ and discovers the fallback HTTP API from that registry index.
 
 `COOLDOWN_REGISTRY_API` no longer exists.
 
-### `enforcement` replaces 0.2.x `mode`
+### `[cooldown].incompatible-publish-age` replaces 0.2.x `mode`
 
 `COOLDOWN_OFFLINE_OK` no longer exists.
 
@@ -88,23 +130,26 @@ and discovers the fallback HTTP API from that registry index.
 
 This release uses:
 
-- `enforcement = "strict"` / `COOLDOWN_ENFORCEMENT=strict`
-- `enforcement = "cargo_compatible"` / `COOLDOWN_ENFORCEMENT=cargo_compatible`
-- `enforcement = "off"` / `COOLDOWN_ENFORCEMENT=off`
+- `[cooldown].incompatible-publish-age = "deny"` /
+  `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=deny`
+- `[cooldown].incompatible-publish-age = "fallback"` /
+  `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=fallback`
+- `[cooldown].incompatible-publish-age = "allow"` /
+  `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=allow`
 
 If you previously used 0.2.x best-effort behavior and want to keep Cargo's best
 valid lockfile while warning about fresh versions that Cargo still requires,
 use:
 
 ```bash
-COOLDOWN_ENFORCEMENT=cargo_compatible
+COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=fallback
 ```
 
 This now prompts before accepting unresolved fresh versions. To keep the 0.2.x
 non-interactive behavior, also set:
 
 ```bash
-COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto
+COOLDOWN_FALLBACK_ACCEPT=auto
 ```
 
 If you want a registry to be excluded from cooldown entirely, use
@@ -123,13 +168,15 @@ If you want a registry to be excluded from cooldown entirely, use
 5. Move allow rules into `cooldown.toml`.
 6. Add `skip_registries` or `COOLDOWN_SKIP_REGISTRIES` for any registry that
    should not participate in cooldown.
-7. Replace `mode` with `enforcement` in `cooldown.toml`; rename the value
-   `best_effort` to `cargo_compatible`.
-8. Replace `COOLDOWN_MODE` with `COOLDOWN_ENFORCEMENT` in scripts and CI.
+7. Replace `mode` with `[cooldown].incompatible-publish-age` in
+   `cooldown.toml`; rename `strict` to `deny`, `off` to `allow`, and
+   `best_effort` to `fallback`.
+8. Replace `COOLDOWN_MODE` with `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE` in scripts
+   and CI.
 9. If you relied on 0.2.x best-effort behavior, switch to
-   `COOLDOWN_ENFORCEMENT=cargo_compatible`.
+   `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=fallback`.
 10. If that flow must remain non-interactive, add
-    `COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto`.
+    `COOLDOWN_FALLBACK_ACCEPT=auto`.
 
 ## Internal registries
 
@@ -141,9 +188,10 @@ per-crate HTTP only when `pubtime` is missing.
 
 If an internal registry still cannot provide timestamps:
 
-- `strict` enforcement fails closed;
-- `cargo_compatible` enforcement emits a warning and continues;
-- `off` enforcement disables cooldown entirely.
+- `incompatible-publish-age = "deny"` fails closed;
+- `incompatible-publish-age = "fallback"` emits a warning and
+  continues;
+- `incompatible-publish-age = "allow"` disables cooldown entirely.
 
 For registries such as CodeArtifact, the practical migration path is usually:
 
@@ -161,7 +209,7 @@ See also:
 - package-scoped runs now cool only the selected workspace members and their
   dependency closure;
 - unchanged lockfile entries are skipped by default unless
-  `lockfile_baseline = "ignore"` is enabled;
+  `[cooldown].lockfile-baseline = "ignore"` is enabled;
 - configuration discovery now starts from the effective Cargo root instead of
   implicitly following the current directory;
 - allow rules now live inside `cooldown.toml`;
@@ -178,9 +226,11 @@ See also:
 - no `cooldown-allowlist.toml`, `allowlist_path`, or
   `COOLDOWN_ALLOWLIST_PATH` references remain;
 - registries that should be excluded are listed in `skip_registries`;
-- 0.2.x `mode` keys were renamed to `enforcement`;
-- 0.2.x `COOLDOWN_MODE` references were renamed to `COOLDOWN_ENFORCEMENT`;
+- 0.2.x `mode` keys were renamed to
+  `[cooldown].incompatible-publish-age`;
+- 0.2.x `COOLDOWN_MODE` references were renamed to
+  `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE`;
 - flows that expect 0.2.x best-effort behavior use
-  `COOLDOWN_ENFORCEMENT=cargo_compatible`;
+  `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=fallback`;
 - non-interactive flows that expect 0.2.x best-effort behavior also use
-  `COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto`.
+  `COOLDOWN_FALLBACK_ACCEPT=auto`.

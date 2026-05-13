@@ -106,12 +106,16 @@ Options:
   -h, --help                     Show this help
 
 Environment is forwarded to the benchmark script. Useful variables include:
-  SAMPLES, COOLDOWN_MINUTES, BENCH_OFFLINE, BENCH_PREFETCH_COOLDOWN,
-  BENCH_ISOLATED_CARGO_HOME, BENCH_ARTIFACT_ROOT, BENCH_RUN_ID,
-  RUST_LOG, COOLDOWN_VERBOSE
+  SAMPLES, CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE,
+  COOLDOWN_INCOMPATIBLE_PUBLISH_AGE, COOLDOWN_FALLBACK_ACCEPT,
+  BENCH_OFFLINE, BENCH_PREFETCH_COOLDOWN, BENCH_ISOLATED_CARGO_HOME,
+  BENCH_ARTIFACT_ROOT, BENCH_RUN_ID, RUST_LOG, COOLDOWN_VERBOSE
 
-The benchmark runs one cooldown enforcement policy. COOLDOWN_VERBOSE defaults to
-1 so the runner can report registry API fallback usage from captured logs.
+The benchmark defaults to fallback policy because current crates.io
+graphs may contain fresh resolver-constrained groups. Set
+COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=deny to benchmark fail-closed behavior.
+COOLDOWN_VERBOSE defaults to 1 so the runner can report registry API fallback
+usage from captured logs.
 "#
     );
 }

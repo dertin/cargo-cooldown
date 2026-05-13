@@ -7,9 +7,9 @@ The authoritative automated suite lives in `./tests`.
 - index-first resolution using local `pubtime`
 - per-crate HTTP fallback when `pubtime` is missing
 - default baseline behavior for unchanged lockfile entries
-- opt-in `lockfile_baseline = "ignore"` behavior
+- opt-in `lockfile-baseline = "ignore"` behavior
 - fail-closed behavior for registries without release-time metadata
-- `cargo_compatible` enforcement behavior for the same condition
+- `incompatible-publish-age = "fallback"` behavior for the same condition
 - `skip_registries` by name and by URL
 - snapshot reachability for the metadata-derived resolver state
 - batch solver coverage for independent, duplicate, optional, target-specific,
@@ -99,7 +99,12 @@ Run the aggressive 60-day crates.io benchmark using a larger workspace:
 ```
 
 That workload pulls a larger transitive graph than the small smoke workspace.
-Use `COOLDOWN_MINUTES=131401` to push the same benchmark to roughly 3 months.
+Use `CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE="3 months"` to push the same
+benchmark to roughly 3 months. The crates.io benchmark defaults to
+`COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=fallback` so moving real-world
+dependency graphs do not fail the timing run just because Cargo currently
+requires a fresh resolver-constrained group. Set
+`COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=deny` to benchmark fail-closed behavior.
 
 The same benchmark runner is available through Cargo's benchmark command:
 

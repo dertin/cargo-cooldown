@@ -42,7 +42,7 @@ use clap_cargo::{Features, Manifest, Workspace};
 use tracing::{debug, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Enforcement;
+use crate::config::IncompatiblePublishAgePolicy;
 use crate::isolation::{CurrentDirGuard, IsolatedWorkspace};
 use crate::project::ProjectContext;
 use crate::ui::PhaseStatus;
@@ -537,7 +537,9 @@ fn run_update_with_cooldown_isolation(
         }
         let post_update_lockfile = executor::capture_initial_lockfile(config, isolated.manifest())?;
 
-        if config.enforcement != Enforcement::Off && config.cooldown_minutes > 0 {
+        if config.incompatible_publish_age != IncompatiblePublishAgePolicy::Allow
+            && config.min_publish_age_seconds > 0
+        {
             match executor::run_pinning_flow_with_snapshot(
                 config,
                 isolated.manifest(),
@@ -547,23 +549,23 @@ fn run_update_with_cooldown_isolation(
                 "dependency graph updated and cooled down",
             ) {
                 Ok(()) => {}
-                Err(err) => match config.enforcement {
-                    Enforcement::CargoCompatible
-                        if executor::is_cargo_compatible_fresh_versions_not_accepted(&err) =>
+                Err(err) => match config.incompatible_publish_age {
+                    IncompatiblePublishAgePolicy::Fallback
+                        if executor::is_fallback_fresh_versions_not_accepted(&err) =>
                     {
                         return Err(err);
                     }
-                    Enforcement::CargoCompatible => {
-                        warn!(error = %err, "cooldown guard failed after cargo update; continuing due to cargo_compatible enforcement");
+                    IncompatiblePublishAgePolicy::Fallback => {
+                        warn!(error = %err, "cooldown guard failed after cargo update; continuing due to fallback policy");
                         executor::restore_lockfile_snapshot(
                             &post_update_lockfile,
                             isolated.manifest(),
                         )?;
                     }
-                    Enforcement::Strict => {
+                    IncompatiblePublishAgePolicy::Deny => {
                         return Err(err);
                     }
-                    Enforcement::Off => {}
+                    IncompatiblePublishAgePolicy::Allow => {}
                 },
             }
         }
@@ -634,7 +636,9 @@ fn main() -> Result<()> {
                 }
             }
 
-            if config.enforcement != Enforcement::Off && config.cooldown_minutes > 0 {
+            if config.incompatible_publish_age != IncompatiblePublishAgePolicy::Allow
+                && config.min_publish_age_seconds > 0
+            {
                 match run_cooldown_guard_isolated(
                     &config,
                     &project,
@@ -642,19 +646,19 @@ fn main() -> Result<()> {
                     "dependency graph cooled down; continuing with Cargo command",
                 ) {
                     Ok(()) => {}
-                    Err(err) => match config.enforcement {
-                        Enforcement::CargoCompatible
-                            if executor::is_cargo_compatible_fresh_versions_not_accepted(&err) =>
+                    Err(err) => match config.incompatible_publish_age {
+                        IncompatiblePublishAgePolicy::Fallback
+                            if executor::is_fallback_fresh_versions_not_accepted(&err) =>
                         {
                             return Err(err);
                         }
-                        Enforcement::CargoCompatible => {
-                            warn!(error = %err, "cooldown guard failed; continuing due to cargo_compatible enforcement");
+                        IncompatiblePublishAgePolicy::Fallback => {
+                            warn!(error = %err, "cooldown guard failed; continuing due to fallback policy");
                         }
-                        Enforcement::Strict => {
+                        IncompatiblePublishAgePolicy::Deny => {
                             return Err(err);
                         }
-                        Enforcement::Off => {}
+                        IncompatiblePublishAgePolicy::Allow => {}
                     },
                 }
             }

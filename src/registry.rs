@@ -21,7 +21,7 @@ use tame_index::utils::canonicalize_url;
 use tame_index::{IndexKrate, PathBuf as TamePathBuf};
 
 use crate::cache::Cache;
-use crate::config::Config;
+use crate::config::{Config, RegistryMinPublishAgeOverride};
 
 const CRATES_IO_LEGACY_SOURCE_ID: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_SPARSE_SOURCE_ID: &str = "sparse+https://index.crates.io/";
@@ -163,7 +163,7 @@ impl RegistryStore {
 
     /// Resolve a Cargo metadata source ID into the effective registry context.
     ///
-    /// Cargo may report legacy, sparse, mirrored, or replacement registry URLs.
+    /// Cargo may report git-index, sparse, mirrored, or replacement registry URLs.
     /// This function normalizes that input, finds the local index location and
     /// optional API endpoint, applies `skip_registries`, and caches the result for
     /// later timeline or checksum lookups.
@@ -610,6 +610,43 @@ fn skip_registry_matches(
     Ok(normalized == normalized_source_id || normalized == normalized_effective_index_url)
 }
 
+pub fn registry_override_matches(
+    override_config: &RegistryMinPublishAgeOverride,
+    context: &RegistryContext,
+) -> Result<bool> {
+    let normalized_source_id = normalize_registry_identifier(&context.source_id)?;
+    let normalized_effective_index_url =
+        normalize_registry_identifier(&context.effective_index_url)?;
+
+    if let Some(index) = override_config.index.as_deref() {
+        let normalized_index = normalize_registry_identifier(index)?;
+        return Ok(normalized_index == normalized_source_id
+            || normalized_index == normalized_effective_index_url);
+    }
+
+    if override_config
+        .name
+        .eq_ignore_ascii_case(context.logical_name.as_str())
+    {
+        return Ok(true);
+    }
+
+    skip_registry_matches(
+        &override_config.name,
+        context.logical_name == "crates-io",
+        &normalized_source_id,
+        &normalized_effective_index_url,
+        cargo_config_root(),
+    )
+}
+
+pub fn validate_registry_override_index(index: &str) -> Result<()> {
+    if !looks_like_registry_identifier(index.trim()) {
+        bail!("registry override index must be a registry URL or source ID");
+    }
+    normalize_registry_identifier(index).map(|_| ())
+}
+
 fn looks_like_registry_identifier(value: &str) -> bool {
     value.starts_with("registry+") || value.starts_with("sparse+") || value.contains("://")
 }
@@ -707,6 +744,11 @@ pub fn ensure_timeline_available(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allow_rules::AllowRules;
+    use crate::config::{
+        Config, FallbackAccept, IncompatiblePublishAgePolicy, LockfileBaselineMode,
+        RegistryMinPublishAgeConfig,
+    };
     use chrono::TimeZone;
     use std::fs;
     use tame_index::IndexVersion;
@@ -833,6 +875,41 @@ mod tests {
                 root
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn crates_io_min_publish_age_override_wins_over_global() {
+        let context = RegistryContext {
+            logical_name: "crates-io".to_string(),
+            source_id: CRATES_IO_LEGACY_SOURCE_ID.to_string(),
+            effective_index_url: "https://github.com/rust-lang/crates.io-index".to_string(),
+            api: None,
+            cache_fingerprint: "test".to_string(),
+            skipped: false,
+            index_root: TamePathBuf::new(),
+        };
+        let config = Config {
+            min_publish_age_seconds: 14 * 24 * 60 * 60,
+            registry_min_publish_age: RegistryMinPublishAgeConfig {
+                crates_io_seconds: Some(5 * 24 * 60 * 60),
+                registries: Vec::new(),
+            },
+            incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,
+            fallback_accept: FallbackAccept::Prompt,
+            lockfile_baseline: LockfileBaselineMode::Floor,
+            now_override: None,
+            ttl_seconds: 60,
+            cache_dir: None,
+            http_retries: 0,
+            verbose: false,
+            skip_registries: Vec::new(),
+            allow_rules: AllowRules::default(),
+        };
+
+        assert_eq!(
+            config.min_publish_age_seconds_for(&context, "serde"),
+            5 * 24 * 60 * 60
         );
     }
 

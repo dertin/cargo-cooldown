@@ -72,7 +72,7 @@ Available CASE values:
   allow-rules      Append package-scoped allow rules to the smoke workspace
                    config for one run, showing mixed per-crate cooldown
                    overrides.
-  cargo-compatible Keep cooldown enabled, but continue the Cargo command if
+  fallback         Keep cooldown enabled, but continue the Cargo command if
                    Cargo requires fresh versions.
   skip-crates-io   Skip crates.io entirely through COOLDOWN_SKIP_REGISTRIES
                    and verify that cooldown does not inspect registry packages.
@@ -109,7 +109,7 @@ else
   echo "Using local cargo-cooldown binary built from current sources: ${CMD_BIN}" >&2
 fi
 
-SELECTED=("allow-rules" "cargo-compatible" "skip-crates-io" "aggressive-ttl")
+SELECTED=("allow-rules" "fallback" "skip-crates-io" "aggressive-ttl")
 if [[ $# -gt 0 ]]; then
   SELECTED=("$@")
 fi
@@ -122,15 +122,15 @@ for case_name in "${SELECTED[@]}"; do
         "Temporarily appends allow.package rules so one dependency gets a shorter cooldown and another is excluded entirely." \
         yes \
         $'[[allow.package]]\ncrate = "chrono"\nminutes = 60\n\n[[allow.package]]\ncrate = "serde_json"\nminutes = 0' \
-        COOLDOWN_MINUTES=131401
+        CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE="3 months"
       ;;
-    cargo-compatible)
+    fallback)
       run_case \
-        "cargo-compatible" \
+        "fallback" \
         "Cooldown is active, but fresh versions required by Cargo are reported as warnings and the Cargo command still runs." \
         yes \
-        COOLDOWN_ENFORCEMENT=cargo_compatible \
-        COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto
+        COOLDOWN_INCOMPATIBLE_PUBLISH_AGE=fallback \
+        COOLDOWN_FALLBACK_ACCEPT=auto
       ;;
     skip-crates-io)
       run_case \
@@ -144,7 +144,7 @@ for case_name in "${SELECTED[@]}"; do
         "aggressive-ttl" \
         "Shorter cooldown window with verbose logs, shorter TTL, and retries. Useful to inspect cache behavior and timestamp source decisions." \
         yes \
-        COOLDOWN_MINUTES=180 \
+        CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE="3 hours" \
         COOLDOWN_TTL_SECONDS=300 \
         COOLDOWN_HTTP_RETRIES=4 \
         COOLDOWN_VERBOSE=1

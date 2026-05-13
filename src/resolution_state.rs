@@ -27,27 +27,27 @@ use clap_cargo::Workspace;
 ///
 /// A value here means the package is reachable from the selected workspace
 /// command, is not skipped or allowed, and its locked release timestamp is newer
-/// than the active cooldown cutoff.
+/// than the active min-publish-age cutoff.
 #[derive(Clone, Debug)]
 pub struct FreshCrate {
     pub package_id: PackageId,
     pub name: String,
     pub source_id: String,
     pub current_version: String,
-    pub minimum_minutes: u64,
+    pub minimum_seconds: u64,
 }
 
 /// Cooldown-relevant state for one resolved registry package.
 ///
 /// The state keeps the data needed by later solver phases without carrying the
 /// whole Cargo metadata package around: identity, current version, effective
-/// cooldown minutes, and the reasons this package may be exempt from pinning.
+/// min-publish-age window, and the reasons this package may be exempt from pinning.
 #[derive(Clone, Debug)]
 pub struct CrateState {
     pub name: String,
     pub source_id: String,
     pub current_version: String,
-    pub minimum_minutes: u64,
+    pub minimum_seconds: u64,
     pub exact_allowed: bool,
     pub skipped: bool,
     pub baseline_exempt: bool,
@@ -56,7 +56,7 @@ pub struct CrateState {
 impl CrateState {
     /// Whether this package should be left untouched by cooldown.
     pub fn is_cooldown_exempt(&self) -> bool {
-        self.exact_allowed || self.minimum_minutes == 0 || self.skipped || self.baseline_exempt
+        self.exact_allowed || self.minimum_seconds == 0 || self.skipped || self.baseline_exempt
     }
 }
 
@@ -66,7 +66,7 @@ pub struct ReleaseInspectionKey {
     pub source_id: String,
     pub crate_name: String,
     pub current_version: String,
-    pub minimum_minutes: u64,
+    pub minimum_seconds: u64,
 }
 
 /// Result of checking whether one locked release is inside the cooldown window.
@@ -99,10 +99,10 @@ pub struct ScanSummary {
     pub inspected: usize,
     pub fresh: usize,
     pub baseline_exempt: usize,
-    pub cargo_compatible_skipped: usize,
+    pub fallback_skipped: usize,
     pub skipped: usize,
     pub exact_allowed: usize,
-    pub zero_minutes: usize,
+    pub zero_min_publish_age: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,7 +219,7 @@ struct PackageScanRecord {
     state: CrateState,
     inspected: bool,
     fresh: bool,
-    cargo_compatible_skipped: bool,
+    fallback_skipped: bool,
 }
 
 /// Aggregated cooldown state for one resolver pass.
@@ -237,7 +237,7 @@ pub struct ResolutionState {
     pub scan_summary: ScanSummary,
     pub fresh_keys_present: HashSet<String>,
     fresh_entries: HashMap<PackageId, FreshCrate>,
-    cargo_compatible_entries: HashMap<PackageId, FreshCrate>,
+    fallback_entries: HashMap<PackageId, FreshCrate>,
     version_requirement_counts: HashMap<PackageId, HashMap<String, (VersionReq, usize)>>,
     requirement_origin_counts: RequirementOriginCounts,
     equality_dependent_counts: HashMap<PackageId, HashMap<PackageId, usize>>,
@@ -252,7 +252,7 @@ struct ResolutionScanCtx<'a> {
     initial_lockfile: &'a LockfileSnapshot,
     registry_store: &'a mut RegistryStore,
     inspection_cache: &'a mut HashMap<ReleaseInspectionKey, ReleaseInspection>,
-    cargo_compatible_skips: &'a HashMap<String, String>,
+    fallback_skips: &'a HashMap<String, String>,
     now: DateTime<Utc>,
 }
 
@@ -263,8 +263,8 @@ impl ResolutionState {
     }
 
     /// Fresh packages already skipped once and only eligible for coordinated retries.
-    pub fn cargo_compatible_entries_vec(&self) -> Vec<FreshCrate> {
-        self.cargo_compatible_entries.values().cloned().collect()
+    pub fn fallback_entries_vec(&self) -> Vec<FreshCrate> {
+        self.fallback_entries.values().cloned().collect()
     }
 
     fn apply_node(
@@ -295,7 +295,9 @@ impl ResolutionState {
 
         let context = ctx.registry_store.context_for_source(source_id)?.clone();
         let current_version = package.version.clone();
-        let minimum_minutes = effective_minimum_minutes(ctx.config, &package.name);
+        let minimum_seconds = ctx
+            .config
+            .min_publish_age_seconds_for(&context, &package.name);
         let exact_allowed = ctx
             .config
             .allow_rules
@@ -310,7 +312,7 @@ impl ResolutionState {
             name: package.name.clone(),
             source_id: source_id.clone(),
             current_version: current_version.clone(),
-            minimum_minutes,
+            minimum_seconds,
             exact_allowed,
             skipped: context.skipped,
             baseline_exempt,
@@ -319,7 +321,7 @@ impl ResolutionState {
             state: state.clone(),
             inspected: false,
             fresh: false,
-            cargo_compatible_skipped: false,
+            fallback_skipped: false,
         };
         self.crate_states.insert(package_id.clone(), state.clone());
 
@@ -332,7 +334,7 @@ impl ResolutionState {
                 &state,
                 ctx.now,
             )?;
-            let cutoff = cutoff_time(minimum_minutes, ctx.now);
+            let cutoff = cutoff_time(minimum_seconds, ctx.now);
             debug!(
                 crate = %package.name,
                 version = %current_version,
@@ -361,15 +363,14 @@ impl ResolutionState {
                     name: package.name.clone(),
                     source_id: source_id.clone(),
                     current_version: current_version.clone(),
-                    minimum_minutes,
+                    minimum_seconds,
                 };
                 let key = crate_failure_key(source_id, package.name.as_str(), &current_version);
-                // Cargo-compatible skips are tied to the exact resolved package version
+                // Fallback skips are tied to the exact resolved package version
                 // so successful later pins can reclassify new versions normally.
-                if ctx.cargo_compatible_skips.contains_key(&key) {
-                    record.cargo_compatible_skipped = true;
-                    self.cargo_compatible_entries
-                        .insert(package_id.clone(), fresh);
+                if ctx.fallback_skips.contains_key(&key) {
+                    record.fallback_skipped = true;
+                    self.fallback_entries.insert(package_id.clone(), fresh);
                 } else {
                     self.fresh_entries.insert(package_id.clone(), fresh);
                 }
@@ -468,10 +469,10 @@ impl ResolutionState {
         self.scan_summary.baseline_exempt += usize::from(record.state.baseline_exempt);
         self.scan_summary.skipped += usize::from(record.state.skipped);
         self.scan_summary.exact_allowed += usize::from(record.state.exact_allowed);
-        self.scan_summary.zero_minutes += usize::from(record.state.minimum_minutes == 0);
+        self.scan_summary.zero_min_publish_age += usize::from(record.state.minimum_seconds == 0);
         self.scan_summary.inspected += usize::from(record.inspected);
-        self.scan_summary.fresh += usize::from(record.fresh && !record.cargo_compatible_skipped);
-        self.scan_summary.cargo_compatible_skipped += usize::from(record.cargo_compatible_skipped);
+        self.scan_summary.fresh += usize::from(record.fresh && !record.fallback_skipped);
+        self.scan_summary.fallback_skipped += usize::from(record.fallback_skipped);
         if record.fresh {
             self.fresh_keys_present.insert(crate_failure_key(
                 &record.state.source_id,
@@ -496,7 +497,7 @@ pub fn build_resolution_state(
     initial_lockfile: &LockfileSnapshot,
     registry_store: &mut RegistryStore,
     inspection_cache: &mut HashMap<ReleaseInspectionKey, ReleaseInspection>,
-    cargo_compatible_skips: &HashMap<String, String>,
+    fallback_skips: &HashMap<String, String>,
     now: DateTime<Utc>,
 ) -> Result<ResolutionState> {
     let mut state = ResolutionState::default();
@@ -506,7 +507,7 @@ pub fn build_resolution_state(
         initial_lockfile,
         registry_store,
         inspection_cache,
-        cargo_compatible_skips,
+        fallback_skips,
         now,
     };
     for package_id in snapshot.reachable_order() {
@@ -591,17 +592,6 @@ fn snapshot_node(node: &Node) -> SnapshotNode {
     }
 }
 
-fn effective_minimum_minutes(config: &Config, crate_name: &str) -> u64 {
-    let mut minutes = config.cooldown_minutes;
-    if let Some(global) = config.allow_rules.global_minutes() {
-        minutes = minutes.min(global);
-    }
-    if let Some(&crate_minutes) = config.allow_rules.per_crate_minutes().get(crate_name) {
-        minutes = minutes.min(crate_minutes);
-    }
-    minutes
-}
-
 fn constraint_contributions(
     node: &SnapshotNode,
     package: &SnapshotPackage,
@@ -661,7 +651,7 @@ pub fn inspect_current_release(
         source_id: state.source_id.clone(),
         crate_name: state.name.clone(),
         current_version: state.current_version.clone(),
-        minimum_minutes: state.minimum_minutes,
+        minimum_seconds: state.minimum_seconds,
     };
     if let Some(cached) = inspection_cache.get(&key) {
         return Ok((cached.clone(), true));
@@ -674,7 +664,7 @@ pub fn inspect_current_release(
     let inspection = ReleaseInspection {
         published_at,
         release_time_source: current_release.source,
-        fresh: is_release_fresh(current_release, state.minimum_minutes, now) == Some(true),
+        fresh: is_release_fresh(current_release, state.minimum_seconds, now) == Some(true),
     };
     inspection_cache.insert(key, inspection.clone());
     Ok((inspection, false))
@@ -707,14 +697,17 @@ fn find_manifest_dependency<'a>(
 mod tests {
     use super::*;
     use crate::allow_rules::AllowRules;
-    use crate::config::{CargoCompatibleAccept, Config, Enforcement, LockfileBaselineMode};
+    use crate::config::{
+        Config, FallbackAccept, IncompatiblePublishAgePolicy, LockfileBaselineMode,
+    };
     use serde_json::json;
 
     fn config_fixture() -> Config {
         Config {
-            cooldown_minutes: 60,
-            enforcement: Enforcement::Strict,
-            cargo_compatible_accept: CargoCompatibleAccept::Prompt,
+            min_publish_age_seconds: 60,
+            registry_min_publish_age: Default::default(),
+            incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,
+            fallback_accept: FallbackAccept::Prompt,
             lockfile_baseline: LockfileBaselineMode::Ignore,
             now_override: None,
             ttl_seconds: 60,
@@ -852,6 +845,6 @@ mod tests {
     #[test]
     fn config_fixture_remains_constructible_for_resolution_state_tests() {
         let config = config_fixture();
-        assert_eq!(config.cooldown_minutes, 60);
+        assert_eq!(config.min_publish_age_seconds, 60);
     }
 }

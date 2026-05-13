@@ -213,13 +213,16 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::allow_rules::AllowRules;
-    use crate::config::{CargoCompatibleAccept, Config, Enforcement, LockfileBaselineMode};
+    use crate::config::{
+        Config, FallbackAccept, IncompatiblePublishAgePolicy, LockfileBaselineMode,
+    };
 
     fn config_fixture() -> Config {
         Config {
-            cooldown_minutes: 60,
-            enforcement: Enforcement::Strict,
-            cargo_compatible_accept: CargoCompatibleAccept::Prompt,
+            min_publish_age_seconds: 60,
+            registry_min_publish_age: Default::default(),
+            incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,
+            fallback_accept: FallbackAccept::Prompt,
             lockfile_baseline: LockfileBaselineMode::Floor,
             now_override: None,
             ttl_seconds: 60,

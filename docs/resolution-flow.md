@@ -54,10 +54,10 @@ flowchart TD
     MarkUnresolved --> Metadata
     ActiveFresh -->|No| Coordinated{Small exact-coupled unresolved bundle?}
     Coordinated -->|Resolvable| Validate
-    Coordinated -->|No| FinalPolicy[Apply final enforcement policy]
-    FinalPolicy -->|strict| Fail([Restore real Cargo.lock and fail])
-    FinalPolicy -->|cargo_compatible + prompt rejected| Fail
-    FinalPolicy -->|cargo_compatible + accepted/auto| Publish
+    Coordinated -->|No| FinalPolicy[Apply final incompatible-publish-age policy]
+    FinalPolicy -->|deny| Fail([Restore real Cargo.lock and fail])
+    FinalPolicy -->|fallback + prompt rejected| Fail
+    FinalPolicy -->|fallback + accepted/auto| Publish
     Publish --> Done([Real Cargo.lock receives the final Cargo-valid graph])
 ```
 
@@ -92,7 +92,8 @@ The real root lockfile is held while cooldown works:
 - an invalid sentinel is written at `Cargo.lock`, so an accidental plain
   `cargo build` against the real workspace fails instead of resolving from a
   half-finished lockfile;
-- on normal failure, rejection, or `strict` enforcement, the backup is restored;
+- on normal failure, rejection, or `incompatible-publish-age = "deny"`, the
+  backup is restored;
 - on success, the final temp `Cargo.lock` is published back to the real
   workspace and the backup is removed.
 
@@ -109,8 +110,8 @@ the temp lockfile.
   lockfile is missing. The intended supply-chain guard commands are
   `check`, `build`, `test`, and `run`, because they consume the lockfile before
   Cargo downloads, compiles, tests, or runs dependency code. With the default
-  `lockfile_baseline = "floor"`, versions already present in that snapshot are
-  protected as the baseline and are not cooled. Set `lockfile_baseline` to
+  `lockfile-baseline = "floor"`, versions already present in that snapshot are
+  protected as the baseline and are not cooled. Set `lockfile-baseline` to
   `"ignore"` when these commands should inspect and cool the current lockfile
   itself before Cargo consumes it;
 - for `cargo cooldown update`, the snapshot happens before `cargo update`.
@@ -120,15 +121,16 @@ the temp lockfile.
 
 So `cargo cooldown update` can temporarily put fresh dependency versions in the
 temp `Cargo.lock`, but not in the real root `Cargo.lock`. They are not accepted
-as the final result until the cooldown pass finishes and the active enforcement
-policy allows the remaining graph. If the run fails, rejects the
-`cargo_compatible` prompt, or hits `strict` enforcement, cargo-cooldown restores
-the real pre-run lockfile.
+as the final result until the cooldown pass finishes and the active
+incompatible-publish-age policy allows the remaining graph. If the run fails, rejects the
+`fallback` prompt, or hits `incompatible-publish-age = "deny"`,
+cargo-cooldown restores the real pre-run lockfile.
 
-If cooldown is disabled with `enforcement = "off"` or `cooldown_minutes = 0`,
-`cargo cooldown update` still runs the update in the temporary workspace and then
-publishes Cargo's updated lockfile without a cooldown pass. Other forwarded
-Cargo commands skip the isolation step when cooldown is disabled.
+If cooldown is disabled with `incompatible-publish-age = "allow"` or
+`[registry].global-min-publish-age = "0"`, `cargo cooldown update` still runs
+the update in the temporary workspace and then publishes Cargo's updated
+lockfile without a cooldown pass. Other forwarded Cargo commands skip the
+isolation step when cooldown is disabled.
 
 During the temp resolution phase, Cargo may refresh registry/index metadata in
 `CARGO_HOME`. Normal registry crate source archives are not fetched just because
@@ -140,7 +142,7 @@ That boundary matters because the current implementation already caches:
 
 - registry contexts by source ID;
 - release timelines in memory by `(source_id, crate_name)`;
-- locked-version age inspections by `(source_id, crate_name, current_version, minimum_minutes)`.
+- locked-version age inspections by `(source_id, crate_name, current_version, minimum_seconds)`.
 
 So even though Cargo is re-run after each successful pin, the resolver does not
 need to rebuild the same registry timeline or re-evaluate the same locked
@@ -149,11 +151,12 @@ initial lockfile baseline after later pins.
 
 If any later cooldown step fails after Cargo has already rewritten the temp
 `Cargo.lock`, the resolver restores the exact temp lockfile contents that were
-present at process start before returning the error. Under `strict`, or when a
-`cargo_compatible` unresolved-fresh-version prompt is rejected or cannot run
-interactively, the real lockfile guard restores the original root `Cargo.lock`.
+present at process start before returning the error. Under
+`incompatible-publish-age = "deny"`, or when a `fallback`
+unresolved-fresh-version prompt is rejected or cannot run interactively, the
+real lockfile guard restores the original root `Cargo.lock`.
 For `cargo cooldown update`, other guard failures downgraded by
-`cargo_compatible` restore and publish Cargo's post-update temp lockfile instead
+`fallback` restore and publish Cargo's post-update temp lockfile instead
 of silently leaving the real lockfile unchanged.
 
 That means `cargo cooldown update` has this exact shape:
@@ -164,16 +167,16 @@ That means `cargo cooldown update` has this exact shape:
 4. run `cargo update`, letting Cargo write the newest graph it accepts to the
    temp `Cargo.lock`;
 5. inspect that updated temp lockfile;
-6. with `lockfile_baseline = "floor"`, exempt any `(registry, crate, version)`
+6. with `lockfile-baseline = "floor"`, exempt any `(registry, crate, version)`
    that was already present in the original snapshot;
 7. pin only the newly introduced or version-changed fresh entries, but allow
    them to return to an exact version from the original snapshot even if that
    baseline version is still fresher than the cutoff;
-8. with `lockfile_baseline = "floor"`, reject any cooldown assignment that would
+8. with `lockfile-baseline = "floor"`, reject any cooldown assignment that would
    downgrade a package below the newest version of that package already present
    in the original snapshot;
-9. if the cooldown step fails under `strict` enforcement, or if
-   `cargo_compatible` asks for unresolved fresh-version approval and approval is
+9. if the cooldown step fails under `incompatible-publish-age = "deny"`, or if
+   `fallback` asks for unresolved fresh-version approval and approval is
    not given, restore the original real lockfile;
 10. otherwise publish the final temp `Cargo.lock` to the real workspace.
 
@@ -189,7 +192,7 @@ For each registry package in the selected dependency closure:
 2. skip the package immediately if its registry is in `skip_registries`;
 3. skip the package if it matches an exact allow rule or its effective cooldown
    is `0`;
-4. if `lockfile_baseline = "floor"`, skip the package when the exact locked
+4. if `lockfile-baseline = "floor"`, skip the package when the exact locked
    `(registry, crate, version)` was already present in the initial lockfile
    baseline;
 5. inspect the locked version age.
@@ -200,8 +203,8 @@ before the update remains exempt, while a version introduced by `cargo update`
 is eligible for cooldown. If `cargo update` moves `foo 1.2.3` to `foo 1.2.4`,
 cooldown may pin `foo` back to `1.2.3` even when `1.2.3` is still fresh, because
 that exact version was already part of the baseline snapshot. With the default
-`lockfile_baseline = "floor"`, it will not pin `foo` below `1.2.3` during that
-update run. With `lockfile_baseline = "ignore"`, the pre-update snapshot is not an
+`lockfile-baseline = "floor"`, it will not pin `foo` below `1.2.3` during that
+update run. With `lockfile-baseline = "ignore"`, the pre-update snapshot is not an
 exemption, so `foo` can be cooled below `1.2.3` when Cargo accepts the result.
 
 The age inspection itself works like this:
@@ -216,8 +219,9 @@ The age inspection itself works like this:
    re-inspected after later pins.
 
 If a package is not skipped and still lacks a usable timestamp after local
-index plus fallback, the cooldown step fails under `strict` enforcement and
-becomes a warning under `cargo_compatible` enforcement.
+index plus fallback, the cooldown step fails under
+`incompatible-publish-age = "deny"` and becomes a warning under
+`incompatible-publish-age = "fallback"`.
 
 ## 3. Candidate selection and pin loop
 
@@ -231,7 +235,7 @@ cutoff:
    - is lower than the locked version;
    - satisfies every observed requirement;
    - and is either older than the cutoff or already present in the initial
-     lockfile baseline when `lockfile_baseline = "floor"`.
+     lockfile baseline when `lockfile-baseline = "floor"`.
 
 Fresh packages are first considered for one bulk lockfile assignment. Cooldown
 selects older candidates, builds local dependency components from registry
@@ -265,18 +269,18 @@ Two details matter here:
   locked version, emits a warning, and continues cooling the rest of the graph.
 
 If a batch succeeds, the resolver restarts from `cargo metadata` so Cargo can
-re-resolve the graph from the new lockfile state. Cargo-compatible skips stay
+re-resolve the graph from the new lockfile state. Fallback skips stay
 tied to the exact `(registry, crate, version)` that was skipped, so the same
 fresh version is not requeued again through blocker propagation after a restart.
 The initial baseline does not change, so any package that moves to a version not
 present in that baseline becomes eligible for cooldown on the next pass.
 
-If a pass makes no successful pins but does record new cargo-compatible skips,
+If a pass makes no successful pins but does record new fallback skips,
 the resolver also restarts from `cargo metadata` once so those skipped versions
 are left out of the next freshness queue instead of ending in a generic
 fixed-point error immediately.
 
-Before giving up on the remaining cargo-compatible set, cooldown runs one more
+Before giving up on the remaining fallback set, cooldown runs one more
 bounded pass for small resolver-constrained bundles linked by exact version
 requirements. It searches a small set of mutually compatible older versions
 using local index dependency metadata, rewrites that bundle in `Cargo.lock` as
@@ -295,13 +299,13 @@ between:
 - versions that the resolver had to keep fresh because no further compatible
   cooldown pin was possible in this run.
 
-That final distinction also drives the enforcement policy:
+That final distinction also drives the incompatible-publish-age policy:
 
-- `strict` fails if any resolver-constrained fresh versions remain and restores
+- `deny` fails if any resolver-constrained fresh versions remain and restores
   the original lockfile
-- `cargo_compatible` prompts before keeping the resulting lockfile and prints
+- `fallback` prompts before keeping the resulting lockfile and prints
   one warning block with those remaining fresh versions, unless
-  `cargo_compatible_accept = "auto"` is configured
+  `fallback-accept = "auto"` is configured
 
 The main scalability goal of the batch solver is to avoid one Cargo resolver
 invocation per independent fresh crate. The bulk path handles the common case

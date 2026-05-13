@@ -10,19 +10,22 @@ use semver::{Version, VersionReq};
 use crate::registry::{Release, ReleaseTimeline};
 
 /// Return the oldest publish time that is still accepted by the cooldown window.
-pub fn cutoff_time(minimum_minutes: u64, now: DateTime<Utc>) -> DateTime<Utc> {
-    now - Duration::minutes(minimum_minutes as i64)
+pub fn cutoff_time(minimum_seconds: u64, now: DateTime<Utc>) -> DateTime<Utc> {
+    let seconds = minimum_seconds.min(i64::MAX as u64) as i64;
+    Duration::try_seconds(seconds)
+        .and_then(|duration| now.checked_sub_signed(duration))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
 /// Determine whether a release is fresh when its publish time is known.
 pub fn is_release_fresh(
     release: &Release,
-    minimum_minutes: u64,
+    minimum_seconds: u64,
     now: DateTime<Utc>,
 ) -> Option<bool> {
     release
         .published_at
-        .map(|published_at| published_at > cutoff_time(minimum_minutes, now))
+        .map(|published_at| published_at > cutoff_time(minimum_seconds, now))
 }
 
 /// Select the newest older compatible release accepted by cooldown.
@@ -36,7 +39,7 @@ pub fn select_candidate<'a>(
     timeline: &'a ReleaseTimeline,
     current_version: &str,
     requirements: &[VersionReq],
-    minimum_minutes: u64,
+    minimum_seconds: u64,
     now: DateTime<Utc>,
     baseline_allows: impl Fn(&str) -> bool,
 ) -> Option<&'a Release> {
@@ -44,7 +47,7 @@ pub fn select_candidate<'a>(
         timeline,
         current_version,
         requirements,
-        minimum_minutes,
+        minimum_seconds,
         now,
         baseline_allows,
         1,
@@ -63,7 +66,7 @@ pub fn select_candidates<'a, F>(
     timeline: &'a ReleaseTimeline,
     current_version: &str,
     requirements: &[VersionReq],
-    minimum_minutes: u64,
+    minimum_seconds: u64,
     now: DateTime<Utc>,
     baseline_allows: F,
     limit: usize,
@@ -71,7 +74,7 @@ pub fn select_candidates<'a, F>(
 where
     F: Fn(&str) -> bool,
 {
-    let cutoff = cutoff_time(minimum_minutes, now);
+    let cutoff = cutoff_time(minimum_seconds, now);
     let Some(current) = Version::parse(current_version).ok() else {
         return Vec::new();
     };
@@ -152,11 +155,15 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 4, 3, 0, 0, 0).unwrap();
         let requirements = vec![VersionReq::parse("^1").unwrap()];
         let timeline = timeline();
-        let candidate =
-            select_candidate(&timeline, "1.2.0", &requirements, 14 * 24 * 60, now, |_| {
-                false
-            })
-            .expect("candidate should exist");
+        let candidate = select_candidate(
+            &timeline,
+            "1.2.0",
+            &requirements,
+            14 * 24 * 60 * 60,
+            now,
+            |_| false,
+        )
+        .expect("candidate should exist");
         assert_eq!(candidate.version, "1.1.0");
     }
 
@@ -169,9 +176,14 @@ mod tests {
         timeline.releases[0].published_at = None;
 
         assert!(
-            select_candidate(&timeline, "1.2.0", &requirements, 14 * 24 * 60, now, |_| {
-                false
-            })
+            select_candidate(
+                &timeline,
+                "1.2.0",
+                &requirements,
+                14 * 24 * 60 * 60,
+                now,
+                |_| { false }
+            )
             .is_none()
         );
     }
@@ -197,10 +209,11 @@ mod tests {
             ],
         };
 
-        let candidate = select_candidate(&timeline, "1.1.0", &requirements, 14 * 24 * 60, now, {
-            |version| version == "1.0.0"
-        })
-        .expect("baseline version should remain eligible");
+        let candidate =
+            select_candidate(&timeline, "1.1.0", &requirements, 14 * 24 * 60 * 60, now, {
+                |version| version == "1.0.0"
+            })
+            .expect("baseline version should remain eligible");
 
         assert_eq!(candidate.version, "1.0.0");
     }
@@ -214,7 +227,7 @@ mod tests {
             &timeline,
             "1.2.0",
             &requirements,
-            14 * 24 * 60,
+            14 * 24 * 60 * 60,
             now,
             |_| false,
             2,
@@ -233,8 +246,15 @@ mod tests {
     fn reports_freshness_when_timestamp_is_available() {
         let now = Utc.with_ymd_and_hms(2026, 4, 3, 0, 0, 0).unwrap();
         assert_eq!(
-            is_release_fresh(&timeline().releases[2], 14 * 24 * 60, now,),
+            is_release_fresh(&timeline().releases[2], 14 * 24 * 60 * 60, now,),
             Some(true)
         );
+    }
+
+    #[test]
+    fn cutoff_time_saturates_for_absurdly_large_durations() {
+        let now = Utc.with_ymd_and_hms(2026, 4, 3, 0, 0, 0).unwrap();
+
+        assert_eq!(cutoff_time(u64::MAX, now), DateTime::<Utc>::MIN_UTC);
     }
 }

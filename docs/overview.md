@@ -24,11 +24,11 @@ downloaded or compiled just because a lockfile exists. The higher-risk moment is
 when a later Cargo command consumes that lockfile and needs crate contents,
 especially commands that compile dependencies or execute build scripts.
 
-With the default `lockfile_baseline = "floor"`, guard-style commands treat
+With the default `[cooldown].lockfile-baseline = "floor"`, guard-style commands treat
 versions already present in the initial `Cargo.lock` as the protected baseline.
-Use `lockfile_baseline = "ignore"` when `cargo cooldown check`, `build`, `test`,
-or `run` should also try to cool already-locked versions before Cargo consumes
-them.
+Use `[cooldown].lockfile-baseline = "ignore"` when `cargo cooldown check`,
+`build`, `test`, or `run` should also try to cool already-locked versions before
+Cargo consumes them.
 
 For guard-style commands:
 
@@ -66,46 +66,50 @@ For `cargo cooldown update`:
 4. run `cargo update` in the temp workspace
 5. cool the updated temp lockfile
 6. publish the final temp `Cargo.lock` back to the real workspace
-7. restore the original lockfile if `strict` enforcement fails
+7. restore the original lockfile if `incompatible-publish-age = "deny"` fails
 
 ## Important Ideas
 
-- `cooldown_minutes` defines what "fresh" means.
-- `enforcement` decides whether remaining fresh versions are an error or a
-  warning.
-- `lockfile_baseline` decides whether versions already present in the initial
-  `Cargo.lock` are protected.
+- `[registry].global-min-publish-age` defines what "fresh" means.
+- `[cooldown].incompatible-publish-age` decides whether remaining fresh versions
+  are an error or a warning.
+- `[cooldown].lockfile-baseline` decides whether versions already present in the
+  initial `Cargo.lock` are protected.
 - `skip_registries` excludes whole registries from cooldown processing.
 - Allow rules intentionally reduce the cooldown window for selected crates.
 
 ## Generated Defaults
 
 ```toml
-enforcement = "cargo_compatible"
-cargo_compatible_accept = "prompt"
-lockfile_baseline = "floor"
+[cooldown]
+incompatible-publish-age = "deny"
+lockfile-baseline = "floor"
+
+[registry]
+global-min-publish-age = "14 days"
 ```
 
 In human terms:
 
 - protect the versions that were already locked before the command started
 - cool versions that Cargo added or changed
-- ask before keeping the best Cargo-valid lockfile if the updated graph still
-  needs a fresh version
+- fail closed and restore the original lockfile if Cargo still needs a fresh
+  version
 
-Use `lockfile_baseline = "ignore"` when you also want to try cooling versions that
-were already locked before the command started.
+Use `[cooldown].lockfile-baseline = "ignore"` when you also want to try cooling
+versions that were already locked before the command started.
 
-Use `enforcement = "strict"` when unresolved fresh versions should fail closed
-and restore the original `Cargo.lock`.
+Use `[cooldown].incompatible-publish-age = "fallback"` when long
+min-publish-age windows should cool what Cargo accepts but keep the best
+Cargo-valid lockfile if the graph still needs fresh versions.
 
-Use `cargo_compatible_accept = "auto"` only for workflows that should keep the
-Cargo-compatible result without asking.
+Use `[cooldown].fallback-accept = "auto"` only for workflows that should keep the
+fallback result without asking.
 
 ## Why Fresh Versions Can Remain
 
-A fresh version can remain even with `lockfile_baseline = "ignore"` because Cargo may
-not accept any older graph. Common causes:
+A fresh version can remain even with `[cooldown].lockfile-baseline = "ignore"`
+because Cargo may not accept any older graph. Common causes:
 
 - the current manifests require a fresh version range
 - a transitive crate uses an exact version dependency

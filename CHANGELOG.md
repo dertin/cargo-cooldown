@@ -8,6 +8,31 @@
   `test`, `run`, and `update` commands while continuing to forward any other
   Cargo command through cooldown.
 - `cargo cooldown --version` now prints the cargo-cooldown version directly.
+- RFC-style min publish age config aligned with the
+  [Cargo RFC for min publish age](https://github.com/rust-lang/rfcs/pull/3923):
+  `[registry].global-min-publish-age`, `[registry].min-publish-age`,
+  `[registries.<name>].min-publish-age`, `CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE`,
+  `CARGO_REGISTRY_MIN_PUBLISH_AGE`, and
+  `CARGO_REGISTRIES_<name>_MIN_PUBLISH_AGE`.
+- Policy environment overrides remain namespaced under
+  `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE` and
+  `COOLDOWN_FALLBACK_ACCEPT`.
+- New canonical cargo-cooldown extension section:
+  `[cooldown].incompatible-publish-age`,
+  `[cooldown].fallback-accept`, and
+  `[cooldown].lockfile-baseline`.
+- `cargo cooldown init` now emits `[registry].global-min-publish-age` instead of
+  `cooldown_minutes`, and emits cargo-cooldown-specific policy under
+  `[cooldown]`. Generated configs default to the RFC-style fail-closed
+  `incompatible-publish-age = "deny"` policy.
+
+### Deprecated
+
+- 0.3.0 compatibility aliases remain supported in 0.3.1 and are deprecated for
+  planned removal in the next major 0.4.x line: `cooldown_minutes`,
+  `COOLDOWN_MINUTES`, root `enforcement`, `COOLDOWN_ENFORCEMENT`, root
+  `cargo_compatible_accept`, `COOLDOWN_CARGO_COMPATIBLE_ACCEPT`, and root
+  `lockfile_baseline`.
 
 ### Fixed
 
@@ -31,10 +56,10 @@ Migration guide:
 - explicit `lockfile_baseline` / `COOLDOWN_LOCKFILE_BASELINE` to choose between
   using the initial lockfile as a version floor or ignoring that floor
 - explicit `enforcement` / `COOLDOWN_ENFORCEMENT` to choose strict rollback,
-  Cargo-compatible warnings, or fully disabled cooldown
+  `cargo_compatible` warnings, or fully disabled cooldown
 - explicit `cargo_compatible_accept` / `COOLDOWN_CARGO_COMPATIBLE_ACCEPT` to
   choose prompt-based review or automatic acceptance for unresolved fresh
-  versions under Cargo-compatible enforcement
+  versions under `cargo_compatible` enforcement
 - `cargo cooldown update` to refresh the lockfile first and then cool only the
   versions that changed relative to the pre-update baseline
 - `cargo cooldown init` to scaffold `cooldown.toml` interactively for crates
@@ -85,7 +110,7 @@ enforcement names changed in this release. See the
   freshly updated crate back to an exact version from the initial baseline,
   even when that baseline version is still inside the cooldown window
 - cooldown now treats blockers or parent constraints that were already
-  exhausted earlier in the run as cargo-compatible skips instead of failing
+  exhausted earlier in the run as fallback skips instead of failing
   later with a generic fixed-point error
 - cooldown now emits a single final warning when fresh versions remain,
   distinguishing baseline-carried versions from resolver-constrained ones, and

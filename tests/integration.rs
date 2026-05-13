@@ -27,7 +27,7 @@ const OLD_PUBTIME: &str = "2026-03-01T00:00:00Z";
 const FRESH_PUBTIME: &str = "2026-04-02T12:00:00Z";
 const FRESHER_PUBTIME: &str = "2026-04-02T18:00:00Z";
 const NOW: &str = "2026-04-03T00:00:00Z";
-const COOLDOWN_MINUTES: &str = "1440";
+const MIN_PUBLISH_AGE: &str = "1 day";
 const REGISTRY_NAME: &str = "cool-reg";
 const LOCKFILE_BASELINE_IGNORE: (&str, &str) = ("COOLDOWN_LOCKFILE_BASELINE", "ignore");
 const CHAIN_A_NAME: &str = "chaina";
@@ -192,26 +192,26 @@ fn fails_closed_when_registry_lacks_release_time_metadata() {
 }
 
 #[test]
-fn cargo_compatible_enforcement_continues_when_registry_lacks_release_time_metadata() {
+fn fallback_policy_continues_when_registry_lacks_release_time_metadata() {
     let mut harness =
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");
     harness.generate_lockfile();
 
     let output = harness.run_cooldown(&[
         LOCKFILE_BASELINE_IGNORE,
-        ("COOLDOWN_ENFORCEMENT", "cargo_compatible"),
-        ("COOLDOWN_CARGO_COMPATIBLE_ACCEPT", "auto"),
+        ("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", "fallback"),
+        ("COOLDOWN_FALLBACK_ACCEPT", "auto"),
     ]);
     assert!(
         output.status.success(),
-        "cargo_compatible enforcement should continue: {}",
+        "fallback policy should continue: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), FRESH_VERSION);
 }
 
 #[test]
-fn cargo_compatible_update_keeps_cargo_updated_lockfile_when_metadata_is_missing() {
+fn fallback_update_keeps_cargo_updated_lockfile_when_metadata_is_missing() {
     let mut harness = TestHarness::new_with_dependency_req(
         RegistryMode::MissingPubtimeNoApi,
         &format!("={OLD_VERSION}"),
@@ -224,13 +224,13 @@ fn cargo_compatible_update_keeps_cargo_updated_lockfile_when_metadata_is_missing
     let output = harness.run_command(
         &["update"],
         &[
-            ("COOLDOWN_ENFORCEMENT", "cargo_compatible"),
-            ("COOLDOWN_CARGO_COMPATIBLE_ACCEPT", "auto"),
+            ("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", "fallback"),
+            ("COOLDOWN_FALLBACK_ACCEPT", "auto"),
         ],
     );
     assert!(
         output.status.success(),
-        "cargo_compatible update should keep Cargo's updated lockfile when cooldown metadata is missing: {}",
+        "fallback update should keep Cargo's updated lockfile when cooldown metadata is missing: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), FRESH_VERSION);
@@ -274,16 +274,106 @@ fn skips_registry_from_start_by_effective_url() {
 }
 
 #[test]
-fn enforcement_off_skips_cooldown_checks_entirely() {
+fn global_min_publish_age_cools_lockfile() {
+    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
+    harness.generate_lockfile();
+    fs::write(
+        harness.workspace_dir.join("cooldown.toml"),
+        r#"[cooldown]
+lockfile-baseline = "ignore"
+
+[registry]
+global-min-publish-age = "1 day"
+"#,
+    )
+    .expect("config should be writable");
+
+    let output = harness.run_command_without_default_cooldown_env(&["check"], &[]);
+
+    assert!(
+        output.status.success(),
+        "RFC-style global min-publish-age should cool the fresh dependency: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+}
+
+#[test]
+fn rfc_style_named_registry_override_zero_keeps_alternate_registry_trusted() {
+    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
+    harness.generate_lockfile();
+    fs::write(
+        harness.workspace_dir.join("cooldown.toml"),
+        format!(
+            r#"[cooldown]
+lockfile-baseline = "ignore"
+
+[registry]
+global-min-publish-age = "1 day"
+
+[registries.{REGISTRY_NAME}]
+min-publish-age = "0"
+"#
+        ),
+    )
+    .expect("config should be writable");
+
+    let output = harness.run_command_without_default_cooldown_env(&["check"], &[]);
+
+    assert!(
+        output.status.success(),
+        "named registry min-publish-age override should bypass cooldown: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+}
+
+#[test]
+fn rfc_style_registry_override_by_index_can_use_non_cargo_name() {
+    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
+    harness.generate_lockfile();
+    fs::write(
+        harness.workspace_dir.join("cooldown.toml"),
+        format!(
+            r#"[cooldown]
+lockfile-baseline = "ignore"
+
+[registry]
+global-min-publish-age = "1 day"
+
+[registries.policy-name]
+index = "sparse+{}/index/"
+min-publish-age = "0"
+"#,
+            harness.server.base_url()
+        ),
+    )
+    .expect("config should be writable");
+
+    let output = harness.run_command_without_default_cooldown_env(&["check"], &[]);
+
+    assert!(
+        output.status.success(),
+        "registry min-publish-age override should match by index URL: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+}
+
+#[test]
+fn incompatible_publish_age_allow_skips_cooldown_checks_entirely() {
     let mut harness =
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");
     harness.generate_lockfile();
     harness.server.reset_counts();
 
-    let output = harness.run_cooldown(&[LOCKFILE_BASELINE_IGNORE, ("COOLDOWN_ENFORCEMENT", "off")]);
+    let output = harness.run_cooldown(&[
+        LOCKFILE_BASELINE_IGNORE,
+        ("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", "allow"),
+    ]);
     assert!(
         output.status.success(),
-        "enforcement=off should bypass cooldown: {}",
+        "incompatible-publish-age = \"allow\" should bypass cooldown: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), FRESH_VERSION);
@@ -456,7 +546,7 @@ fn exact_allow_rule_keeps_fresh_version_pinned() {
     fs::write(
         &config,
         format!(
-            "cooldown_minutes = 1440\nlockfile_baseline = \"ignore\"\n\n[[allow.exact]]\ncrate = \"{CRATE_NAME}\"\nversion = \"{FRESH_VERSION}\"\n"
+            "[cooldown]\nlockfile-baseline = \"ignore\"\n\n[registry]\nglobal-min-publish-age = \"1 day\"\n\n[[allow.exact]]\ncrate = \"{CRATE_NAME}\"\nversion = \"{FRESH_VERSION}\"\n"
         ),
     )
     .expect("config should be writable");
@@ -557,7 +647,7 @@ fn cooldown_update_holds_real_lockfile_and_uses_temp_workspace() {
         .env("CARGO_HOME", &harness.cargo_home)
         .env("CARGO_TERM_PROGRESS_WHEN", "never")
         .env("COOLDOWN_NOW", NOW)
-        .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+        .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
         .env("COOLDOWN_HTTP_RETRIES", "0")
         .env("COOLDOWN_VERBOSE", "true")
         .env("COOLDOWN_EXPECT_HELD_WORKSPACE", &harness.workspace_dir)
@@ -607,7 +697,10 @@ fn cooldown_update_reports_plain_lockfile_updates_when_no_cooling_is_needed() {
     assert_eq!(harness.locked_version(), OLD_VERSION);
     harness.set_dependency_requirement("1");
 
-    let output = harness.run_command(&["update"], &[("COOLDOWN_MINUTES", "1")]);
+    let output = harness.run_command(
+        &["update"],
+        &[("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", "1 minute")],
+    );
 
     assert!(
         output.status.success(),
@@ -684,7 +777,7 @@ fn cooldown_update_can_restore_a_fresh_baseline_version() {
         .env("CARGO_HOME", &cargo_home)
         .env("CARGO_TERM_PROGRESS_WHEN", "never")
         .env("COOLDOWN_NOW", NOW)
-        .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+        .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
         .env("COOLDOWN_HTTP_RETRIES", "0")
         .output()
         .expect("cargo-cooldown should run");
@@ -796,7 +889,7 @@ fn assert_cooldown_update_with_existing_fresh_lockfile_version(
         .env("CARGO_HOME", &cargo_home)
         .env("CARGO_TERM_PROGRESS_WHEN", "never")
         .env("COOLDOWN_NOW", NOW)
-        .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+        .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
         .env("COOLDOWN_HTTP_RETRIES", "0")
         .env("COOLDOWN_VERBOSE", "true");
     for (key, value) in extra_env {
@@ -1355,15 +1448,15 @@ fn benchmark_batch_solver() {
 }
 
 #[test]
-fn cargo_compatible_allows_resolver_constrained_versions_outside_selected_scope() {
+fn fallback_allows_resolver_constrained_versions_outside_selected_scope() {
     let mut harness = ScopedConflictHarness::new().expect("scoped conflict harness should build");
     harness.generate_lockfile();
     assert_eq!(harness.locked_version(), FRESH_VERSION);
 
-    let output = harness.run_cooldown(Some("cargo_compatible"));
+    let output = harness.run_cooldown(Some("fallback"));
     assert!(
         output.status.success(),
-        "cargo_compatible should keep the lockfile and warn: {}",
+        "fallback should keep the lockfile and warn: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), FRESH_VERSION);
@@ -1380,7 +1473,7 @@ fn cargo_compatible_allows_resolver_constrained_versions_outside_selected_scope(
 }
 
 #[test]
-fn cargo_compatible_requires_prompt_unless_auto_accept_is_configured() {
+fn fallback_requires_prompt_unless_auto_accept_is_configured() {
     let mut harness = ScopedConflictHarness::new().expect("scoped conflict harness should build");
     harness.generate_lockfile();
     let baseline_lockfile = harness.lockfile_contents();
@@ -1388,7 +1481,7 @@ fn cargo_compatible_requires_prompt_unless_auto_accept_is_configured() {
     let output = harness.run_cooldown_requiring_prompt();
     assert!(
         !output.status.success(),
-        "non-interactive cargo_compatible should require explicit acceptance: {}",
+        "non-interactive fallback should require explicit acceptance: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.lockfile_contents(), baseline_lockfile);
@@ -1402,14 +1495,11 @@ fn cargo_compatible_requires_prompt_unless_auto_accept_is_configured() {
         stderr.contains("published: 2026-04-02T12:00:00Z"),
         "{stderr}"
     );
-    assert!(
-        stderr.contains("COOLDOWN_CARGO_COMPATIBLE_ACCEPT=auto"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("COOLDOWN_FALLBACK_ACCEPT=auto"), "{stderr}");
 }
 
 #[test]
-fn strict_rejects_resolver_constrained_versions_outside_selected_scope() {
+fn deny_policy_rejects_resolver_constrained_versions_outside_selected_scope() {
     let mut harness = ScopedConflictHarness::new().expect("scoped conflict harness should build");
     harness.generate_lockfile();
     let baseline_lockfile = harness.lockfile_contents();
@@ -1418,14 +1508,14 @@ fn strict_rejects_resolver_constrained_versions_outside_selected_scope() {
     let output = harness.run_cooldown(None);
     assert!(
         !output.status.success(),
-        "strict should fail when fresh resolver-constrained versions remain: {}",
+        "deny policy should fail when fresh resolver-constrained versions remain: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.lockfile_contents(), baseline_lockfile);
     assert_eq!(harness.locked_version(), FRESH_VERSION);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("strict enforcement blocked fresh versions"),
+        stderr.contains("`incompatible-publish-age = \"deny\"` blocked fresh versions"),
         "{stderr}"
     );
     assert!(stderr.contains("scopedfresh 1.0.1"), "{stderr}");
@@ -1502,11 +1592,29 @@ impl TestHarness {
         self.run_command_in(&self.workspace_dir, args, extra_env)
     }
 
+    fn run_command_without_default_cooldown_env(
+        &self,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Output {
+        self.run_command_in_with_default_cooldown_env(&self.workspace_dir, args, extra_env, false)
+    }
+
     fn run_command_in(
         &self,
         current_dir: &Path,
         args: &[&str],
         extra_env: &[(&str, &str)],
+    ) -> Output {
+        self.run_command_in_with_default_cooldown_env(current_dir, args, extra_env, true)
+    }
+
+    fn run_command_in_with_default_cooldown_env(
+        &self,
+        current_dir: &Path,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+        include_default_min_publish_age: bool,
     ) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
         command
@@ -1515,8 +1623,10 @@ impl TestHarness {
             .env("CARGO_HOME", &self.cargo_home)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
             .env("COOLDOWN_NOW", NOW)
-            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
             .env("COOLDOWN_HTTP_RETRIES", "0");
+        if include_default_min_publish_age {
+            command.env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE);
+        }
 
         for (key, value) in extra_env {
             command.env(key, value);
@@ -1692,7 +1802,7 @@ impl CoordinatedBundleHarness {
             .env("CARGO_HOME", &self.cargo_home)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
             .env("COOLDOWN_NOW", NOW)
-            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
             .env("COOLDOWN_HTTP_RETRIES", "0");
 
         for (key, value) in extra_env {
@@ -1841,7 +1951,7 @@ impl BacktrackingBundleHarness {
             .env("CARGO_HOME", &self.cargo_home)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
             .env("COOLDOWN_NOW", NOW)
-            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
             .env("COOLDOWN_HTTP_RETRIES", "0")
             .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
             .env("PATH", &self.path_with_wrapper)
@@ -1946,7 +2056,7 @@ impl DuplicateNameBatchHarness {
             .env("CARGO_HOME", &self.cargo_home)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
             .env("COOLDOWN_NOW", NOW)
-            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
             .env("COOLDOWN_HTTP_RETRIES", "0")
             .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
             .env("PATH", &self.path_with_wrapper)
@@ -2074,7 +2184,7 @@ impl DuplicateTransitiveBatchHarness {
             .env("CARGO_HOME", &self.cargo_home)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
             .env("COOLDOWN_NOW", NOW)
-            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
             .env("COOLDOWN_HTTP_RETRIES", "0")
             .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
             .env("COOLDOWN_VERBOSE", "true")
@@ -2190,7 +2300,7 @@ impl DependencyChainHarness {
             .env("CARGO_HOME", &self.cargo_home)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
             .env("COOLDOWN_NOW", NOW)
-            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
             .env("COOLDOWN_HTTP_RETRIES", "0");
 
         for (key, value) in extra_env {
@@ -2293,7 +2403,7 @@ impl MultiPassBenchmarkHarness {
             .env("CARGO_HOME", &self.cargo_home)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
             .env("COOLDOWN_NOW", NOW)
-            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
             .env("COOLDOWN_HTTP_RETRIES", "0")
             .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
             .env("PATH", &self.path_with_wrapper);
@@ -2390,7 +2500,7 @@ index = "sparse+{base_url}/index/"
             .env("CARGO_HOME", &self.cargo_home)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
             .env("COOLDOWN_NOW", NOW)
-            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
             .env("COOLDOWN_HTTP_RETRIES", "0")
             .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
             .env("PATH", &self.path_with_wrapper)
@@ -2462,13 +2572,13 @@ impl ScopedConflictHarness {
         );
     }
 
-    fn run_cooldown(&self, enforcement: Option<&str>) -> Output {
+    fn run_cooldown(&self, incompatible_publish_age: Option<&str>) -> Output {
         let mut command = self.cooldown_command();
 
-        if let Some(enforcement) = enforcement {
-            command.env("COOLDOWN_ENFORCEMENT", enforcement);
-            if enforcement == "cargo_compatible" {
-                command.env("COOLDOWN_CARGO_COMPATIBLE_ACCEPT", "auto");
+        if let Some(policy) = incompatible_publish_age {
+            command.env("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", policy);
+            if policy == "fallback" {
+                command.env("COOLDOWN_FALLBACK_ACCEPT", "auto");
             }
         }
 
@@ -2477,7 +2587,7 @@ impl ScopedConflictHarness {
 
     fn run_cooldown_requiring_prompt(&self) -> Output {
         let mut command = self.cooldown_command();
-        command.env("COOLDOWN_ENFORCEMENT", "cargo_compatible");
+        command.env("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", "fallback");
         command.output().expect("cargo-cooldown should run")
     }
 
@@ -2489,7 +2599,7 @@ impl ScopedConflictHarness {
             .env("CARGO_HOME", &self.cargo_home)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
             .env("COOLDOWN_NOW", NOW)
-            .env("COOLDOWN_MINUTES", COOLDOWN_MINUTES)
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
             .env("COOLDOWN_HTTP_RETRIES", "0")
             .env("COOLDOWN_LOCKFILE_BASELINE", "ignore");
         command
@@ -2558,7 +2668,7 @@ impl WorkspaceMemberHarness {
             ])
             .current_dir(&self.runner_dir)
             .env("CARGO_TERM_PROGRESS_WHEN", "never")
-            .env("COOLDOWN_MINUTES", "60")
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", "60 minutes")
             .env("PATH", &self.path_with_wrapper)
             .env("COOLDOWN_CARGO_LOG", &self.cargo_wrapper_log)
             .output()

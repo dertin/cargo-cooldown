@@ -1,9 +1,13 @@
 # Baseline smoke-workspace settings; individual runs override values via environment variables.
-cooldown_minutes = 720
-enforcement = "strict"
 ttl_seconds = 86400
 http_retries = 2
 verbose = true
+
+[cooldown]
+incompatible-publish-age = "deny"
+
+[registry]
+global-min-publish-age = "12 hours"
 
 # Example allow rules for manual smoke tests:
 #

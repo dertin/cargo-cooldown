@@ -1,5 +1,9 @@
-cooldown_minutes = 86400
-enforcement = "cargo_compatible"
-cargo_compatible_accept = "auto"
-lockfile_baseline = "ignore"
 verbose = false
+
+[cooldown]
+incompatible-publish-age = "fallback"
+fallback-accept = "auto"
+lockfile-baseline = "ignore"
+
+[registry]
+global-min-publish-age = "60 days"
