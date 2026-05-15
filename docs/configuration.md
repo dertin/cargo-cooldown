@@ -289,18 +289,18 @@ version = "1.0.218"
 
 [[allow.package]]
 crate = "tokio"
-minutes = 60
+min-publish-age = "1 hour"
 
 [[allow.package]]
 crate = "openssl"
-minutes = 0
+min-publish-age = "0"
 ```
 
 Rules:
 
 - `[[allow.exact]]`: allow one exact `(crate, version)` pair
 - `[[allow.package]]`: use a shorter cooldown for one crate name
-- `minutes = 0`: exclude that crate from cooldown
+- `min-publish-age = "0"`: exclude that crate from cooldown
 - `[allow.global]`: define a shorter default cooldown for all registry crates
 
 `allow.global` and `allow.package` only reduce the effective cooldown. They do

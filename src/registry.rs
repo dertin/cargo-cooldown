@@ -610,34 +610,43 @@ fn skip_registry_matches(
     Ok(normalized == normalized_source_id || normalized == normalized_effective_index_url)
 }
 
-pub fn registry_override_matches(
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RegistryOverrideMatchPriority {
+    ResolvedName = 1,
+    LogicalName = 2,
+    ExplicitIndex = 3,
+}
+
+pub fn registry_override_match_priority(
     override_config: &RegistryMinPublishAgeOverride,
     context: &RegistryContext,
-) -> Result<bool> {
+) -> Result<Option<RegistryOverrideMatchPriority>> {
     let normalized_source_id = normalize_registry_identifier(&context.source_id)?;
     let normalized_effective_index_url =
         normalize_registry_identifier(&context.effective_index_url)?;
 
     if let Some(index) = override_config.index.as_deref() {
         let normalized_index = normalize_registry_identifier(index)?;
-        return Ok(normalized_index == normalized_source_id
-            || normalized_index == normalized_effective_index_url);
+        return Ok((normalized_index == normalized_source_id
+            || normalized_index == normalized_effective_index_url)
+            .then_some(RegistryOverrideMatchPriority::ExplicitIndex));
     }
 
     if override_config
         .name
         .eq_ignore_ascii_case(context.logical_name.as_str())
     {
-        return Ok(true);
+        return Ok(Some(RegistryOverrideMatchPriority::LogicalName));
     }
 
-    skip_registry_matches(
+    let matches = skip_registry_matches(
         &override_config.name,
         context.logical_name == "crates-io",
         &normalized_source_id,
         &normalized_effective_index_url,
         cargo_config_root(),
-    )
+    )?;
+    Ok(matches.then_some(RegistryOverrideMatchPriority::ResolvedName))
 }
 
 pub fn validate_registry_override_index(index: &str) -> Result<()> {
@@ -911,6 +920,54 @@ mod tests {
             config.min_publish_age_seconds_for(&context, "serde"),
             5 * 24 * 60 * 60
         );
+    }
+
+    #[test]
+    fn explicit_index_registry_override_wins_over_name_match_regardless_of_order() {
+        let context = RegistryContext {
+            logical_name: "cool-reg".to_string(),
+            source_id: "sparse+https://example.com/index/".to_string(),
+            effective_index_url: "sparse+https://example.com/index/".to_string(),
+            api: None,
+            cache_fingerprint: "test".to_string(),
+            skipped: false,
+            index_root: TamePathBuf::new(),
+        };
+        let name_override = RegistryMinPublishAgeOverride {
+            name: "cool-reg".to_string(),
+            index: None,
+            min_publish_age_seconds: 24 * 60 * 60,
+        };
+        let index_override = RegistryMinPublishAgeOverride {
+            name: "policy-name".to_string(),
+            index: Some("sparse+https://example.com/index/".to_string()),
+            min_publish_age_seconds: 0,
+        };
+
+        for registries in [
+            vec![name_override.clone(), index_override.clone()],
+            vec![index_override, name_override],
+        ] {
+            let config = Config {
+                min_publish_age_seconds: 14 * 24 * 60 * 60,
+                registry_min_publish_age: RegistryMinPublishAgeConfig {
+                    crates_io_seconds: None,
+                    registries,
+                },
+                incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,
+                fallback_accept: FallbackAccept::Prompt,
+                lockfile_baseline: LockfileBaselineMode::Floor,
+                now_override: None,
+                ttl_seconds: 60,
+                cache_dir: None,
+                http_retries: 0,
+                verbose: false,
+                skip_registries: Vec::new(),
+                allow_rules: AllowRules::default(),
+            };
+
+            assert_eq!(config.min_publish_age_seconds_for(&context, "serde"), 0);
+        }
     }
 
     #[test]

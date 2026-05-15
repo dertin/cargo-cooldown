@@ -25,6 +25,9 @@
   `cooldown_minutes`, and emits cargo-cooldown-specific policy under
   `[cooldown]`. Generated configs default to the RFC-style fail-closed
   `incompatible-publish-age = "deny"` policy.
+- `[[allow.package]]` now accepts RFC-style `min-publish-age = "N unit"`
+  duration strings, including `min-publish-age = "0"` to exempt one crate from
+  cooldown. The older `minutes` form remains supported for compatibility.
 
 ### Deprecated
 
@@ -38,6 +41,12 @@
 
 - `cargo cooldown version` now only prints the cargo-cooldown version and no
   longer runs cooldown or forwards to `cargo version`.
+- Cooldown now runs when the global min publish age is `0` but a crates.io or
+  named registry min publish age override is positive, so registry-specific
+  policy is enforced for both guard commands and `cargo cooldown update`.
+- Overlapping named registry min publish age overrides are now resolved
+  deterministically, with explicit `index` matches taking precedence over
+  registry-name matches.
 
 ## 0.3.0 - 2026-04-26
 

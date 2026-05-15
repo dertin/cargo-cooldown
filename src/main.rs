@@ -537,9 +537,7 @@ fn run_update_with_cooldown_isolation(
         }
         let post_update_lockfile = executor::capture_initial_lockfile(config, isolated.manifest())?;
 
-        if config.incompatible_publish_age != IncompatiblePublishAgePolicy::Allow
-            && config.min_publish_age_seconds > 0
-        {
+        if should_run_cooldown_guard(config) {
             match executor::run_pinning_flow_with_snapshot(
                 config,
                 isolated.manifest(),
@@ -636,9 +634,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            if config.incompatible_publish_age != IncompatiblePublishAgePolicy::Allow
-                && config.min_publish_age_seconds > 0
-            {
+            if should_run_cooldown_guard(&config) {
                 match run_cooldown_guard_isolated(
                     &config,
                     &project,
@@ -667,6 +663,11 @@ fn main() -> Result<()> {
             exit_with(status.code().unwrap_or(1));
         }
     }
+}
+
+fn should_run_cooldown_guard(config: &config::Config) -> bool {
+    config.incompatible_publish_age != IncompatiblePublishAgePolicy::Allow
+        && config.has_positive_min_publish_age()
 }
 
 /// Unit tests for CLI parsing and forwarded Cargo argument assembly.

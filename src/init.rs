@@ -271,17 +271,17 @@ fn render_config_file(template: &ConfigTemplate, is_override: bool) -> String {
         output.push_str("# `allow.exact` fully allows one exact crate version.\n");
         output.push_str("# `allow.package` lowers the cooldown for one crate name.\n");
         output.push_str(
-            "# Use `minutes = 0` in `allow.package` to exclude that crate from cooldown.\n",
+            "# Use `min-publish-age = \"0\"` in `allow.package` to exclude that crate from cooldown.\n",
         );
         output.push('\n');
         output.push_str("# [allow.global]\n");
         output.push_str("# minutes = 1440\n\n");
         output.push_str("# [[allow.package]]\n");
         output.push_str("# crate = \"tokio\"\n");
-        output.push_str("# minutes = 60\n\n");
+        output.push_str("# min-publish-age = \"1 hour\"\n\n");
         output.push_str("# [[allow.package]]\n");
         output.push_str("# crate = \"openssl\"\n");
-        output.push_str("# minutes = 0\n\n");
+        output.push_str("# min-publish-age = \"0\"\n\n");
         output.push_str("# [[allow.exact]]\n");
         output.push_str("# crate = \"serde\"\n");
         output.push_str("# version = \"1.0.218\"\n");

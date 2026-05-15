@@ -146,18 +146,18 @@ version = "1.0.218"
 
 [[allow.package]]
 crate = "tokio"
-minutes = 60
+min-publish-age = "1 hour"
 
 [[allow.package]]
 crate = "openssl"
-minutes = 0
+min-publish-age = "0"
 ```
 
 Use:
 
 - `[[allow.exact]]` to allow one exact crate version
 - `[[allow.package]]` to use a shorter cooldown for one crate
-- `minutes = 0` to exclude one crate from cooldown
+- `min-publish-age = "0"` to exclude one crate from cooldown
 
 Allow rules only reduce the effective cooldown window. They do not make a crate
 wait longer than the configured min publish age.

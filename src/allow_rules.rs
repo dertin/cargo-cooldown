@@ -40,6 +40,10 @@ pub struct AllowPackage {
     pub crate_name: String,
     #[serde(default)]
     pub minutes: Option<u64>,
+    #[serde(rename = "min-publish-age")]
+    pub min_publish_age: Option<String>,
+    #[serde(skip)]
+    pub(crate) min_publish_age_seconds: Option<u64>,
 }
 
 /// Provides a lower default cooldown window for all registry crates.
@@ -69,11 +73,14 @@ impl AllowRules {
             .any(|entry| entry.crate_name == name && entry.version == version)
     }
 
-    pub fn per_crate_minutes(&self) -> HashMap<String, u64> {
+    pub fn per_crate_min_publish_age_seconds(&self) -> HashMap<String, u64> {
         self.allow
             .package
             .iter()
-            .filter_map(|pkg| pkg.minutes.map(|minutes| (pkg.crate_name.clone(), minutes)))
+            .filter_map(|pkg| {
+                pkg.effective_min_publish_age_seconds()
+                    .map(|seconds| (pkg.crate_name.clone(), seconds))
+            })
             .collect()
     }
 
@@ -94,6 +101,31 @@ impl AllowRules {
         }
         effective
     }
+
+    #[cfg(test)]
+    pub fn effective_min_publish_age_seconds_for(&self, name: &str, default_seconds: u64) -> u64 {
+        let mut effective = default_seconds;
+        if let Some(global) = self.global_minutes() {
+            effective = effective.min(minutes_to_seconds_saturating(global));
+        }
+        if let Some(rule) = self.allow.package.iter().find(|pkg| pkg.crate_name == name)
+            && let Some(seconds) = rule.effective_min_publish_age_seconds()
+        {
+            effective = effective.min(seconds);
+        }
+        effective
+    }
+}
+
+impl AllowPackage {
+    fn effective_min_publish_age_seconds(&self) -> Option<u64> {
+        self.min_publish_age_seconds
+            .or_else(|| self.minutes.map(minutes_to_seconds_saturating))
+    }
+}
+
+fn minutes_to_seconds_saturating(minutes: u64) -> u64 {
+    minutes.saturating_mul(60)
 }
 
 impl AllowSection {
@@ -141,6 +173,8 @@ mod tests {
                 package: vec![AllowPackage {
                     crate_name: "bar".to_string(),
                     minutes: Some(10),
+                    min_publish_age: None,
+                    min_publish_age_seconds: None,
                 }],
                 global: Some(AllowGlobal { minutes: Some(60) }),
             },
@@ -160,6 +194,8 @@ mod tests {
                 package: vec![AllowPackage {
                     crate_name: "bar".to_string(),
                     minutes: Some(5),
+                    min_publish_age: None,
+                    min_publish_age_seconds: None,
                 }],
                 global: Some(AllowGlobal { minutes: Some(30) }),
             },
@@ -182,6 +218,8 @@ mod tests {
                 package: vec![AllowPackage {
                     crate_name: "tokio".to_string(),
                     minutes: Some(0),
+                    min_publish_age: None,
+                    min_publish_age_seconds: None,
                 }],
                 global: Some(AllowGlobal {
                     minutes: Some(1440),
@@ -191,5 +229,32 @@ mod tests {
 
         assert_eq!(allow_rules.effective_minutes_for("tokio", 1440), 0);
         assert_eq!(allow_rules.effective_minutes_for("serde", 1440), 1440);
+    }
+
+    #[test]
+    fn package_rule_can_disable_cooldown_with_min_publish_age() {
+        let allow_rules = AllowRules {
+            allow: AllowSection {
+                exact: Vec::new(),
+                package: vec![AllowPackage {
+                    crate_name: "tokio".to_string(),
+                    minutes: None,
+                    min_publish_age: Some("0".to_string()),
+                    min_publish_age_seconds: Some(0),
+                }],
+                global: Some(AllowGlobal {
+                    minutes: Some(1440),
+                }),
+            },
+        };
+
+        assert_eq!(
+            allow_rules.effective_min_publish_age_seconds_for("tokio", 86_400),
+            0
+        );
+        assert_eq!(
+            allow_rules.effective_min_publish_age_seconds_for("serde", 86_400),
+            86_400
+        );
     }
 }

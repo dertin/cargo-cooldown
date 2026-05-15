@@ -329,6 +329,36 @@ min-publish-age = "0"
 }
 
 #[test]
+fn registry_override_with_zero_global_min_publish_age_cools_lockfile() {
+    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
+    harness.generate_lockfile();
+    fs::write(
+        harness.workspace_dir.join("cooldown.toml"),
+        format!(
+            r#"[cooldown]
+lockfile-baseline = "ignore"
+
+[registry]
+global-min-publish-age = "0"
+
+[registries.{REGISTRY_NAME}]
+min-publish-age = "1 day"
+"#
+        ),
+    )
+    .expect("config should be writable");
+
+    let output = harness.run_command_without_default_cooldown_env(&["check"], &[]);
+
+    assert!(
+        output.status.success(),
+        "named registry min-publish-age override should run when global min-publish-age is zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+}
+
+#[test]
 fn rfc_style_registry_override_by_index_can_use_non_cargo_name() {
     let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
     harness.generate_lockfile();
@@ -561,6 +591,36 @@ fn exact_allow_rule_keeps_fresh_version_pinned() {
 }
 
 #[test]
+fn allow_package_min_publish_age_zero_exempts_crate_from_global_cooldown() {
+    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
+    harness.generate_lockfile();
+    fs::write(
+        harness.workspace_dir.join("cooldown.toml"),
+        format!(
+            r#"[cooldown]
+lockfile-baseline = "ignore"
+
+[registry]
+global-min-publish-age = "1 day"
+
+[[allow.package]]
+crate = "{CRATE_NAME}"
+min-publish-age = "0"
+"#
+        ),
+    )
+    .expect("config should be writable");
+
+    let output = harness.run_command_without_default_cooldown_env(&["check"], &[]);
+    assert!(
+        output.status.success(),
+        "allow.package min-publish-age = 0 should bypass cooldown for the crate: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+}
+
+#[test]
 fn cooldown_update_keeps_existing_baseline_versions_with_floor_baseline() {
     let harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
     let mut harness = harness;
@@ -718,6 +778,37 @@ fn cooldown_update_reports_plain_lockfile_updates_when_no_cooling_is_needed() {
         stderr.contains("    Finished dependency graph updated and cooled down"),
         "{stderr}"
     );
+}
+
+#[test]
+fn cooldown_update_uses_registry_override_when_global_min_publish_age_is_zero() {
+    let mut harness =
+        TestHarness::new_with_dependency_req(RegistryMode::PubtimeOnly, &format!("={OLD_VERSION}"))
+            .expect("harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+    harness.set_dependency_requirement("1");
+    fs::write(
+        harness.workspace_dir.join("cooldown.toml"),
+        format!(
+            r#"[registry]
+global-min-publish-age = "0"
+
+[registries.{REGISTRY_NAME}]
+min-publish-age = "1 day"
+"#
+        ),
+    )
+    .expect("config should be writable");
+
+    let output = harness.run_command_without_default_cooldown_env(&["update"], &[]);
+
+    assert!(
+        output.status.success(),
+        "cargo cooldown update should apply registry min-publish-age when global min-publish-age is zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), OLD_VERSION);
 }
 
 #[test]

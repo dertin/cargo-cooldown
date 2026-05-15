@@ -97,13 +97,17 @@ version = "1.0.218"
 
 [[allow.package]]
 crate = "tokio"
-minutes = 60
+min-publish-age = "1 hour"
 
 [allow.global]
 minutes = 1440
 ```
 
-If an existing rule uses `minimum_release_age`, rename that key to `minutes`.
+If an existing rule uses `minimum_release_age`, rename that key to
+`min-publish-age`. The older `minutes` form still works for compatibility, but
+new `allow.package` rules should use duration strings such as
+`min-publish-age = "1 hour"` or `min-publish-age = "0"`.
+
 Use lowercase or dashed TOML keys such as
 `[registry].global-min-publish-age`; environment variable names are only
 accepted from the environment.

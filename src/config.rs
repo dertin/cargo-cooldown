@@ -13,7 +13,7 @@ use serde::Deserialize;
 use crate::allow_rules::{AllowRules, AllowSection};
 use crate::project::ProjectContext;
 use crate::registry::{
-    RegistryContext, registry_override_matches, validate_registry_override_index,
+    RegistryContext, registry_override_match_priority, validate_registry_override_index,
 };
 
 const SECONDS_PER_MINUTE: u64 = 60;
@@ -145,11 +145,19 @@ impl Config {
         if let Some(global_minutes) = self.allow_rules.global_minutes() {
             seconds = seconds.min(minutes_to_seconds_saturating(global_minutes));
         }
-        if let Some(&crate_minutes) = self.allow_rules.per_crate_minutes().get(crate_name) {
-            seconds = seconds.min(minutes_to_seconds_saturating(crate_minutes));
+        if let Some(&crate_seconds) = self
+            .allow_rules
+            .per_crate_min_publish_age_seconds()
+            .get(crate_name)
+        {
+            seconds = seconds.min(crate_seconds);
         }
 
         seconds
+    }
+
+    pub fn has_positive_min_publish_age(&self) -> bool {
+        self.min_publish_age_seconds > 0 || self.registry_min_publish_age.has_positive_override()
     }
 }
 
@@ -160,6 +168,14 @@ pub struct RegistryMinPublishAgeConfig {
 }
 
 impl RegistryMinPublishAgeConfig {
+    fn has_positive_override(&self) -> bool {
+        self.crates_io_seconds.is_some_and(|seconds| seconds > 0)
+            || self
+                .registries
+                .iter()
+                .any(|registry| registry.min_publish_age_seconds > 0)
+    }
+
     fn for_context(&self, context: &RegistryContext) -> Option<u64> {
         if context.logical_name == "crates-io" {
             return self.crates_io_seconds;
@@ -167,9 +183,15 @@ impl RegistryMinPublishAgeConfig {
 
         self.registries
             .iter()
-            .rev()
-            .find(|entry| registry_override_matches(entry, context).unwrap_or(false))
-            .map(|entry| entry.min_publish_age_seconds)
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let priority = registry_override_match_priority(entry, context)
+                    .ok()
+                    .flatten()?;
+                Some((priority, index, entry.min_publish_age_seconds))
+            })
+            .max_by_key(|(priority, index, _)| (*priority, *index))
+            .map(|(_, _, seconds)| seconds)
     }
 
     fn merge_from(&mut self, overlay: RegistryMinPublishAgeConfig) {
@@ -412,9 +434,12 @@ impl MergedConfig {
             );
         }
 
-        self.allow_rules.merge_from(&AllowRules {
+        let mut allow_rules = AllowRules {
             allow: file.data.allow.clone(),
-        });
+        };
+        normalize_allow_rule_min_publish_age(&mut allow_rules)
+            .with_context(|| format!("invalid allow rules in {}", file.path.display()))?;
+        self.allow_rules.merge_from(&allow_rules);
         Ok(())
     }
 
@@ -571,7 +596,10 @@ impl FileConfig {
             config.crates_io_seconds = Some(parse_duration_seconds(value)?);
         }
 
-        for (name, registry) in &self.data.registries {
+        let mut registries: Vec<_> = self.data.registries.iter().collect();
+        registries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        for (name, registry) in registries {
             let Some(value) = registry.min_publish_age.as_deref() else {
                 continue;
             };
@@ -592,6 +620,45 @@ impl FileConfig {
 
         Ok(config)
     }
+}
+
+fn normalize_allow_rule_min_publish_age(allow_rules: &mut AllowRules) -> Result<()> {
+    for package in &mut allow_rules.allow.package {
+        let compat_seconds = package
+            .minutes
+            .map(minutes_to_seconds)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "invalid `minutes` value for [[allow.package]] crate `{}`",
+                    package.crate_name
+                )
+            })?;
+        let rfc_seconds = package
+            .min_publish_age
+            .as_deref()
+            .map(parse_duration_seconds)
+            .transpose()
+            .with_context(|| {
+                format!(
+                    "invalid `min-publish-age` value for [[allow.package]] crate `{}`",
+                    package.crate_name
+                )
+            })?;
+
+        if compat_seconds
+            .zip(rfc_seconds)
+            .is_some_and(|(compat, rfc)| compat != rfc)
+        {
+            bail!(
+                "[[allow.package]] crate `{}` defines incompatible `minutes` and `min-publish-age` values; use only one per-package cooldown setting",
+                package.crate_name
+            );
+        }
+
+        package.min_publish_age_seconds = rfc_seconds.or(compat_seconds);
+    }
+    Ok(())
 }
 
 fn merge_registry_skip_lists(base: &[String], overlay: &[String]) -> Vec<String> {
@@ -633,6 +700,7 @@ fn parse_bool(value: &str) -> Result<bool> {
 
 fn env_registry_min_publish_age_overrides() -> Result<RegistryMinPublishAgeConfig> {
     let mut config = RegistryMinPublishAgeConfig::default();
+    let mut overrides = Vec::new();
     for (key, value) in env::vars() {
         let Some(raw_name) = key
             .strip_prefix("CARGO_REGISTRIES_")
@@ -643,8 +711,13 @@ fn env_registry_min_publish_age_overrides() -> Result<RegistryMinPublishAgeConfi
         if raw_name.is_empty() {
             continue;
         }
+        overrides.push((raw_name.to_ascii_lowercase().replace('_', "-"), value));
+    }
+
+    overrides.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (name, value) in overrides {
         config.registries.push(RegistryMinPublishAgeOverride {
-            name: raw_name.to_ascii_lowercase().replace('_', "-"),
+            name,
             index: None,
             min_publish_age_seconds: parse_duration_seconds(&value)?,
         });
@@ -1122,6 +1195,51 @@ seconds = 60
     }
 
     #[test]
+    fn loads_allow_package_min_publish_age() {
+        let _guard = env_lock().lock().unwrap();
+        let root = TempDir::new().unwrap();
+        root.child("cooldown.toml")
+            .write_str(
+                r#"[[allow.package]]
+crate = "serde"
+min-publish-age = "1 day"
+"#,
+            )
+            .unwrap();
+
+        let config = Config::load(&project_fixture(root.path(), None)).unwrap();
+
+        assert_eq!(
+            config
+                .allow_rules
+                .per_crate_min_publish_age_seconds()
+                .get("serde"),
+            Some(&SECONDS_PER_DAY)
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_allow_package_duration_forms() {
+        let _guard = env_lock().lock().unwrap();
+        let root = TempDir::new().unwrap();
+        root.child("cooldown.toml")
+            .write_str(
+                r#"[[allow.package]]
+crate = "serde"
+minutes = 60
+min-publish-age = "1 day"
+"#,
+            )
+            .unwrap();
+
+        let err = Config::load(&project_fixture(root.path(), None)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("defines incompatible `minutes` and `min-publish-age`"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
     fn rejects_invalid_verbose_env_value() {
         with_env_var("COOLDOWN_VERBOSE", Some("yes"), || {
             let root = TempDir::new().unwrap();
@@ -1366,6 +1484,37 @@ min-publish-age = "0"
         assert_eq!(registry.name, "my-org");
         assert_eq!(registry.index.as_deref(), Some("https://my.org"));
         assert_eq!(registry.min_publish_age_seconds, 0);
+    }
+
+    #[test]
+    fn registry_overrides_load_in_deterministic_name_order() {
+        let _guard = env_lock().lock().unwrap();
+        let root = TempDir::new().unwrap();
+        root.child("cooldown.toml")
+            .write_str(
+                r#"[registries.zeta]
+min-publish-age = "3 days"
+
+[registries.alpha]
+min-publish-age = "1 day"
+
+[registries.middle]
+min-publish-age = "2 days"
+"#,
+            )
+            .unwrap();
+
+        let config = Config::load(&project_fixture(root.path(), None)).unwrap();
+
+        assert_eq!(
+            config
+                .registry_min_publish_age
+                .registries
+                .iter()
+                .map(|registry| registry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["alpha", "middle", "zeta"]
+        );
     }
 
     #[test]
