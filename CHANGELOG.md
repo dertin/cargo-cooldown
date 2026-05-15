@@ -47,6 +47,10 @@
 - Overlapping named registry min publish age overrides are now resolved
   deterministically, with explicit `index` matches taking precedence over
   registry-name matches.
+- Layered `[registries.<name>]` overrides now preserve an existing `index`
+  when a higher-precedence config only changes `min-publish-age`.
+- Invalid registry names in min publish age overrides now produce an error
+  instead of being silently ignored.
 
 ## 0.3.0 - 2026-04-26
 

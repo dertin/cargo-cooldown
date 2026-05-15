@@ -297,7 +297,7 @@ impl ResolutionState {
         let current_version = package.version.clone();
         let minimum_seconds = ctx
             .config
-            .min_publish_age_seconds_for(&context, &package.name);
+            .min_publish_age_seconds_for(&context, &package.name)?;
         let exact_allowed = ctx
             .config
             .allow_rules

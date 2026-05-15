@@ -917,7 +917,9 @@ mod tests {
         };
 
         assert_eq!(
-            config.min_publish_age_seconds_for(&context, "serde"),
+            config
+                .min_publish_age_seconds_for(&context, "serde")
+                .unwrap(),
             5 * 24 * 60 * 60
         );
     }
@@ -966,8 +968,57 @@ mod tests {
                 allow_rules: AllowRules::default(),
             };
 
-            assert_eq!(config.min_publish_age_seconds_for(&context, "serde"), 0);
+            assert_eq!(
+                config
+                    .min_publish_age_seconds_for(&context, "serde")
+                    .unwrap(),
+                0
+            );
         }
+    }
+
+    #[test]
+    fn invalid_registry_override_name_errors_instead_of_falling_back() {
+        let context = RegistryContext {
+            logical_name: "cool-reg".to_string(),
+            source_id: "sparse+https://example.com/index/".to_string(),
+            effective_index_url: "sparse+https://example.com/index/".to_string(),
+            api: None,
+            cache_fingerprint: "test".to_string(),
+            skipped: false,
+            index_root: TamePathBuf::new(),
+        };
+        let config = Config {
+            min_publish_age_seconds: 0,
+            registry_min_publish_age: RegistryMinPublishAgeConfig {
+                crates_io_seconds: None,
+                registries: vec![RegistryMinPublishAgeOverride {
+                    name: "registry-that-does-not-exist".to_string(),
+                    index: None,
+                    min_publish_age_seconds: 24 * 60 * 60,
+                }],
+            },
+            incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,
+            fallback_accept: FallbackAccept::Prompt,
+            lockfile_baseline: LockfileBaselineMode::Floor,
+            now_override: None,
+            ttl_seconds: 60,
+            cache_dir: None,
+            http_retries: 0,
+            verbose: false,
+            skip_registries: Vec::new(),
+            allow_rules: AllowRules::default(),
+        };
+
+        let err = config
+            .min_publish_age_seconds_for(&context, "serde")
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains(
+                "failed to evaluate min-publish-age override for [registries.registry-that-does-not-exist]"
+            ),
+            "{err:#}"
+        );
     }
 
     #[test]

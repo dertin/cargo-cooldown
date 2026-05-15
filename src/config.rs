@@ -13,7 +13,8 @@ use serde::Deserialize;
 use crate::allow_rules::{AllowRules, AllowSection};
 use crate::project::ProjectContext;
 use crate::registry::{
-    RegistryContext, registry_override_match_priority, validate_registry_override_index,
+    RegistryContext, RegistryOverrideMatchPriority, registry_override_match_priority,
+    validate_registry_override_index,
 };
 
 const SECONDS_PER_MINUTE: u64 = 60;
@@ -136,10 +137,14 @@ impl Config {
         Ok(merged.finish())
     }
 
-    pub fn min_publish_age_seconds_for(&self, context: &RegistryContext, crate_name: &str) -> u64 {
+    pub fn min_publish_age_seconds_for(
+        &self,
+        context: &RegistryContext,
+        crate_name: &str,
+    ) -> Result<u64> {
         let mut seconds = self
             .registry_min_publish_age
-            .for_context(context)
+            .for_context(context)?
             .unwrap_or(self.min_publish_age_seconds);
 
         if let Some(global_minutes) = self.allow_rules.global_minutes() {
@@ -153,7 +158,7 @@ impl Config {
             seconds = seconds.min(crate_seconds);
         }
 
-        seconds
+        Ok(seconds)
     }
 
     pub fn has_positive_min_publish_age(&self) -> bool {
@@ -176,22 +181,33 @@ impl RegistryMinPublishAgeConfig {
                 .any(|registry| registry.min_publish_age_seconds > 0)
     }
 
-    fn for_context(&self, context: &RegistryContext) -> Option<u64> {
+    fn for_context(&self, context: &RegistryContext) -> Result<Option<u64>> {
         if context.logical_name == "crates-io" {
-            return self.crates_io_seconds;
+            return Ok(self.crates_io_seconds);
         }
 
-        self.registries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                let priority = registry_override_match_priority(entry, context)
-                    .ok()
-                    .flatten()?;
-                Some((priority, index, entry.min_publish_age_seconds))
-            })
-            .max_by_key(|(priority, index, _)| (*priority, *index))
-            .map(|(_, _, seconds)| seconds)
+        let mut best: Option<(RegistryOverrideMatchPriority, usize, u64)> = None;
+        for (index, entry) in self.registries.iter().enumerate() {
+            let Some(priority) =
+                registry_override_match_priority(entry, context).with_context(|| {
+                    format!(
+                        "failed to evaluate min-publish-age override for [registries.{}]",
+                        entry.name
+                    )
+                })?
+            else {
+                continue;
+            };
+            let candidate = (priority, index, entry.min_publish_age_seconds);
+            if best
+                .as_ref()
+                .is_none_or(|current| (candidate.0, candidate.1) > (current.0, current.1))
+            {
+                best = Some(candidate);
+            }
+        }
+
+        Ok(best.map(|(_, _, seconds)| seconds))
     }
 
     fn merge_from(&mut self, overlay: RegistryMinPublishAgeConfig) {
@@ -205,7 +221,11 @@ impl RegistryMinPublishAgeConfig {
                 .iter_mut()
                 .find(|existing| existing.name == registry.name)
             {
-                *existing = registry;
+                let mut merged = registry;
+                if merged.index.is_none() {
+                    merged.index = existing.index.clone();
+                }
+                *existing = merged;
             } else {
                 self.registries.push(registry);
             }
@@ -1305,6 +1325,41 @@ version = "1.2.3"
         assert_eq!(config.allow_rules.global_minutes(), Some(3));
         assert_eq!(config.allow_rules.effective_minutes_for("serde", 90), 1);
         assert!(config.allow_rules.is_exact_allowed("foo", "1.2.3"));
+    }
+
+    #[test]
+    fn member_registry_override_preserves_workspace_index_when_overlay_omits_it() {
+        let _guard = env_lock().lock().unwrap();
+        let root = TempDir::new().unwrap();
+        let member_dir = root.child("member-a");
+        member_dir.create_dir_all().unwrap();
+        root.child("cooldown.toml")
+            .write_str(
+                r#"[registries.policy-name]
+index = "sparse+https://example.com/index/"
+min-publish-age = "5 days"
+"#,
+            )
+            .unwrap();
+        member_dir
+            .child("cooldown.toml")
+            .write_str(
+                r#"[registries.policy-name]
+min-publish-age = "1 day"
+"#,
+            )
+            .unwrap();
+
+        let config = Config::load(&project_fixture(root.path(), Some(member_dir.path()))).unwrap();
+
+        assert_eq!(config.registry_min_publish_age.registries.len(), 1);
+        let registry = &config.registry_min_publish_age.registries[0];
+        assert_eq!(registry.name, "policy-name");
+        assert_eq!(
+            registry.index.as_deref(),
+            Some("sparse+https://example.com/index/")
+        );
+        assert_eq!(registry.min_publish_age_seconds, SECONDS_PER_DAY);
     }
 
     #[test]
