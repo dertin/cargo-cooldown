@@ -59,6 +59,8 @@ jobs:
           fi
 
       - name: Run tests
+        env:
+          CARGO_TERM_COLOR: never
         run: cargo test --locked --bins --tests
 
   build:
