@@ -238,6 +238,7 @@ pub struct RegistryMinPublishAgeOverride {
     pub name: String,
     pub index: Option<String>,
     pub min_publish_age_seconds: u64,
+    pub name_from_env: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -635,6 +636,7 @@ impl FileConfig {
                 name: name.clone(),
                 index: registry.index.clone(),
                 min_publish_age_seconds: parse_duration_seconds(value)?,
+                name_from_env: false,
             });
         }
 
@@ -731,7 +733,7 @@ fn env_registry_min_publish_age_overrides() -> Result<RegistryMinPublishAgeConfi
         if raw_name.is_empty() {
             continue;
         }
-        overrides.push((raw_name.to_ascii_lowercase().replace('_', "-"), value));
+        overrides.push((raw_name.to_ascii_lowercase(), value));
     }
 
     overrides.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -740,6 +742,7 @@ fn env_registry_min_publish_age_overrides() -> Result<RegistryMinPublishAgeConfi
             name,
             index: None,
             min_publish_age_seconds: parse_duration_seconds(&value)?,
+            name_from_env: true,
         });
     }
     Ok(config)
@@ -1687,6 +1690,10 @@ global-min-publish-age = "1 day"
                 "CARGO_REGISTRIES_MY_ORG_MIN_PUBLISH_AGE",
                 env::var("CARGO_REGISTRIES_MY_ORG_MIN_PUBLISH_AGE").ok(),
             ),
+            (
+                "CARGO_REGISTRIES_MY_REGISTRY_MIN_PUBLISH_AGE",
+                env::var("CARGO_REGISTRIES_MY_REGISTRY_MIN_PUBLISH_AGE").ok(),
+            ),
         ];
 
         unsafe { env::remove_var("COOLDOWN_MINUTES") };
@@ -1695,6 +1702,7 @@ global-min-publish-age = "1 day"
         unsafe { env::set_var("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", "2 weeks") };
         unsafe { env::set_var("CARGO_REGISTRY_MIN_PUBLISH_AGE", "5 days") };
         unsafe { env::set_var("CARGO_REGISTRIES_MY_ORG_MIN_PUBLISH_AGE", "0") };
+        unsafe { env::set_var("CARGO_REGISTRIES_MY_REGISTRY_MIN_PUBLISH_AGE", "1 day") };
 
         let config = Config::load(&project_fixture(root.path(), None)).unwrap();
 
@@ -1709,7 +1717,20 @@ global-min-publish-age = "1 day"
                 .registries
                 .iter()
                 .any(|registry| {
-                    registry.name == "my-org" && registry.min_publish_age_seconds == 0
+                    registry.name == "my_org"
+                        && registry.name_from_env
+                        && registry.min_publish_age_seconds == 0
+                })
+        );
+        assert!(
+            config
+                .registry_min_publish_age
+                .registries
+                .iter()
+                .any(|registry| {
+                    registry.name == "my_registry"
+                        && registry.name_from_env
+                        && registry.min_publish_age_seconds == SECONDS_PER_DAY
                 })
         );
 

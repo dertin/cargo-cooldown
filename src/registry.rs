@@ -635,8 +635,19 @@ pub fn registry_override_match_priority(
     if override_config
         .name
         .eq_ignore_ascii_case(context.logical_name.as_str())
+        || (override_config.name_from_env
+            && override_config.name == cargo_env_registry_name(&context.logical_name))
     {
         return Ok(Some(RegistryOverrideMatchPriority::LogicalName));
+    }
+
+    if override_config.name_from_env {
+        return env_registry_override_match_priority(
+            &override_config.name,
+            context.logical_name == "crates-io",
+            &normalized_source_id,
+            &normalized_effective_index_url,
+        );
     }
 
     let matches = skip_registry_matches(
@@ -649,6 +660,39 @@ pub fn registry_override_match_priority(
     Ok(matches.then_some(RegistryOverrideMatchPriority::ResolvedName))
 }
 
+fn env_registry_override_match_priority(
+    env_name: &str,
+    is_crates_io: bool,
+    normalized_source_id: &str,
+    normalized_effective_index_url: &str,
+) -> Result<Option<RegistryOverrideMatchPriority>> {
+    match skip_registry_matches(
+        env_name,
+        is_crates_io,
+        normalized_source_id,
+        normalized_effective_index_url,
+        cargo_config_root(),
+    ) {
+        Ok(matches) => return Ok(matches.then_some(RegistryOverrideMatchPriority::ResolvedName)),
+        Err(raw_err) => {
+            let dashed_name = env_name.replace('_', "-");
+            if dashed_name == env_name {
+                return Err(raw_err);
+            }
+
+            let matches = skip_registry_matches(
+                &dashed_name,
+                is_crates_io,
+                normalized_source_id,
+                normalized_effective_index_url,
+                cargo_config_root(),
+            )
+            .map_err(|_| raw_err)?;
+            Ok(matches.then_some(RegistryOverrideMatchPriority::ResolvedName))
+        }
+    }
+}
+
 pub fn validate_registry_override_index(index: &str) -> Result<()> {
     if !looks_like_registry_identifier(index.trim()) {
         bail!("registry override index must be a registry URL or source ID");
@@ -658,6 +702,10 @@ pub fn validate_registry_override_index(index: &str) -> Result<()> {
 
 fn looks_like_registry_identifier(value: &str) -> bool {
     value.starts_with("registry+") || value.starts_with("sparse+") || value.contains("://")
+}
+
+fn cargo_env_registry_name(logical_name: &str) -> String {
+    logical_name.to_ascii_lowercase().replace('-', "_")
 }
 
 fn is_crates_io_source_id(source_id: &str) -> bool {
@@ -939,11 +987,13 @@ mod tests {
             name: "cool-reg".to_string(),
             index: None,
             min_publish_age_seconds: 24 * 60 * 60,
+            name_from_env: false,
         };
         let index_override = RegistryMinPublishAgeOverride {
             name: "policy-name".to_string(),
             index: Some("sparse+https://example.com/index/".to_string()),
             min_publish_age_seconds: 0,
+            name_from_env: false,
         };
 
         for registries in [
@@ -996,6 +1046,7 @@ mod tests {
                     name: "registry-that-does-not-exist".to_string(),
                     index: None,
                     min_publish_age_seconds: 24 * 60 * 60,
+                    name_from_env: true,
                 }],
             },
             incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,

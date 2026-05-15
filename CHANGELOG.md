@@ -51,6 +51,8 @@
   when a higher-precedence config only changes `min-publish-age`.
 - Invalid registry names in min publish age overrides now produce an error
   instead of being silently ignored.
+- Registry min publish age environment overrides now preserve underscores in
+  registry names instead of always rewriting them to dashes.
 
 ## 0.3.0 - 2026-04-26
 
