@@ -597,7 +597,7 @@ impl FileConfig {
         }
 
         let mut registries: Vec<_> = self.data.registries.iter().collect();
-        registries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        registries.sort_by_key(|(left, _)| *left);
 
         for (name, registry) in registries {
             let Some(value) = registry.min_publish_age.as_deref() else {
