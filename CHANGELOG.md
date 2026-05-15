@@ -49,6 +49,8 @@
   registry-name matches.
 - Layered `[registries.<name>]` overrides now preserve an existing `index`
   when a higher-precedence config only changes `min-publish-age`.
+- Layered `[registries.<name>]` overrides now preserve an existing
+  `min-publish-age` when a higher-precedence config only changes `index`.
 - Invalid registry names in min publish age overrides now produce an error
   instead of being silently ignored.
 - Registry min publish age environment overrides now preserve underscores in

@@ -175,10 +175,11 @@ pub struct RegistryMinPublishAgeConfig {
 impl RegistryMinPublishAgeConfig {
     fn has_positive_override(&self) -> bool {
         self.crates_io_seconds.is_some_and(|seconds| seconds > 0)
-            || self
-                .registries
-                .iter()
-                .any(|registry| registry.min_publish_age_seconds > 0)
+            || self.registries.iter().any(|registry| {
+                registry
+                    .min_publish_age_seconds
+                    .is_some_and(|seconds| seconds > 0)
+            })
     }
 
     fn for_context(&self, context: &RegistryContext) -> Result<Option<u64>> {
@@ -188,6 +189,9 @@ impl RegistryMinPublishAgeConfig {
 
         let mut best: Option<(RegistryOverrideMatchPriority, usize, u64)> = None;
         for (index, entry) in self.registries.iter().enumerate() {
+            let Some(seconds) = entry.min_publish_age_seconds else {
+                continue;
+            };
             let Some(priority) =
                 registry_override_match_priority(entry, context).with_context(|| {
                     format!(
@@ -198,7 +202,7 @@ impl RegistryMinPublishAgeConfig {
             else {
                 continue;
             };
-            let candidate = (priority, index, entry.min_publish_age_seconds);
+            let candidate = (priority, index, seconds);
             if best
                 .as_ref()
                 .is_none_or(|current| (candidate.0, candidate.1) > (current.0, current.1))
@@ -225,6 +229,9 @@ impl RegistryMinPublishAgeConfig {
                 if merged.index.is_none() {
                     merged.index = existing.index.clone();
                 }
+                if merged.min_publish_age_seconds.is_none() {
+                    merged.min_publish_age_seconds = existing.min_publish_age_seconds;
+                }
                 *existing = merged;
             } else {
                 self.registries.push(registry);
@@ -237,7 +244,7 @@ impl RegistryMinPublishAgeConfig {
 pub struct RegistryMinPublishAgeOverride {
     pub name: String,
     pub index: Option<String>,
-    pub min_publish_age_seconds: u64,
+    pub min_publish_age_seconds: Option<u64>,
     pub name_from_env: bool,
 }
 
@@ -621,9 +628,9 @@ impl FileConfig {
         registries.sort_by_key(|(left, _)| *left);
 
         for (name, registry) in registries {
-            let Some(value) = registry.min_publish_age.as_deref() else {
+            if registry.min_publish_age.is_none() && registry.index.is_none() {
                 continue;
-            };
+            }
             if let Some(index) = registry.index.as_deref() {
                 validate_registry_override_index(index).with_context(|| {
                     format!(
@@ -635,7 +642,11 @@ impl FileConfig {
             config.registries.push(RegistryMinPublishAgeOverride {
                 name: name.clone(),
                 index: registry.index.clone(),
-                min_publish_age_seconds: parse_duration_seconds(value)?,
+                min_publish_age_seconds: registry
+                    .min_publish_age
+                    .as_deref()
+                    .map(parse_duration_seconds)
+                    .transpose()?,
                 name_from_env: false,
             });
         }
@@ -741,7 +752,7 @@ fn env_registry_min_publish_age_overrides() -> Result<RegistryMinPublishAgeConfi
         config.registries.push(RegistryMinPublishAgeOverride {
             name,
             index: None,
-            min_publish_age_seconds: parse_duration_seconds(&value)?,
+            min_publish_age_seconds: Some(parse_duration_seconds(&value)?),
             name_from_env: true,
         });
     }
@@ -1362,7 +1373,42 @@ min-publish-age = "1 day"
             registry.index.as_deref(),
             Some("sparse+https://example.com/index/")
         );
-        assert_eq!(registry.min_publish_age_seconds, SECONDS_PER_DAY);
+        assert_eq!(registry.min_publish_age_seconds, Some(SECONDS_PER_DAY));
+    }
+
+    #[test]
+    fn member_registry_override_preserves_workspace_min_publish_age_when_overlay_sets_index() {
+        let _guard = env_lock().lock().unwrap();
+        let root = TempDir::new().unwrap();
+        let member_dir = root.child("member-a");
+        member_dir.create_dir_all().unwrap();
+        root.child("cooldown.toml")
+            .write_str(
+                r#"[registries.policy-name]
+index = "sparse+https://workspace.example/index/"
+min-publish-age = "5 days"
+"#,
+            )
+            .unwrap();
+        member_dir
+            .child("cooldown.toml")
+            .write_str(
+                r#"[registries.policy-name]
+index = "sparse+https://member.example/index/"
+"#,
+            )
+            .unwrap();
+
+        let config = Config::load(&project_fixture(root.path(), Some(member_dir.path()))).unwrap();
+
+        assert_eq!(config.registry_min_publish_age.registries.len(), 1);
+        let registry = &config.registry_min_publish_age.registries[0];
+        assert_eq!(registry.name, "policy-name");
+        assert_eq!(
+            registry.index.as_deref(),
+            Some("sparse+https://member.example/index/")
+        );
+        assert_eq!(registry.min_publish_age_seconds, Some(5 * SECONDS_PER_DAY));
     }
 
     #[test]
@@ -1541,7 +1587,7 @@ min-publish-age = "0"
         let registry = &config.registry_min_publish_age.registries[0];
         assert_eq!(registry.name, "my-org");
         assert_eq!(registry.index.as_deref(), Some("https://my.org"));
-        assert_eq!(registry.min_publish_age_seconds, 0);
+        assert_eq!(registry.min_publish_age_seconds, Some(0));
     }
 
     #[test]
@@ -1719,7 +1765,7 @@ global-min-publish-age = "1 day"
                 .any(|registry| {
                     registry.name == "my_org"
                         && registry.name_from_env
-                        && registry.min_publish_age_seconds == 0
+                        && registry.min_publish_age_seconds == Some(0)
                 })
         );
         assert!(
@@ -1730,7 +1776,7 @@ global-min-publish-age = "1 day"
                 .any(|registry| {
                     registry.name == "my_registry"
                         && registry.name_from_env
-                        && registry.min_publish_age_seconds == SECONDS_PER_DAY
+                        && registry.min_publish_age_seconds == Some(SECONDS_PER_DAY)
                 })
         );
 

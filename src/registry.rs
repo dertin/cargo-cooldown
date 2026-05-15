@@ -673,7 +673,7 @@ fn env_registry_override_match_priority(
         normalized_effective_index_url,
         cargo_config_root(),
     ) {
-        Ok(matches) => return Ok(matches.then_some(RegistryOverrideMatchPriority::ResolvedName)),
+        Ok(matches) => Ok(matches.then_some(RegistryOverrideMatchPriority::ResolvedName)),
         Err(raw_err) => {
             let dashed_name = env_name.replace('_', "-");
             if dashed_name == env_name {
@@ -986,13 +986,13 @@ mod tests {
         let name_override = RegistryMinPublishAgeOverride {
             name: "cool-reg".to_string(),
             index: None,
-            min_publish_age_seconds: 24 * 60 * 60,
+            min_publish_age_seconds: Some(24 * 60 * 60),
             name_from_env: false,
         };
         let index_override = RegistryMinPublishAgeOverride {
             name: "policy-name".to_string(),
             index: Some("sparse+https://example.com/index/".to_string()),
-            min_publish_age_seconds: 0,
+            min_publish_age_seconds: Some(0),
             name_from_env: false,
         };
 
@@ -1045,7 +1045,7 @@ mod tests {
                 registries: vec![RegistryMinPublishAgeOverride {
                     name: "registry-that-does-not-exist".to_string(),
                     index: None,
-                    min_publish_age_seconds: 24 * 60 * 60,
+                    min_publish_age_seconds: Some(24 * 60 * 60),
                     name_from_env: true,
                 }],
             },
