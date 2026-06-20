@@ -3354,13 +3354,14 @@ fn find_manifest_dependency<'a>(
     dep_name: &str,
     package_name: &str,
 ) -> Option<&'a cargo_metadata::Dependency> {
+    let normalized_dep_name = dep_name.replace('-', "_");
     deps.iter().find(|candidate| {
-        candidate
-            .rename
-            .as_deref()
-            .is_some_and(|rename| rename == dep_name)
-            || candidate.name == dep_name
-            || candidate.name == package_name
+        if let Some(rename) = &candidate.rename {
+            rename.replace('-', "_") == normalized_dep_name
+        } else {
+            candidate.name.replace('-', "_") == normalized_dep_name
+                || candidate.name == package_name
+        }
     })
 }
 
@@ -3546,6 +3547,11 @@ mod tests {
         let matched = find_manifest_dependency(&deps, "digest-sha2", "sha2")
             .expect("renamed dependency should match");
         assert_eq!(matched.req, VersionReq::parse("^0.10").unwrap());
+
+        // Test hyphen to underscore normalization
+        let matched_normalized = find_manifest_dependency(&deps, "digest_sha2", "sha2")
+            .expect("renamed dependency with underscore should match");
+        assert_eq!(matched_normalized.req, VersionReq::parse("^0.10").unwrap());
     }
 
     #[test]

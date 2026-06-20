@@ -682,13 +682,14 @@ fn find_manifest_dependency<'a>(
     dep_name: &str,
     package_name: &str,
 ) -> Option<&'a ManifestDependencyRecord> {
+    let normalized_dep_name = dep_name.replace('-', "_");
     deps.iter().find(|candidate| {
-        candidate
-            .rename
-            .as_deref()
-            .is_some_and(|rename| rename == dep_name)
-            || candidate.name == dep_name
-            || candidate.name == package_name
+        if let Some(rename) = &candidate.rename {
+            rename.replace('-', "_") == normalized_dep_name
+        } else {
+            candidate.name.replace('-', "_") == normalized_dep_name
+                || candidate.name == package_name
+        }
     })
 }
 
@@ -840,6 +841,30 @@ mod tests {
             requirement: "^1".to_string(),
         };
         assert_eq!(origin.requirement_req(), VersionReq::parse("^1").unwrap());
+    }
+
+    #[test]
+    fn find_manifest_dependency_matches_normalized_and_renamed_dependency() {
+        let deps = vec![
+            ManifestDependencyRecord {
+                name: "mio".to_string(),
+                rename: Some("mio-0_6".to_string()),
+                requirement: "~0.6".to_string(),
+            },
+            ManifestDependencyRecord {
+                name: "mio".to_string(),
+                rename: Some("mio-1_0".to_string()),
+                requirement: "^1.0".to_string(),
+            },
+        ];
+        // Matches even with hyphen/underscore mismatch and multiple renamed options
+        let matched = find_manifest_dependency(&deps, "mio_1_0", "mio")
+            .expect("renamed dependency with underscore should match the correct candidate");
+        assert_eq!(matched.requirement, "^1.0");
+
+        let matched_hyphen = find_manifest_dependency(&deps, "mio-1-0", "mio")
+            .expect("renamed dependency with hyphen should match the correct candidate");
+        assert_eq!(matched_hyphen.requirement, "^1.0");
     }
 
     #[test]
