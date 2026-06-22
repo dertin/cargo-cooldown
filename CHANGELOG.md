@@ -11,6 +11,8 @@
   CLI help assertions are stable in GitHub Actions.
 - The release publish job now checks out the requested tag before creating the
   GitHub release and artifact attestations.
+- The locked `quinn-proto` dependency is updated to `0.11.15` to address
+  `RUSTSEC-2026-0185`.
 
 ## 0.3.1 - 2026-05-15
 
