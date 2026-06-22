@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2 - 2026-06-22
+
+### Fixed
+
+- Dependency matching now normalizes Cargo metadata names and respects renamed
+  dependency aliases, preventing the resolver from applying requirements from
+  the wrong alias when a crate is included under multiple names.
+- The release workflow now disables Cargo color output while running tests so
+  CLI help assertions are stable in GitHub Actions.
+- The release publish job now checks out the requested tag before creating the
+  GitHub release and artifact attestations.
+
 ## 0.3.1 - 2026-05-15
 
 ### Added
