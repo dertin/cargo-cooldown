@@ -15,6 +15,28 @@ if [[ ! "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
   exit 2
 fi
 
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+github_repo_from_remote() {
+  local url
+  url="$(git remote get-url origin)"
+  case "$url" in
+    git@github.com:*)
+      printf '%s\n' "${url#git@github.com:}" | sed 's/\.git$//'
+      ;;
+    https://github.com/*)
+      printf '%s\n' "${url#https://github.com/}" | sed 's/\.git$//'
+      ;;
+    *)
+      echo "Unsupported origin remote: ${url}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+github_repo="$(github_repo_from_remote)"
+
 cargo_manifest_version() {
   local pkgid
   pkgid="$(cargo pkgid)"
@@ -48,13 +70,50 @@ if [ -n "$(git status --porcelain)" ]; then
   exit 1
 fi
 
-if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
-  echo "Tag ${tag} already exists locally" >&2
-  exit 1
-fi
+trigger_github_release() {
+  gh workflow run release.yml -R "$github_repo" --ref main -f "tag=${tag}"
+
+  local run_id=""
+  for _ in {1..30}; do
+    run_id="$(
+      gh run list \
+        -R "$github_repo" \
+        --workflow release.yml \
+        --event workflow_dispatch \
+        --branch main \
+        --commit "$remote_head" \
+        --json databaseId,displayTitle \
+        --jq ".[] | select(.displayTitle == \"Release ${tag}\") | .databaseId" \
+        --limit 20 |
+        head -n 1
+    )"
+    if [ -n "$run_id" ]; then
+      break
+    fi
+    sleep 2
+  done
+
+  if [ -z "$run_id" ]; then
+    echo "Could not find the release workflow run for ${tag}" >&2
+    exit 1
+  fi
+
+  gh run watch "$run_id" -R "$github_repo" --exit-status
+}
 
 if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-  echo "Tag ${tag} already exists on origin" >&2
+  if gh release view "$tag" -R "$github_repo" >/dev/null 2>&1; then
+    echo "Release ${tag} is already complete on GitHub." >&2
+    exit 0
+  fi
+
+  echo "Tag ${tag} already exists on origin; triggering GitHub release workflow only." >&2
+  trigger_github_release
+  exit 0
+fi
+
+if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+  echo "Tag ${tag} exists locally but not on origin; push it or delete it first." >&2
   exit 1
 fi
 
@@ -72,30 +131,4 @@ if ! cargo publish --locked; then
   exit 1
 fi
 
-gh workflow run release.yml --ref main -f "tag=${tag}"
-
-run_id=""
-for _ in {1..30}; do
-  run_id="$(
-    gh run list \
-      --workflow release.yml \
-      --event workflow_dispatch \
-      --branch main \
-      --commit "$remote_head" \
-      --json databaseId,displayTitle \
-      --jq ".[] | select(.displayTitle == \"Release ${tag}\") | .databaseId" \
-      --limit 20 |
-      head -n 1
-  )"
-  if [ -n "$run_id" ]; then
-    break
-  fi
-  sleep 2
-done
-
-if [ -z "$run_id" ]; then
-  echo "Could not find the release workflow run for ${tag}" >&2
-  exit 1
-fi
-
-gh run watch "$run_id" --exit-status
+trigger_github_release
