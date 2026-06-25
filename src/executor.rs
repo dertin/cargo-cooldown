@@ -3023,10 +3023,10 @@ fn apply_lockfile_pin_assignment(
 /// Write a proposed pin assignment and ask Cargo to validate the result.
 ///
 /// The current lockfile is captured first. After rewriting package versions and
-/// checksums, Cargo is run with `--locked`; if Cargo needs to refresh derived
-/// lockfile data, one unlocked metadata pass is allowed and then rechecked with
-/// `--locked`. Any rejection restores the captured lockfile and reports why the
-/// batch failed.
+/// checksums, Cargo is asked once without `--locked` so it can refresh derived
+/// lockfile data and rewrite the file in its native format. A final
+/// `--locked` metadata pass validates the normalized lockfile. Any rejection
+/// restores the captured lockfile and reports why the batch failed.
 fn apply_lockfile_pin_assignment_detailed(
     manifest: &Manifest,
     workspace: &Workspace,
@@ -3042,56 +3042,42 @@ fn apply_lockfile_pin_assignment_detailed(
         write_lockfile_pin_assignment(lockfile_path, registry_store, pins)
     })?;
 
+    if let Err(unlocked_err) = timed_debug!("normalize batch lockfile via cargo metadata", {
+        read_metadata(manifest, features)
+    }) {
+        let error = unlocked_err.to_string();
+        if !parse_batch_conflict_packages(&error).is_empty() {
+            debug!(
+                target: "cargo_cooldown::timing",
+                error = %error,
+                "cooldown batch solver rejected by cargo metadata during lockfile normalization"
+            );
+            lockfile_snapshot.restore(lockfile_path)?;
+            return Ok(BatchPinOutcome::Rejected { error });
+        }
+
+        debug!(
+            target: "cargo_cooldown::timing",
+            error = %error,
+            "cooldown batch solver rejected during lockfile normalization"
+        );
+        lockfile_snapshot.restore(lockfile_path)?;
+        return Ok(BatchPinOutcome::Rejected { error });
+    }
+
     let locked_metadata = match timed_debug!("batch validation cargo metadata --locked", {
         read_metadata_locked(manifest, features)
     }) {
         Ok(metadata) => metadata,
         Err(err) => {
             let error = err.to_string();
-            if !parse_batch_conflict_packages(&error).is_empty() {
-                debug!(
-                    target: "cargo_cooldown::timing",
-                    error = %error,
-                    "cooldown batch solver rejected by cargo metadata --locked"
-                );
-                lockfile_snapshot.restore(lockfile_path)?;
-                return Ok(BatchPinOutcome::Rejected { error });
-            }
-
             debug!(
                 target: "cargo_cooldown::timing",
                 error = %error,
-                "cooldown batch solver lockfile assignment requires Cargo to refresh the lockfile"
+                "cooldown batch solver rejected by cargo metadata --locked after normalization"
             );
-
-            if let Err(unlocked_err) = timed_debug!("batch validation cargo metadata", {
-                read_metadata(manifest, features)
-            }) {
-                let error = unlocked_err.to_string();
-                debug!(
-                    target: "cargo_cooldown::timing",
-                    error = %error,
-                    "cooldown batch solver rejected by cargo metadata"
-                );
-                lockfile_snapshot.restore(lockfile_path)?;
-                return Ok(BatchPinOutcome::Rejected { error });
-            }
-
-            match timed_debug!("batch validation cargo metadata --locked after update", {
-                read_metadata_locked(manifest, features)
-            }) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    let error = err.to_string();
-                    debug!(
-                        target: "cargo_cooldown::timing",
-                        error = %error,
-                        "cooldown batch solver rejected by cargo metadata --locked after update"
-                    );
-                    lockfile_snapshot.restore(lockfile_path)?;
-                    return Ok(BatchPinOutcome::Rejected { error });
-                }
-            }
+            lockfile_snapshot.restore(lockfile_path)?;
+            return Ok(BatchPinOutcome::Rejected { error });
         }
     };
 
