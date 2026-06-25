@@ -3244,17 +3244,73 @@ fn rewrite_lockfile_dependency_ref(
     dependency: &str,
     version_renames: &HashMap<(String, String), String>,
 ) -> Option<String> {
-    let (name, version) = parse_versioned_lockfile_dependency(dependency)?;
-    let new_version = version_renames.get(&(name.to_string(), version.to_string()))?;
-    Some(format!("{name} {new_version}"))
+    let parsed = parse_versioned_lockfile_dependency(dependency)?;
+    let version = parsed.version?;
+    let new_version = version_renames.get(&(parsed.name.to_string(), version.to_string()))?;
+    Some(format_lockfile_dependency_ref(
+        parsed.name,
+        new_version,
+        parsed.source,
+    ))
 }
 
-fn parse_versioned_lockfile_dependency(dependency: &str) -> Option<(&str, &str)> {
-    let (name, version) = dependency.rsplit_once(' ')?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedLockfileDependencyRef<'a> {
+    name: &'a str,
+    version: Option<&'a str>,
+    source: Option<&'a str>,
+}
+
+/// Parse a lockfile `dependencies` entry in Cargo's compact package-id format.
+///
+/// Cargo may emit `name`, `name version`, or `name version (source)` when multiple
+/// packages share the same name or version.
+fn parse_versioned_lockfile_dependency(
+    dependency: &str,
+) -> Option<ParsedLockfileDependencyRef<'_>> {
+    let mut parts = dependency.splitn(3, ' ');
+    let name = parts.next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let version = parts.next().map(str::trim).filter(|part| !part.is_empty());
+    let source = parts.next().and_then(|part| {
+        part.trim()
+            .strip_prefix('(')
+            .and_then(|part| part.strip_suffix(')'))
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+    });
+
+    if source.is_some() && version.is_none() {
+        return None;
+    }
+
+    let Some(version) = version else {
+        return Some(ParsedLockfileDependencyRef {
+            name,
+            version: None,
+            source: None,
+        });
+    };
+
     if version.is_empty() || !version.as_bytes()[0].is_ascii_digit() {
         return None;
     }
-    Some((name, version))
+
+    Some(ParsedLockfileDependencyRef {
+        name,
+        version: Some(version),
+        source,
+    })
+}
+
+fn format_lockfile_dependency_ref(name: &str, version: &str, source: Option<&str>) -> String {
+    match source {
+        Some(source) => format!("{name} {version} ({source})"),
+        None => format!("{name} {version}"),
+    }
 }
 
 fn lockfile_pin_assignment_made_progress(
@@ -4489,25 +4545,64 @@ mod tests {
     fn parse_versioned_lockfile_dependency_splits_name_and_version() {
         assert_eq!(
             parse_versioned_lockfile_dependency("getrandom 0.4.3"),
-            Some(("getrandom", "0.4.3"))
+            Some(ParsedLockfileDependencyRef {
+                name: "getrandom",
+                version: Some("0.4.3"),
+                source: None,
+            })
         );
         assert_eq!(
             parse_versioned_lockfile_dependency("windows-sys 0.61.2"),
-            Some(("windows-sys", "0.61.2"))
+            Some(ParsedLockfileDependencyRef {
+                name: "windows-sys",
+                version: Some("0.61.2"),
+                source: None,
+            })
         );
-        assert_eq!(parse_versioned_lockfile_dependency("getrandom"), None);
+        assert_eq!(
+            parse_versioned_lockfile_dependency(
+                "bar 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)"
+            ),
+            Some(ParsedLockfileDependencyRef {
+                name: "bar",
+                version: Some("0.1.0"),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index"),
+            })
+        );
+        assert_eq!(
+            parse_versioned_lockfile_dependency("getrandom"),
+            Some(ParsedLockfileDependencyRef {
+                name: "getrandom",
+                version: None,
+                source: None,
+            })
+        );
     }
 
     #[test]
     fn rewrite_lockfile_dependency_ref_updates_disambiguated_versions() {
-        let renames = HashMap::from([(
-            ("getrandom".to_string(), "0.4.3".to_string()),
-            "0.4.2".to_string(),
-        )]);
+        let renames = HashMap::from([
+            (
+                ("getrandom".to_string(), "0.4.3".to_string()),
+                "0.4.2".to_string(),
+            ),
+            (
+                ("bar".to_string(), "0.4.3".to_string()),
+                "0.4.2".to_string(),
+            ),
+        ]);
 
         assert_eq!(
             rewrite_lockfile_dependency_ref("getrandom 0.4.3", &renames).as_deref(),
             Some("getrandom 0.4.2")
+        );
+        assert_eq!(
+            rewrite_lockfile_dependency_ref(
+                "bar 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)",
+                &renames
+            )
+            .as_deref(),
+            Some("bar 0.4.2 (registry+https://github.com/rust-lang/crates.io-index)")
         );
         assert_eq!(
             rewrite_lockfile_dependency_ref("getrandom 0.3.4", &renames),
