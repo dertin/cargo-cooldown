@@ -3171,17 +3171,8 @@ fn write_lockfile_pin_assignment(
         table.insert("checksum".to_string(), toml::Value::String(checksum));
     }
 
-    let version_renames = pins
-        .iter()
-        .filter(|pin| pin.current_version != pin.target_version)
-        .map(|pin| {
-            (
-                (pin.name.clone(), pin.current_version.clone()),
-                pin.target_version.clone(),
-            )
-        })
-        .collect::<HashMap<_, _>>();
-    if !version_renames.is_empty() {
+    let version_renames = build_lockfile_dependency_renames(pins);
+    if !version_renames.by_name_source_version.is_empty() {
         rewrite_lockfile_dependency_versions(packages, &version_renames);
     }
 
@@ -3212,9 +3203,63 @@ fn write_lockfile_pin_assignment(
 /// package entries that still reference the old disambiguated version, a later
 /// unlocked `cargo metadata` pass can rewire those edges to a different locked
 /// version of the same crate name.
+/// Version rewrites keyed for lockfile `dependencies` entries.
+///
+/// Source-qualified refs match on `(name, source, version)`. Unqualified refs
+/// match on `(name, version)` only when that pair maps to a single pin.
+#[derive(Default)]
+struct LockfileDependencyRenames {
+    by_name_source_version: HashMap<(String, String, String), String>,
+    by_name_version: HashMap<(String, String), String>,
+}
+
+fn build_lockfile_dependency_renames(pins: &[LockfilePin]) -> LockfileDependencyRenames {
+    let changed_pins: Vec<_> = pins
+        .iter()
+        .filter(|pin| pin.current_version != pin.target_version)
+        .collect();
+
+    let by_name_source_version = changed_pins
+        .iter()
+        .map(|pin| {
+            (
+                (
+                    pin.name.clone(),
+                    pin.source_id.clone(),
+                    pin.current_version.clone(),
+                ),
+                pin.target_version.clone(),
+            )
+        })
+        .collect();
+
+    let mut name_version_counts = HashMap::<(String, String), usize>::new();
+    for pin in &changed_pins {
+        *name_version_counts
+            .entry((pin.name.clone(), pin.current_version.clone()))
+            .or_default() += 1;
+    }
+
+    let by_name_version = changed_pins
+        .iter()
+        .filter(|pin| name_version_counts[&(pin.name.clone(), pin.current_version.clone())] == 1)
+        .map(|pin| {
+            (
+                (pin.name.clone(), pin.current_version.clone()),
+                pin.target_version.clone(),
+            )
+        })
+        .collect();
+
+    LockfileDependencyRenames {
+        by_name_source_version,
+        by_name_version,
+    }
+}
+
 fn rewrite_lockfile_dependency_versions(
     packages: &mut [toml::Value],
-    version_renames: &HashMap<(String, String), String>,
+    version_renames: &LockfileDependencyRenames,
 ) {
     for package in packages {
         let Some(table) = package.as_table_mut() else {
@@ -3242,11 +3287,20 @@ fn rewrite_lockfile_dependency_versions(
 
 fn rewrite_lockfile_dependency_ref(
     dependency: &str,
-    version_renames: &HashMap<(String, String), String>,
+    version_renames: &LockfileDependencyRenames,
 ) -> Option<String> {
     let parsed = parse_versioned_lockfile_dependency(dependency)?;
     let version = parsed.version?;
-    let new_version = version_renames.get(&(parsed.name.to_string(), version.to_string()))?;
+    let new_version = match parsed.source {
+        Some(source) => version_renames.by_name_source_version.get(&(
+            parsed.name.to_string(),
+            source.to_string(),
+            version.to_string(),
+        ))?,
+        None => version_renames
+            .by_name_version
+            .get(&(parsed.name.to_string(), version.to_string()))?,
+    };
     Some(format_lockfile_dependency_ref(
         parsed.name,
         new_version,
@@ -4579,16 +4633,35 @@ mod tests {
         );
     }
 
+    fn lockfile_pin_for_test(
+        source_id: &str,
+        name: &str,
+        current_version: &str,
+        target_version: &str,
+    ) -> LockfilePin {
+        LockfilePin {
+            root_names: BTreeSet::new(),
+            name: name.to_string(),
+            source_id: source_id.to_string(),
+            current_version: current_version.to_string(),
+            target_version: target_version.to_string(),
+        }
+    }
+
     #[test]
     fn rewrite_lockfile_dependency_ref_updates_disambiguated_versions() {
-        let renames = HashMap::from([
-            (
-                ("getrandom".to_string(), "0.4.3".to_string()),
-                "0.4.2".to_string(),
+        let renames = build_lockfile_dependency_renames(&[
+            lockfile_pin_for_test(
+                "registry+https://github.com/rust-lang/crates.io-index",
+                "getrandom",
+                "0.4.3",
+                "0.4.2",
             ),
-            (
-                ("bar".to_string(), "0.4.3".to_string()),
-                "0.4.2".to_string(),
+            lockfile_pin_for_test(
+                "registry+https://github.com/rust-lang/crates.io-index",
+                "bar",
+                "0.4.3",
+                "0.4.2",
             ),
         ]);
 
@@ -4609,6 +4682,28 @@ mod tests {
             None
         );
         assert_eq!(rewrite_lockfile_dependency_ref("fastrand", &renames), None);
+    }
+
+    #[test]
+    fn rewrite_lockfile_dependency_ref_matches_source_qualified_pins() {
+        const REGISTRY_A: &str = "registry+https://example.com/a-index";
+        const REGISTRY_B: &str = "registry+https://example.com/b-index";
+        let renames = build_lockfile_dependency_renames(&[
+            lockfile_pin_for_test(REGISTRY_A, "foo", "1.0.0", "0.9.0"),
+            lockfile_pin_for_test(REGISTRY_B, "foo", "1.0.0", "0.8.0"),
+        ]);
+
+        assert_eq!(
+            rewrite_lockfile_dependency_ref(&format!("foo 1.0.0 ({REGISTRY_A})"), &renames)
+                .as_deref(),
+            Some("foo 0.9.0 (registry+https://example.com/a-index)")
+        );
+        assert_eq!(
+            rewrite_lockfile_dependency_ref(&format!("foo 1.0.0 ({REGISTRY_B})"), &renames)
+                .as_deref(),
+            Some("foo 0.8.0 (registry+https://example.com/b-index)")
+        );
+        assert_eq!(rewrite_lockfile_dependency_ref("foo 1.0.0", &renames), None);
     }
 
     #[test]
@@ -4636,9 +4731,11 @@ dependencies = [
             .get_mut("package")
             .and_then(toml::Value::as_array_mut)
             .unwrap();
-        let renames = HashMap::from([(
-            ("getrandom".to_string(), "0.4.3".to_string()),
-            "0.4.2".to_string(),
+        let renames = build_lockfile_dependency_renames(&[lockfile_pin_for_test(
+            "registry+https://github.com/rust-lang/crates.io-index",
+            "getrandom",
+            "0.4.3",
+            "0.4.2",
         )]);
 
         rewrite_lockfile_dependency_versions(packages, &renames);
