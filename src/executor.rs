@@ -3185,6 +3185,20 @@ fn write_lockfile_pin_assignment(
         table.insert("checksum".to_string(), toml::Value::String(checksum));
     }
 
+    let version_renames = pins
+        .iter()
+        .filter(|pin| pin.current_version != pin.target_version)
+        .map(|pin| {
+            (
+                (pin.name.clone(), pin.current_version.clone()),
+                pin.target_version.clone(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    if !version_renames.is_empty() {
+        rewrite_lockfile_dependency_versions(packages, &version_renames);
+    }
+
     let mut seen = HashSet::new();
     packages.retain(|package| {
         let Some(table) = package.as_table() else {
@@ -3204,6 +3218,58 @@ fn write_lockfile_pin_assignment(
 
     fs::write(lockfile_path, toml::to_string(&document)?)
         .with_context(|| format!("failed to write lockfile {}", lockfile_path.display()))
+}
+
+/// Keep `dependencies` entries aligned with pinned package version rewrites.
+///
+/// Batch pins change `[[package]].version` directly. Without updating dependent
+/// package entries that still reference the old disambiguated version, a later
+/// unlocked `cargo metadata` pass can rewire those edges to a different locked
+/// version of the same crate name.
+fn rewrite_lockfile_dependency_versions(
+    packages: &mut [toml::Value],
+    version_renames: &HashMap<(String, String), String>,
+) {
+    for package in packages {
+        let Some(table) = package.as_table_mut() else {
+            continue;
+        };
+        let Some(dependencies) = table
+            .get_mut("dependencies")
+            .and_then(toml::Value::as_array_mut)
+        else {
+            continue;
+        };
+
+        for dependency in dependencies {
+            let Some(dependency_name) = dependency.as_str() else {
+                continue;
+            };
+            let Some(updated) =
+                rewrite_lockfile_dependency_ref(dependency_name, version_renames)
+            else {
+                continue;
+            };
+            *dependency = toml::Value::String(updated);
+        }
+    }
+}
+
+fn rewrite_lockfile_dependency_ref(
+    dependency: &str,
+    version_renames: &HashMap<(String, String), String>,
+) -> Option<String> {
+    let (name, version) = parse_versioned_lockfile_dependency(dependency)?;
+    let new_version = version_renames.get(&(name.to_string(), version.to_string()))?;
+    Some(format!("{name} {new_version}"))
+}
+
+fn parse_versioned_lockfile_dependency(dependency: &str) -> Option<(&str, &str)> {
+    let (name, version) = dependency.rsplit_once(' ')?;
+    if version.is_empty() || !version.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+    Some((name, version))
 }
 
 fn lockfile_pin_assignment_made_progress(
@@ -4432,6 +4498,88 @@ mod tests {
         assert_eq!(assignment["webshim"].version, "1.0.0");
         assert_eq!(assignment["futureshim"].version, "1.0.0");
         assert_eq!(assignment["sharedshim"].version, "1.0.0");
+    }
+
+    #[test]
+    fn parse_versioned_lockfile_dependency_splits_name_and_version() {
+        assert_eq!(
+            parse_versioned_lockfile_dependency("getrandom 0.4.3"),
+            Some(("getrandom", "0.4.3"))
+        );
+        assert_eq!(
+            parse_versioned_lockfile_dependency("windows-sys 0.61.2"),
+            Some(("windows-sys", "0.61.2"))
+        );
+        assert_eq!(parse_versioned_lockfile_dependency("getrandom"), None);
+    }
+
+    #[test]
+    fn rewrite_lockfile_dependency_ref_updates_disambiguated_versions() {
+        let renames = HashMap::from([(
+            ("getrandom".to_string(), "0.4.3".to_string()),
+            "0.4.2".to_string(),
+        )]);
+
+        assert_eq!(
+            rewrite_lockfile_dependency_ref("getrandom 0.4.3", &renames).as_deref(),
+            Some("getrandom 0.4.2")
+        );
+        assert_eq!(
+            rewrite_lockfile_dependency_ref("getrandom 0.3.4", &renames),
+            None
+        );
+        assert_eq!(rewrite_lockfile_dependency_ref("fastrand", &renames), None);
+    }
+
+    #[test]
+    fn rewrite_lockfile_dependency_versions_updates_package_dependency_arrays() {
+        let mut document = toml::from_str::<toml::Value>(
+            r#"
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+]
+
+[[package]]
+name = "uuid"
+version = "1.23.3"
+dependencies = [
+ "getrandom 0.4.3",
+]
+"#,
+        )
+        .unwrap();
+        let packages = document
+            .get_mut("package")
+            .and_then(toml::Value::as_array_mut)
+            .unwrap();
+        let renames = HashMap::from([(
+            ("getrandom".to_string(), "0.4.3".to_string()),
+            "0.4.2".to_string(),
+        )]);
+
+        rewrite_lockfile_dependency_versions(packages, &renames);
+
+        let tempfile = &packages[0];
+        let tempfile_deps = tempfile["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|dep| dep.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(tempfile_deps, vec!["fastrand", "getrandom 0.4.2"]);
+
+        let uuid = &packages[1];
+        let uuid_deps = uuid["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|dep| dep.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(uuid_deps, vec!["getrandom 0.4.2"]);
     }
 
     #[test]

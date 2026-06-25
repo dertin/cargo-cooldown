@@ -1,6 +1,6 @@
 [package]
 name = "cargo-cooldown"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 rust-version = "1.91.1"
 description = "Cargo wrapper that enforces a cooldown window for freshly published registry crates for improved supply chain security."
