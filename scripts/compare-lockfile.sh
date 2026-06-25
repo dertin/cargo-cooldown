@@ -131,6 +131,11 @@ command -v rustup >/dev/null || die "rustup is required"
 command -v python3 >/dev/null || die "python3 is required"
 command -v diff >/dev/null || die "diff is required"
 
+if ! rustup toolchain list | awk '{print $1}' | grep -Eq "^${toolchain}(-|$)"; then
+  log "Installing Rust toolchain ${toolchain}"
+  rustup toolchain install "$toolchain"
+fi
+
 toolchain_cargo_dir=$(dirname "$(rustup which --toolchain "$toolchain" cargo)")
 [[ -x "$toolchain_cargo_dir/cargo" ]] || die "cargo not found for toolchain ${toolchain}"
 
@@ -141,11 +146,6 @@ if ! command -v cargo-cooldown >/dev/null; then
   else
     die "cargo-cooldown not found in PATH. Re-run with --install-cargo-cooldown or install it manually."
   fi
-fi
-
-if ! rustup toolchain list | awk '{print $1}' | grep -Eq "^${toolchain}(-|$)"; then
-  log "Installing Rust toolchain ${toolchain}"
-  rustup toolchain install "$toolchain"
 fi
 
 if [[ -z "$out_dir" ]]; then
