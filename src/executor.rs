@@ -3023,10 +3023,10 @@ fn apply_lockfile_pin_assignment(
 /// Write a proposed pin assignment and ask Cargo to validate the result.
 ///
 /// The current lockfile is captured first. After rewriting package versions and
-/// checksums, Cargo is run with `--locked`; if Cargo needs to refresh derived
-/// lockfile data, one unlocked metadata pass is allowed and then rechecked with
-/// `--locked`. Any rejection restores the captured lockfile and reports why the
-/// batch failed.
+/// checksums, Cargo is asked once without `--locked` so it can refresh derived
+/// lockfile data and rewrite the file in its native format. A final
+/// `--locked` metadata pass validates the normalized lockfile. Any rejection
+/// restores the captured lockfile and reports why the batch failed.
 fn apply_lockfile_pin_assignment_detailed(
     manifest: &Manifest,
     workspace: &Workspace,
@@ -3042,56 +3042,42 @@ fn apply_lockfile_pin_assignment_detailed(
         write_lockfile_pin_assignment(lockfile_path, registry_store, pins)
     })?;
 
+    if let Err(unlocked_err) = timed_debug!("normalize batch lockfile via cargo metadata", {
+        read_metadata(manifest, features)
+    }) {
+        let error = unlocked_err.to_string();
+        if !parse_batch_conflict_packages(&error).is_empty() {
+            debug!(
+                target: "cargo_cooldown::timing",
+                error = %error,
+                "cooldown batch solver rejected by cargo metadata during lockfile normalization"
+            );
+            lockfile_snapshot.restore(lockfile_path)?;
+            return Ok(BatchPinOutcome::Rejected { error });
+        }
+
+        debug!(
+            target: "cargo_cooldown::timing",
+            error = %error,
+            "cooldown batch solver rejected during lockfile normalization"
+        );
+        lockfile_snapshot.restore(lockfile_path)?;
+        return Ok(BatchPinOutcome::Rejected { error });
+    }
+
     let locked_metadata = match timed_debug!("batch validation cargo metadata --locked", {
         read_metadata_locked(manifest, features)
     }) {
         Ok(metadata) => metadata,
         Err(err) => {
             let error = err.to_string();
-            if !parse_batch_conflict_packages(&error).is_empty() {
-                debug!(
-                    target: "cargo_cooldown::timing",
-                    error = %error,
-                    "cooldown batch solver rejected by cargo metadata --locked"
-                );
-                lockfile_snapshot.restore(lockfile_path)?;
-                return Ok(BatchPinOutcome::Rejected { error });
-            }
-
             debug!(
                 target: "cargo_cooldown::timing",
                 error = %error,
-                "cooldown batch solver lockfile assignment requires Cargo to refresh the lockfile"
+                "cooldown batch solver rejected by cargo metadata --locked after normalization"
             );
-
-            if let Err(unlocked_err) = timed_debug!("batch validation cargo metadata", {
-                read_metadata(manifest, features)
-            }) {
-                let error = unlocked_err.to_string();
-                debug!(
-                    target: "cargo_cooldown::timing",
-                    error = %error,
-                    "cooldown batch solver rejected by cargo metadata"
-                );
-                lockfile_snapshot.restore(lockfile_path)?;
-                return Ok(BatchPinOutcome::Rejected { error });
-            }
-
-            match timed_debug!("batch validation cargo metadata --locked after update", {
-                read_metadata_locked(manifest, features)
-            }) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    let error = err.to_string();
-                    debug!(
-                        target: "cargo_cooldown::timing",
-                        error = %error,
-                        "cooldown batch solver rejected by cargo metadata --locked after update"
-                    );
-                    lockfile_snapshot.restore(lockfile_path)?;
-                    return Ok(BatchPinOutcome::Rejected { error });
-                }
-            }
+            lockfile_snapshot.restore(lockfile_path)?;
+            return Ok(BatchPinOutcome::Rejected { error });
         }
     };
 
@@ -3185,6 +3171,11 @@ fn write_lockfile_pin_assignment(
         table.insert("checksum".to_string(), toml::Value::String(checksum));
     }
 
+    let version_renames = build_lockfile_dependency_renames(pins);
+    if !version_renames.by_name_source_version.is_empty() {
+        rewrite_lockfile_dependency_versions(packages, &version_renames);
+    }
+
     let mut seen = HashSet::new();
     packages.retain(|package| {
         let Some(table) = package.as_table() else {
@@ -3204,6 +3195,176 @@ fn write_lockfile_pin_assignment(
 
     fs::write(lockfile_path, toml::to_string(&document)?)
         .with_context(|| format!("failed to write lockfile {}", lockfile_path.display()))
+}
+
+/// Keep `dependencies` entries aligned with pinned package version rewrites.
+///
+/// Batch pins change `[[package]].version` directly. Without updating dependent
+/// package entries that still reference the old disambiguated version, a later
+/// unlocked `cargo metadata` pass can rewire those edges to a different locked
+/// version of the same crate name.
+/// Version rewrites keyed for lockfile `dependencies` entries.
+///
+/// Source-qualified refs match on `(name, source, version)`. Unqualified refs
+/// match on `(name, version)` only when that pair maps to a single pin.
+#[derive(Default)]
+struct LockfileDependencyRenames {
+    by_name_source_version: HashMap<(String, String, String), String>,
+    by_name_version: HashMap<(String, String), String>,
+}
+
+fn build_lockfile_dependency_renames(pins: &[LockfilePin]) -> LockfileDependencyRenames {
+    let changed_pins: Vec<_> = pins
+        .iter()
+        .filter(|pin| pin.current_version != pin.target_version)
+        .collect();
+
+    let by_name_source_version = changed_pins
+        .iter()
+        .map(|pin| {
+            (
+                (
+                    pin.name.clone(),
+                    pin.source_id.clone(),
+                    pin.current_version.clone(),
+                ),
+                pin.target_version.clone(),
+            )
+        })
+        .collect();
+
+    let mut name_version_counts = HashMap::<(String, String), usize>::new();
+    for pin in &changed_pins {
+        *name_version_counts
+            .entry((pin.name.clone(), pin.current_version.clone()))
+            .or_default() += 1;
+    }
+
+    let by_name_version = changed_pins
+        .iter()
+        .filter(|pin| name_version_counts[&(pin.name.clone(), pin.current_version.clone())] == 1)
+        .map(|pin| {
+            (
+                (pin.name.clone(), pin.current_version.clone()),
+                pin.target_version.clone(),
+            )
+        })
+        .collect();
+
+    LockfileDependencyRenames {
+        by_name_source_version,
+        by_name_version,
+    }
+}
+
+fn rewrite_lockfile_dependency_versions(
+    packages: &mut [toml::Value],
+    version_renames: &LockfileDependencyRenames,
+) {
+    for package in packages {
+        let Some(table) = package.as_table_mut() else {
+            continue;
+        };
+        let Some(dependencies) = table
+            .get_mut("dependencies")
+            .and_then(toml::Value::as_array_mut)
+        else {
+            continue;
+        };
+
+        for dependency in dependencies {
+            let Some(dependency_name) = dependency.as_str() else {
+                continue;
+            };
+            let Some(updated) = rewrite_lockfile_dependency_ref(dependency_name, version_renames)
+            else {
+                continue;
+            };
+            *dependency = toml::Value::String(updated);
+        }
+    }
+}
+
+fn rewrite_lockfile_dependency_ref(
+    dependency: &str,
+    version_renames: &LockfileDependencyRenames,
+) -> Option<String> {
+    let parsed = parse_versioned_lockfile_dependency(dependency)?;
+    let version = parsed.version?;
+    let new_version = match parsed.source {
+        Some(source) => version_renames.by_name_source_version.get(&(
+            parsed.name.to_string(),
+            source.to_string(),
+            version.to_string(),
+        ))?,
+        None => version_renames
+            .by_name_version
+            .get(&(parsed.name.to_string(), version.to_string()))?,
+    };
+    Some(format_lockfile_dependency_ref(
+        parsed.name,
+        new_version,
+        parsed.source,
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedLockfileDependencyRef<'a> {
+    name: &'a str,
+    version: Option<&'a str>,
+    source: Option<&'a str>,
+}
+
+/// Parse a lockfile `dependencies` entry in Cargo's compact package-id format.
+///
+/// Cargo may emit `name`, `name version`, or `name version (source)` when multiple
+/// packages share the same name or version.
+fn parse_versioned_lockfile_dependency(
+    dependency: &str,
+) -> Option<ParsedLockfileDependencyRef<'_>> {
+    let mut parts = dependency.splitn(3, ' ');
+    let name = parts.next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let version = parts.next().map(str::trim).filter(|part| !part.is_empty());
+    let source = parts.next().and_then(|part| {
+        part.trim()
+            .strip_prefix('(')
+            .and_then(|part| part.strip_suffix(')'))
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+    });
+
+    if source.is_some() && version.is_none() {
+        return None;
+    }
+
+    let Some(version) = version else {
+        return Some(ParsedLockfileDependencyRef {
+            name,
+            version: None,
+            source: None,
+        });
+    };
+
+    if version.is_empty() || !version.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+
+    Some(ParsedLockfileDependencyRef {
+        name,
+        version: Some(version),
+        source,
+    })
+}
+
+fn format_lockfile_dependency_ref(name: &str, version: &str, source: Option<&str>) -> String {
+    match source {
+        Some(source) => format!("{name} {version} ({source})"),
+        None => format!("{name} {version}"),
+    }
 }
 
 fn lockfile_pin_assignment_made_progress(
@@ -4432,6 +4593,170 @@ mod tests {
         assert_eq!(assignment["webshim"].version, "1.0.0");
         assert_eq!(assignment["futureshim"].version, "1.0.0");
         assert_eq!(assignment["sharedshim"].version, "1.0.0");
+    }
+
+    #[test]
+    fn parse_versioned_lockfile_dependency_splits_name_and_version() {
+        assert_eq!(
+            parse_versioned_lockfile_dependency("getrandom 0.4.3"),
+            Some(ParsedLockfileDependencyRef {
+                name: "getrandom",
+                version: Some("0.4.3"),
+                source: None,
+            })
+        );
+        assert_eq!(
+            parse_versioned_lockfile_dependency("windows-sys 0.61.2"),
+            Some(ParsedLockfileDependencyRef {
+                name: "windows-sys",
+                version: Some("0.61.2"),
+                source: None,
+            })
+        );
+        assert_eq!(
+            parse_versioned_lockfile_dependency(
+                "bar 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)"
+            ),
+            Some(ParsedLockfileDependencyRef {
+                name: "bar",
+                version: Some("0.1.0"),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index"),
+            })
+        );
+        assert_eq!(
+            parse_versioned_lockfile_dependency("getrandom"),
+            Some(ParsedLockfileDependencyRef {
+                name: "getrandom",
+                version: None,
+                source: None,
+            })
+        );
+    }
+
+    fn lockfile_pin_for_test(
+        source_id: &str,
+        name: &str,
+        current_version: &str,
+        target_version: &str,
+    ) -> LockfilePin {
+        LockfilePin {
+            root_names: BTreeSet::new(),
+            name: name.to_string(),
+            source_id: source_id.to_string(),
+            current_version: current_version.to_string(),
+            target_version: target_version.to_string(),
+        }
+    }
+
+    #[test]
+    fn rewrite_lockfile_dependency_ref_updates_disambiguated_versions() {
+        let renames = build_lockfile_dependency_renames(&[
+            lockfile_pin_for_test(
+                "registry+https://github.com/rust-lang/crates.io-index",
+                "getrandom",
+                "0.4.3",
+                "0.4.2",
+            ),
+            lockfile_pin_for_test(
+                "registry+https://github.com/rust-lang/crates.io-index",
+                "bar",
+                "0.4.3",
+                "0.4.2",
+            ),
+        ]);
+
+        assert_eq!(
+            rewrite_lockfile_dependency_ref("getrandom 0.4.3", &renames).as_deref(),
+            Some("getrandom 0.4.2")
+        );
+        assert_eq!(
+            rewrite_lockfile_dependency_ref(
+                "bar 0.4.3 (registry+https://github.com/rust-lang/crates.io-index)",
+                &renames
+            )
+            .as_deref(),
+            Some("bar 0.4.2 (registry+https://github.com/rust-lang/crates.io-index)")
+        );
+        assert_eq!(
+            rewrite_lockfile_dependency_ref("getrandom 0.3.4", &renames),
+            None
+        );
+        assert_eq!(rewrite_lockfile_dependency_ref("fastrand", &renames), None);
+    }
+
+    #[test]
+    fn rewrite_lockfile_dependency_ref_matches_source_qualified_pins() {
+        const REGISTRY_A: &str = "registry+https://example.com/a-index";
+        const REGISTRY_B: &str = "registry+https://example.com/b-index";
+        let renames = build_lockfile_dependency_renames(&[
+            lockfile_pin_for_test(REGISTRY_A, "foo", "1.0.0", "0.9.0"),
+            lockfile_pin_for_test(REGISTRY_B, "foo", "1.0.0", "0.8.0"),
+        ]);
+
+        assert_eq!(
+            rewrite_lockfile_dependency_ref(&format!("foo 1.0.0 ({REGISTRY_A})"), &renames)
+                .as_deref(),
+            Some("foo 0.9.0 (registry+https://example.com/a-index)")
+        );
+        assert_eq!(
+            rewrite_lockfile_dependency_ref(&format!("foo 1.0.0 ({REGISTRY_B})"), &renames)
+                .as_deref(),
+            Some("foo 0.8.0 (registry+https://example.com/b-index)")
+        );
+        assert_eq!(rewrite_lockfile_dependency_ref("foo 1.0.0", &renames), None);
+    }
+
+    #[test]
+    fn rewrite_lockfile_dependency_versions_updates_package_dependency_arrays() {
+        let mut document = toml::from_str::<toml::Value>(
+            r#"
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+dependencies = [
+ "fastrand",
+ "getrandom 0.4.3",
+]
+
+[[package]]
+name = "uuid"
+version = "1.23.3"
+dependencies = [
+ "getrandom 0.4.3",
+]
+"#,
+        )
+        .unwrap();
+        let packages = document
+            .get_mut("package")
+            .and_then(toml::Value::as_array_mut)
+            .unwrap();
+        let renames = build_lockfile_dependency_renames(&[lockfile_pin_for_test(
+            "registry+https://github.com/rust-lang/crates.io-index",
+            "getrandom",
+            "0.4.3",
+            "0.4.2",
+        )]);
+
+        rewrite_lockfile_dependency_versions(packages, &renames);
+
+        let tempfile = &packages[0];
+        let tempfile_deps = tempfile["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|dep| dep.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(tempfile_deps, vec!["fastrand", "getrandom 0.4.2"]);
+
+        let uuid = &packages[1];
+        let uuid_deps = uuid["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|dep| dep.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(uuid_deps, vec!["getrandom 0.4.2"]);
     }
 
     #[test]

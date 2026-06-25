@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.3 - 2026-06-25
+
+### Added
+
+- `scripts/compare-lockfile.sh` compares `Cargo.lock` from `cargo cooldown update`
+  with nightly `-Zmin-publish-age` on the same project, using the same Cargo
+  toolchain version for both sides so resolver differences do not add noise.
+
+### Fixed
+
+- Batch lockfile pins now rewrite disambiguated `dependencies` entries when a
+  crate version is downgraded, so Cargo's subsequent lockfile refresh keeps the
+  intended resolved edges instead of rebinding packages to an older compatible
+  version of the same crate name. Source-qualified dependency refs such as
+  `name version (registry+...)` are rewritten as well, keyed by registry source
+  so multi-registry lockfiles do not cross-apply pins.
+- Batch lockfile rewrites now always pass through one unlocked `cargo metadata`
+  call before final `--locked` validation, so `Cargo.lock` stays in Cargo's native
+  on-disk format instead of the compact TOML serialization used during pin writes.
+
 ## 0.3.2 - 2026-06-22
 
 ### Fixed

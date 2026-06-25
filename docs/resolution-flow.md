@@ -247,9 +247,9 @@ resolved `PackageId` graph before falling back to semver matching. That lets
 components include multiple locked versions of the same crate, such as
 `getrandom 0.2` and `getrandom 0.3`, without conflating their constraints. It
 then rewrites those package entries in `Cargo.lock` and asks Cargo to validate
-the result. The fast validation starts with a locked metadata pass; if Cargo
-only needs to refresh lockfile dependency entries, cooldown allows one normal
-metadata pass and then checks the result with locked metadata again. If Cargo
+the result. Cooldown always runs one unlocked metadata pass after the rewrite so
+Cargo can refresh derived lockfile data and rewrite the file in its native
+format, then checks the normalized result with locked metadata. If Cargo
 rejects the batch, cooldown restores the previous lockfile and prunes the
 reported blockers. The retry budget grows logarithmically with batch size and
 stops early for broad batches where each rejection removes too little of the
