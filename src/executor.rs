@@ -3231,8 +3231,7 @@ fn rewrite_lockfile_dependency_versions(
             let Some(dependency_name) = dependency.as_str() else {
                 continue;
             };
-            let Some(updated) =
-                rewrite_lockfile_dependency_ref(dependency_name, version_renames)
+            let Some(updated) = rewrite_lockfile_dependency_ref(dependency_name, version_renames)
             else {
                 continue;
             };
