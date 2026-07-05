@@ -374,6 +374,30 @@ fn is_cargo_help_request(cargo_args: &[OsString]) -> bool {
         .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
 }
 
+fn is_dry_run_request(cargo_args: &[OsString]) -> bool {
+    cargo_args
+        .iter()
+        .take_while(|arg| arg.to_str() != Some("--"))
+        .any(|arg| matches!(arg.to_str(), Some("--dry-run")))
+}
+
+fn without_dry_run_flag(cargo_args: &[OsString]) -> Vec<OsString> {
+    let double_dash = cargo_args.iter().position(|arg| arg.to_str() == Some("--"));
+
+    let (before, after) = match double_dash {
+        Some(index) => (&cargo_args[..index], &cargo_args[index..]),
+        None => (cargo_args, &[] as &[OsString]),
+    };
+
+    let mut stripped = before
+        .iter()
+        .filter(|arg| arg.to_str() != Some("--dry-run"))
+        .cloned()
+        .collect::<Vec<_>>();
+    stripped.extend(after.iter().cloned());
+    stripped
+}
+
 /// Canonicalize the Cargo invocation so the subcommand leads and the selectors
 /// parsed by clap-cargo (`--manifest-path`, `--package`, feature flags, etc.)
 /// are re-applied in the order that upstream `cargo` expects.
@@ -521,9 +545,20 @@ fn run_update_with_cooldown_isolation(
     forwarded_args: &[OsString],
     phase: &PhaseStatus,
 ) -> Result<IsolatedUpdateOutcome> {
+    let dry_run = is_dry_run_request(forwarded_args);
     phase.set_message("Preparing isolated workspace...");
     let isolated = IsolatedWorkspace::create(project, &cli.manifest)?;
-    let temp_forwarded_args = isolated.rewrite_cargo_args(forwarded_args);
+    let cargo_update_args = if dry_run {
+        without_dry_run_flag(forwarded_args)
+    } else {
+        forwarded_args.to_vec()
+    };
+    let temp_forwarded_args = isolated.rewrite_cargo_args(&cargo_update_args);
+    let success_message = if dry_run {
+        "dry run complete; Cargo.lock unchanged"
+    } else {
+        "dependency graph updated and cooled down"
+    };
 
     {
         let _cwd = CurrentDirGuard::enter(isolated.current_dir())?;
@@ -544,7 +579,7 @@ fn run_update_with_cooldown_isolation(
                 &cli.workspace,
                 &cli.features,
                 initial_lockfile,
-                "dependency graph updated and cooled down",
+                success_message,
             ) {
                 Ok(()) => {}
                 Err(err) => match config.incompatible_publish_age {
@@ -569,8 +604,12 @@ fn run_update_with_cooldown_isolation(
         }
     }
 
-    isolated.publish_lockfile()?;
-    Ok(IsolatedUpdateOutcome::Done)
+    if dry_run {
+        Ok(IsolatedUpdateOutcome::Done)
+    } else {
+        isolated.publish_lockfile()?;
+        Ok(IsolatedUpdateOutcome::Done)
+    }
 }
 
 /// Program entry point.
@@ -675,8 +714,8 @@ fn should_run_cooldown_guard(config: &config::Config) -> bool {
 mod tests {
     use super::{
         CooldownCommand, assemble_cargo_args, init_looks_like_forwarded_cargo_init,
-        init_uses_runtime_selectors, is_cargo_help_request, is_update_command, parse_cli,
-        split_features,
+        init_uses_runtime_selectors, is_cargo_help_request, is_dry_run_request, is_update_command,
+        parse_cli, split_features, without_dry_run_flag,
     };
     use clap::CommandFactory;
     use std::ffi::OsString;
@@ -812,6 +851,27 @@ mod tests {
     fn cargo_help_detection_ignores_args_after_double_dash() {
         let args = to_os_vec(&["test", "--", "--help"]);
         assert!(!is_cargo_help_request(&args));
+    }
+
+    #[test]
+    fn dry_run_detection_matches_update_flag() {
+        let args = to_os_vec(&["update", "--dry-run"]);
+        assert!(is_dry_run_request(&args));
+    }
+
+    #[test]
+    fn dry_run_detection_ignores_args_after_double_dash() {
+        let args = to_os_vec(&["update", "--", "--dry-run"]);
+        assert!(!is_dry_run_request(&args));
+    }
+
+    #[test]
+    fn without_dry_run_flag_strips_flag_before_double_dash() {
+        let args = to_os_vec(&["update", "--dry-run", "-p", "foo", "--", "--dry-run"]);
+        assert_eq!(
+            to_string_vec(&without_dry_run_flag(&args)),
+            vec!["update", "-p", "foo", "--", "--dry-run"]
+        );
     }
 
     #[test]
