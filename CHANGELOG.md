@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.4 - 2026-07-05
+
+### Added
+
+- `cargo cooldown update --dry-run` now previews the cooled dependency graph
+  without writing `Cargo.lock`. It runs `cargo update` and cooldown in an
+  isolated workspace, prints the same `Keeping`/`Updating`/`Adding`/`Removing`
+  summary as a real update, and finishes with `dry run complete; Cargo.lock
+  unchanged`.
+
 ## 0.3.3 - 2026-06-25
 
 ### Added

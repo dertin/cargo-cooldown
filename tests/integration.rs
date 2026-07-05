@@ -621,6 +621,46 @@ min-publish-age = "0"
 }
 
 #[test]
+fn cooldown_update_dry_run_shows_cooled_versions_without_modifying_lockfile() {
+    let mut harness =
+        TestHarness::new_with_dependency_req(RegistryMode::PubtimeOnly, &format!("={OLD_VERSION}"))
+            .expect("harness should build");
+    harness.generate_lockfile();
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+    harness.set_dependency_requirement("1");
+
+    let output = harness.run_command(&["update", "--dry-run"], &[]);
+
+    assert!(
+        output.status.success(),
+        "cargo cooldown update --dry-run should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        harness.locked_version(),
+        OLD_VERSION,
+        "dry-run should not change the lockfile"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let expected_cooldown_line = format!(
+        "     Keeping cooldowndep 1.0.0 (latest: v1.0.1) @ sparse+{}/index/",
+        harness.server.base_url()
+    );
+    assert!(
+        combined.contains(&expected_cooldown_line),
+        "dry-run should show what cooldown would keep: {combined}"
+    );
+    assert!(
+        combined.contains("    Finished dry run complete; Cargo.lock unchanged"),
+        "dry-run should report that the lockfile was left untouched: {combined}"
+    );
+}
+
+#[test]
 fn cooldown_update_keeps_existing_baseline_versions_with_floor_baseline() {
     let harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
     let mut harness = harness;
