@@ -103,6 +103,11 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release --target ${{ matrix.target }}
 
+      - name: Test release target
+        run: cargo test --locked --bins --tests --target ${{ matrix.target }}
+        env:
+          CARGO_TERM_COLOR: never
+
       - name: Package Unix archive
         if: runner.os != 'Windows'
         shell: bash

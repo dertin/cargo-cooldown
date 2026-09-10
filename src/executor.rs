@@ -1033,12 +1033,7 @@ fn selected_package_ids(
     metadata: &cargo_metadata::Metadata,
     workspace: &Workspace,
 ) -> HashSet<PackageId> {
-    workspace
-        .partition_packages(metadata)
-        .0
-        .into_iter()
-        .map(|package| package.id.clone())
-        .collect()
+    crate::resolution_state::selected_package_ids(metadata, workspace)
 }
 
 fn reachable_package_ids(

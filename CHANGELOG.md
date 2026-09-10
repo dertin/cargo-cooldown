@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.3.5 - 2026-09-10
+
+### Fixed
+
+- Targeted `cargo cooldown update -p` now checks the shared workspace graph in
+  both scanning and solver validation, including transitive targets.
+- Keep the real `Cargo.lock` readable during resolution. Acquire coordination
+  before copying the workspace, reject detected external changes, and publish
+  through an atomic replacement on Unix and Windows.
+- Resolve relative and absolute local dependencies from temporary manifests
+  without creating external symlinks. External checkouts retain their own
+  transitive paths and workspace inheritance.
+- Add regression coverage for targeted updates, concurrent readers and writers,
+  interruption recovery, and external paths, with Linux/macOS/Windows CI.
+- Update the test dependency `crossbeam-epoch` to 0.9.20 for RUSTSEC-2026-0204.
+
 ## 0.3.4 - 2026-07-05
 
 ### Added
