@@ -3497,7 +3497,7 @@ fn wrapper_binary_name() -> &'static str {
 
 #[cfg(windows)]
 fn wrapper_binary_name() -> &'static str {
-    "cargo.bat"
+    "cargo.exe"
 }
 
 #[cfg(unix)]
@@ -3529,13 +3529,43 @@ fn write_platform_cargo_wrapper(
     wrapper_path: &Path,
     log_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Command::new("cargo") resolves an .exe on Windows, not a PATH .bat shim.
+    // Compile one native shim per test process, then copy it into each fixture.
+    static SHIM: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let shim_dir = SHIM.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("shim directory should be creatable");
+        let source = dir.path().join("shim.rs");
+        fs::write(
+            &source,
+            format!(
+                r#"use std::io::Write;
+fn main() {{
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let sidecar = std::env::current_exe().unwrap().with_extension("log-path");
+    let log_path = std::fs::read_to_string(sidecar).unwrap();
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(log_path).unwrap();
+    writeln!(log, "{{}}", args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>().join(" ")).unwrap();
+    let status = std::process::Command::new({real_cargo:?}).args(args).status().unwrap();
+    std::process::exit(status.code().unwrap_or(1));
+}}
+"#,
+                real_cargo = real_cargo_binary(),
+            ),
+        )
+        .expect("shim source should be writable");
+        let output = Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(dir.path().join("cargo.exe"))
+            .output()
+            .expect("rustc should compile the test shim");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        dir
+    });
+    fs::copy(shim_dir.path().join("cargo.exe"), wrapper_path)?;
     fs::write(
-        wrapper_path,
-        format!(
-            "@echo off\r\necho %*>>\"{log_path}\"\r\n\"{real_cargo}\" %*\r\n",
-            log_path = log_path.display(),
-            real_cargo = real_cargo_binary(),
-        ),
+        wrapper_path.with_extension("log-path"),
+        log_path.to_str().ok_or("non-UTF-8 fixture path")?,
     )?;
     Ok(())
 }
