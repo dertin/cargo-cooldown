@@ -1030,14 +1030,15 @@ global-min-publish-age = "5 minutes"
             )
             .unwrap();
         let original_cargo_home = env::var_os("CARGO_HOME");
-        let original_home = env::var("HOME").ok();
-        let original_user = env::var("USERPROFILE").ok();
-
-        unsafe { env::remove_var("CARGO_HOME") };
-        unsafe { env::set_var("HOME", fake_home.path()) };
-        unsafe { env::set_var("USERPROFILE", fake_home.path()) };
-
-        let config = Config::load(&project_fixture(root.path(), None)).unwrap();
+        // Windows discovers the home through Known Folders, not USERPROFILE.
+        // Exercise the portable explicit Cargo configuration location.
+        unsafe { env::set_var("CARGO_HOME", fake_home.path().join(".cargo")) };
+        let config = Config::load(&project_fixture(root.path(), None));
+        match original_cargo_home {
+            Some(val) => unsafe { env::set_var("CARGO_HOME", val) },
+            None => unsafe { env::remove_var("CARGO_HOME") },
+        }
+        let config = config.unwrap();
 
         assert_eq!(config.min_publish_age_seconds, 5 * 60);
         assert_eq!(
@@ -1046,19 +1047,6 @@ global-min-publish-age = "5 minutes"
         );
         assert_eq!(config.fallback_accept, FallbackAccept::Prompt);
         assert_eq!(config.http_retries, 3);
-
-        match original_cargo_home {
-            Some(val) => unsafe { env::set_var("CARGO_HOME", val) },
-            None => unsafe { env::remove_var("CARGO_HOME") },
-        }
-        match original_home {
-            Some(val) => unsafe { env::set_var("HOME", val) },
-            None => unsafe { env::remove_var("HOME") },
-        }
-        match original_user {
-            Some(val) => unsafe { env::set_var("USERPROFILE", val) },
-            None => unsafe { env::remove_var("USERPROFILE") },
-        }
     }
 
     #[test]

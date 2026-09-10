@@ -72,6 +72,114 @@ const SCOPED_MEMBER_B: &str = "member-b";
 const BENCHMARK_CRATE_COUNT: usize = 24;
 
 #[test]
+fn targeted_update_cools_direct_dependency_with_manifest_path() {
+    let mut harness =
+        TestHarness::new_with_dependency_req(RegistryMode::PubtimeOnly, &format!("={OLD_VERSION}"))
+            .unwrap();
+    harness.generate_lockfile();
+    harness.set_dependency_requirement("1");
+    let manifest = harness.workspace_dir.join("Cargo.toml");
+    let output = harness.run_command_in(
+        &harness.runner_dir(),
+        &[
+            "update",
+            "-p",
+            CRATE_NAME,
+            "--manifest-path",
+            manifest.to_str().unwrap(),
+        ],
+        &[("COOLDOWN_VERBOSE", "true")],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("registry_packages=1"));
+}
+
+#[test]
+fn targeted_update_cools_h2_transitive_across_workspace_members() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let cargo_home = temp.path().join("cargo-home");
+    let server = RegistryServer::with_crates(
+        vec![
+            PublishedCrate::new(
+                "h2",
+                vec![
+                    PackageVersion::new("0.4.16", Some(OLD_PUBTIME), false),
+                    PackageVersion::new("0.4.19", Some(FRESH_PUBTIME), false),
+                ],
+            ),
+            PublishedCrate::new(
+                "parent",
+                vec![
+                    PackageVersion::new("1.0.0", Some(OLD_PUBTIME), false)
+                        .with_dependencies(vec![RegistryDependency::new("h2", "^0.4")]),
+                ],
+            ),
+        ],
+        false,
+    )
+    .unwrap();
+    fs::create_dir_all(&cargo_home).unwrap();
+    write_registry_config(&cargo_home, &server).unwrap();
+    for member in ["one", "two"] {
+        create_workspace_with_dependencies(&root.join(member), &server, &[("parent", "1")])
+            .unwrap();
+    }
+    // The fixture helper names packages identically; make workspace identities unique.
+    for member in ["one", "two"] {
+        let path = root.join(member).join("Cargo.toml");
+        let mut value: toml::Value = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        value["package"]["name"] = toml::Value::String(member.into());
+        fs::write(path, toml::to_string(&value).unwrap()).unwrap();
+    }
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers=['one','two']\nresolver='2'\n",
+    )
+    .unwrap();
+    let manifest = root.join("one/Cargo.toml");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+    let output = command
+        .args(["update", "-p", "h2", "--manifest-path"])
+        .arg(&manifest)
+        .current_dir(temp.path())
+        .env("CARGO_HOME", &cargo_home)
+        .env("COOLDOWN_NOW", NOW)
+        .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", "7 days")
+        .env("COOLDOWN_VERBOSE", "true")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lockfile = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    assert_eq!(
+        parse_lockfile_version(&lockfile, "h2").as_deref(),
+        Some("0.4.16")
+    );
+    assert!(!lockfile.contains("0.4.19"));
+    let metadata = Command::new("cargo")
+        .args(["metadata", "--locked", "--format-version", "1"])
+        .arg("--manifest-path")
+        .arg(manifest)
+        .env("CARGO_HOME", cargo_home)
+        .output()
+        .unwrap();
+    assert!(
+        metadata.status.success(),
+        "{}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+}
+
+#[test]
 fn existing_lockfile_fresh_dependency_is_ignored_by_default() {
     let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).expect("harness should build");
     harness.generate_lockfile();
@@ -779,12 +887,14 @@ fn cooldown_update_holds_real_lockfile_and_uses_temp_workspace() {
     assert!(
         fs::read_dir(&harness.workspace_dir)
             .expect("workspace should be readable")
-            .all(|entry| !entry
-                .expect("entry should be readable")
-                .file_name()
-                .to_string_lossy()
-                .starts_with("Cargo.lock.cooldown-backup.")),
-        "lockfile backup should be cleaned after publishing"
+            .all(|entry| {
+                !entry
+                    .expect("entry should be readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .eq("Cargo.lock.cooldown-hold")
+            }),
+        "lockfile coordination marker should be cleaned after publishing"
     );
 }
 
@@ -3331,8 +3441,8 @@ fn write_hold_asserting_cargo_wrapper(
             r#"#!/bin/sh
 printf 'cargo %s cwd=%s\n' "$*" "$(pwd)" >> "{log_path}"
 if [ "$1" = "update" ]; then
-  lockfile="$COOLDOWN_EXPECT_HELD_WORKSPACE/Cargo.lock"
-  if grep -q '^cargo-cooldown lockfile hold' "$lockfile"; then
+  marker="$COOLDOWN_EXPECT_HELD_WORKSPACE/Cargo.lock.cooldown-hold"
+  if test -f "$marker"; then
     printf 'update-held-lockfile\n' >> "{log_path}"
   else
     printf 'update-missing-held-lockfile\n' >> "{log_path}"
@@ -3387,7 +3497,7 @@ fn wrapper_binary_name() -> &'static str {
 
 #[cfg(windows)]
 fn wrapper_binary_name() -> &'static str {
-    "cargo.bat"
+    "cargo.exe"
 }
 
 #[cfg(unix)]
@@ -3419,13 +3529,43 @@ fn write_platform_cargo_wrapper(
     wrapper_path: &Path,
     log_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Command::new("cargo") resolves an .exe on Windows, not a PATH .bat shim.
+    // Compile one native shim per test process, then copy it into each fixture.
+    static SHIM: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let shim_dir = SHIM.get_or_init(|| {
+        let dir = tempfile::tempdir().expect("shim directory should be creatable");
+        let source = dir.path().join("shim.rs");
+        fs::write(
+            &source,
+            format!(
+                r#"use std::io::Write;
+fn main() {{
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let sidecar = std::env::current_exe().unwrap().with_extension("log-path");
+    let log_path = std::fs::read_to_string(sidecar).unwrap();
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(log_path).unwrap();
+    writeln!(log, "{{}}", args.iter().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>().join(" ")).unwrap();
+    let status = std::process::Command::new({real_cargo:?}).args(args).status().unwrap();
+    std::process::exit(status.code().unwrap_or(1));
+}}
+"#,
+                real_cargo = real_cargo_binary(),
+            ),
+        )
+        .expect("shim source should be writable");
+        let output = Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(dir.path().join("cargo.exe"))
+            .output()
+            .expect("rustc should compile the test shim");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        dir
+    });
+    fs::copy(shim_dir.path().join("cargo.exe"), wrapper_path)?;
     fs::write(
-        wrapper_path,
-        format!(
-            "@echo off\r\necho %*>>\"{log_path}\"\r\n\"{real_cargo}\" %*\r\n",
-            log_path = log_path.display(),
-            real_cargo = real_cargo_binary(),
-        ),
+        wrapper_path.with_extension("log-path"),
+        log_path.to_str().ok_or("non-UTF-8 fixture path")?,
     )?;
     Ok(())
 }

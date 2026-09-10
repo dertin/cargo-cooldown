@@ -104,3 +104,21 @@ They do not apply to:
 - multiple `--package` values
 - `--exclude`
 - other ambiguous workspace selections
+
+## rust-analyzer Reports an Invalid Cargo.lock
+
+Cooldown keeps the user-visible `Cargo.lock` intact while it works. Coordination
+uses the sibling `Cargo.lock.cooldown-hold` marker, so rust-analyzer can continue
+parsing the lockfile. If that marker remains after a crash, confirm no
+cooldown process is running, remove only the marker, and retry. A lockfile
+whose external changes are detected during cooldown is rejected. Plain Cargo
+does not honor the marker; avoid running simultaneous lockfile writers.
+
+## Relative `path` Dependencies
+
+Cooldown rewrites dependency paths only in the temporary manifests. Internal
+paths use the workspace copy; external paths use the original checkout's
+absolute location, preserving its nested dependencies and workspace settings.
+This requires no symlink privileges on Windows. External checkouts must remain
+available during resolution. Missing paths produce a diagnostic naming the
+declaring manifest and original path.

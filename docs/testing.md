@@ -14,6 +14,19 @@ The authoritative automated suite lives in `./tests`.
 - snapshot reachability for the metadata-derived resolver state
 - batch solver coverage for independent, duplicate, optional, target-specific,
   and newly introduced transitive dependencies
+- isolation coverage that keeps `Cargo.lock` parseable for concurrent readers,
+  serializes cooldown processes with `Cargo.lock.cooldown-hold`, and maps
+  relative external `path` dependencies without symlinks
+
+Issue regressions include targeted direct updates and a deterministic transitive
+`h2` fixture (0.4.16 versus 0.4.19, seven-day cooldown), member manifests,
+concurrent commands with a separate lockfile reader, stale baseline rejection,
+process termination and manual recovery, and local dependencies from roots and
+members with absolute, relative, and transitive paths. The h2 fixture uses
+synthetic publication timestamps rather than time-sensitive crates.io data.
+
+CI runs the suite on Linux, macOS, and Windows. A local Linux run alone does not
+certify the other platforms.
 
 ## How the deterministic suite works
 
@@ -26,6 +39,11 @@ Cargo commands against it:
 
 This keeps the suite offline and deterministic while still exercising the
 binary end-to-end.
+
+The integration harness needs permission to bind loopback TCP sockets for its
+local registry. In restricted runners where socket creation or the configured
+Cargo target directory is denied, unit tests remain valid but the integration
+result is an environment limitation rather than product evidence.
 
 The suite does not rely on committed fixture snapshots under `examples/fixtures`.
 It synthesizes the registry, tarballs, cacheable index responses, and workspace
