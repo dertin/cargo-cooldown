@@ -218,10 +218,21 @@ impl LockfileHoldGuard {
             .lockfile_path
             .parent()
             .context("lockfile has no parent")?;
-        let mut pending = Builder::new()
-            .prefix("Cargo.lock.cooldown-final.")
-            .tempfile_in(parent)?;
+        let mut builder = Builder::new();
+        builder.prefix("Cargo.lock.cooldown-final.");
+        // For new lockfiles use normal file creation permissions, respecting umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o666));
+        }
+        let mut pending = builder.tempfile_in(parent)?;
         pending.write_all(&final_contents)?;
+        if self.original_contents.is_some() {
+            pending
+                .as_file()
+                .set_permissions(fs::metadata(&self.lockfile_path)?.permissions())?;
+        }
         pending.as_file().sync_all()?;
         // Stage first, then check immediately before the atomic replacement.
         self.ensure_original_unchanged()?;
@@ -486,10 +497,12 @@ fn map_path_dependencies(project: &ProjectContext, temp_root: &Path) -> Result<(
             .iter()
             .map(|member| member.manifest_path.clone()),
     );
-    manifests.sort();
-    manifests.dedup();
-    for manifest in manifests {
+    let mut seen = std::collections::HashSet::new();
+    while let Some(manifest) = manifests.pop() {
         let manifest = canonicalize_existing(&manifest)?;
+        if !seen.insert(manifest.clone()) {
+            continue;
+        }
         let relative = manifest
             .strip_prefix(&source_root)
             .with_context(|| format!("manifest {} is outside workspace", manifest.display()))?;
@@ -503,7 +516,7 @@ fn map_path_dependencies(project: &ProjectContext, temp_root: &Path) -> Result<(
         let contents = fs::read_to_string(&destination)?;
         let mut value: toml::Value = toml::from_str(&contents)?;
         let parent = manifest.parent().context("manifest has no parent")?;
-        rewrite_dependency_tables(&mut value, parent, &source_root, temp_root)
+        rewrite_dependency_tables(&mut value, parent, &source_root, temp_root, &mut manifests)
             .with_context(|| format!("cannot map dependencies in {}", manifest.display()))?;
         fs::write(destination, toml::to_string(&value)?)?;
     }
@@ -515,21 +528,40 @@ fn rewrite_dependency_tables(
     manifest_dir: &Path,
     source_root: &Path,
     temp_root: &Path,
+    manifests: &mut Vec<PathBuf>,
 ) -> Result<()> {
     for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
         if let Some(table) = value.get_mut(key).and_then(toml::Value::as_table_mut) {
             for (_, dependency) in table.iter_mut() {
-                rewrite_dependency_path(dependency, manifest_dir, source_root, temp_root)?;
+                rewrite_dependency_path(
+                    dependency,
+                    manifest_dir,
+                    source_root,
+                    temp_root,
+                    manifests,
+                )?;
             }
         }
     }
     for key in ["workspace", "target"] {
         if let Some(section) = value.get_mut(key) {
             if key == "workspace" {
-                rewrite_dependency_tables(section, manifest_dir, source_root, temp_root)?;
+                rewrite_dependency_tables(
+                    section,
+                    manifest_dir,
+                    source_root,
+                    temp_root,
+                    manifests,
+                )?;
             } else if let Some(targets) = section.as_table_mut() {
                 for (_, target) in targets.iter_mut() {
-                    rewrite_dependency_tables(target, manifest_dir, source_root, temp_root)?;
+                    rewrite_dependency_tables(
+                        target,
+                        manifest_dir,
+                        source_root,
+                        temp_root,
+                        manifests,
+                    )?;
                 }
             }
         }
@@ -540,13 +572,19 @@ fn rewrite_dependency_tables(
             .filter_map(|(_, value)| value.as_table_mut())
         {
             for (_, dependency) in registry.iter_mut() {
-                rewrite_dependency_path(dependency, manifest_dir, source_root, temp_root)?;
+                rewrite_dependency_path(
+                    dependency,
+                    manifest_dir,
+                    source_root,
+                    temp_root,
+                    manifests,
+                )?;
             }
         }
     }
     if let Some(replacements) = value.get_mut("replace").and_then(toml::Value::as_table_mut) {
         for (_, dependency) in replacements.iter_mut() {
-            rewrite_dependency_path(dependency, manifest_dir, source_root, temp_root)?;
+            rewrite_dependency_path(dependency, manifest_dir, source_root, temp_root, manifests)?;
         }
     }
     Ok(())
@@ -557,6 +595,7 @@ fn rewrite_dependency_path(
     manifest_dir: &Path,
     source_root: &Path,
     temp_root: &Path,
+    manifests: &mut Vec<PathBuf>,
 ) -> Result<()> {
     let Some(path) = dependency.get_mut("path") else {
         return Ok(());
@@ -567,7 +606,10 @@ fn rewrite_dependency_path(
         bail!("path dependency {} has no Cargo.toml", original.display());
     }
     let mapped = match original.strip_prefix(source_root) {
-        Ok(relative) => temp_root.join(relative),
+        Ok(relative) => {
+            manifests.push(original.join("Cargo.toml"));
+            temp_root.join(relative)
+        }
         Err(_) => original,
     };
     *path = toml::Value::String(
@@ -730,6 +772,26 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn publication_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o644, 0o664, 0o444] {
+            let temp = tempfile::tempdir().unwrap();
+            let lock = temp.path().join("Cargo.lock");
+            let replacement = temp.path().join("replacement");
+            fs::write(&lock, "version = 4\n").unwrap();
+            fs::write(&replacement, "version = 4\n# updated\n").unwrap();
+            fs::set_permissions(&lock, fs::Permissions::from_mode(mode)).unwrap();
+            let mut guard = LockfileHoldGuard::hold(&lock).unwrap();
+            guard.commit_from(&replacement).unwrap();
+            assert_eq!(
+                fs::metadata(lock).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+    }
+
     #[test]
     fn lock_holder_child_process() {
         let Some(root) = env::var_os("COOLDOWN_TEST_LOCK_ROOT") else {
@@ -890,7 +952,8 @@ mod tests {
         )
         .unwrap();
         let mut value: toml::Value = toml::from_str("[dependencies]\nexternal={path='../../external'}\n[[bin]]\nname='app'\npath='not-a-dependency.rs'").unwrap();
-        rewrite_dependency_tables(&mut value, &original, &original, &isolated).unwrap();
+        rewrite_dependency_tables(&mut value, &original, &original, &isolated, &mut Vec::new())
+            .unwrap();
         assert_eq!(
             value["dependencies"]["external"]["path"].as_str().unwrap(),
             fs::canonicalize(&external).unwrap().to_str().unwrap()

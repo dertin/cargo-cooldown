@@ -78,7 +78,10 @@ fn wrapped_check_help_is_forwarded_without_project_discovery() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("Usage: cargo check"),
+        String::from_utf8_lossy(&output.stdout).contains(&format!(
+            "Usage: cargo{} check",
+            std::env::consts::EXE_SUFFIX
+        )),
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
@@ -94,7 +97,10 @@ fn wrapped_update_help_is_forwarded_without_running_update_flow() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&output.stdout).contains("Usage: cargo update"),
+        String::from_utf8_lossy(&output.stdout).contains(&format!(
+            "Usage: cargo{} update",
+            std::env::consts::EXE_SUFFIX
+        )),
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );

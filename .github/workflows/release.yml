@@ -104,7 +104,7 @@ jobs:
         run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Test release target
-        run: cargo test --locked --bins --tests --target ${{ matrix.target }}
+        run: cargo test --release --locked --bins --tests --target ${{ matrix.target }}
         env:
           CARGO_TERM_COLOR: never
 

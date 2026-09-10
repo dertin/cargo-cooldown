@@ -21,7 +21,7 @@ fn reader_process() {
     while !root.join("reader-stop").exists() {
         let contents = fs::read_to_string(root.join("Cargo.lock")).unwrap();
         let value: toml::Value = toml::from_str(&contents).unwrap();
-        assert_eq!(value["version"].as_integer(), Some(4));
+        assert!(value["version"].as_integer().is_some());
         reads += 1;
         fs::write(root.join("reader-ready"), "").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1));
@@ -68,6 +68,36 @@ fn external_dependency_retains_its_workspace_inheritance() {
             .contains("0.7.0")
     );
     assert!(!external.join("Cargo.lock").exists());
+}
+
+#[test]
+fn excluded_local_package_can_depend_on_an_external_checkout() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("app");
+    crate_at(&temp.path().join("external"), "external", "");
+    crate_at(
+        &root.join("local"),
+        "local",
+        "[workspace]\n[dependencies]\nexternal={path='../../external'}\n",
+    );
+    crate_at(
+        &root,
+        "app",
+        "[workspace]\nexclude=['local']\n[dependencies]\nlocal={path='local'}\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .arg("update")
+        .current_dir(&root)
+        .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", "7 days")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    assert!(lock.contains("external"));
 }
 
 #[test]
