@@ -74,7 +74,8 @@ fn external_dependency_retains_its_workspace_inheritance() {
 fn excluded_local_package_can_depend_on_an_external_checkout() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("app");
-    crate_at(&temp.path().join("external"), "external", "");
+    let external = temp.path().join("external");
+    crate_at(&external, "external", "");
     crate_at(
         &root.join("local"),
         "local",
@@ -85,6 +86,12 @@ fn excluded_local_package_can_depend_on_an_external_checkout() {
         "app",
         "[workspace]\nexclude=['local']\n[dependencies]\nlocal={path='local'}\n",
     );
+    let manifests = [
+        root.join("Cargo.toml"),
+        root.join("local/Cargo.toml"),
+        external.join("Cargo.toml"),
+    ];
+    let originals = manifests.each_ref().map(|path| fs::read(path).unwrap());
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
         .arg("update")
         .current_dir(&root)
@@ -96,8 +103,57 @@ fn excluded_local_package_can_depend_on_an_external_checkout() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap();
-    assert!(lock.contains("external"));
+    let lock: toml::Value =
+        toml::from_str(&fs::read_to_string(root.join("Cargo.lock")).unwrap()).unwrap();
+    assert!(lock["package"].as_array().unwrap().iter().any(|package| {
+        package["name"].as_str() == Some("external")
+            && package["version"].as_str() == Some("0.1.0")
+            && package.get("source").is_none()
+    }));
+    for (manifest, original) in manifests.iter().zip(originals) {
+        assert_eq!(
+            fs::read(manifest).unwrap(),
+            original,
+            "{} changed",
+            manifest.display()
+        );
+        assert!(
+            !fs::symlink_metadata(manifest)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+    assert!(!external.join("Cargo.lock").exists());
+    assert!(!root.join("local/Cargo.lock").exists());
+    assert!(!external.join("Cargo.lock.cooldown-hold").exists());
+    assert!(
+        !fs::symlink_metadata(&external)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let metadata = Command::new("cargo")
+        .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(
+        metadata.status.success(),
+        "{}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    let resolved = metadata["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "external")
+        .unwrap();
+    assert_eq!(
+        fs::canonicalize(resolved["manifest_path"].as_str().unwrap()).unwrap(),
+        fs::canonicalize(external.join("Cargo.toml")).unwrap()
+    );
 }
 
 #[test]
