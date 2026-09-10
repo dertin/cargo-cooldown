@@ -23,7 +23,10 @@ fn reader_process() {
         let value: toml::Value = toml::from_str(&contents).unwrap();
         assert!(value["version"].as_integer().is_some());
         reads += 1;
-        fs::write(root.join("reader-ready"), "").unwrap();
+        if reads == 1 {
+            // Signal once, without repeatedly truncating a file the parent polls.
+            fs::create_dir(root.join("reader-ready")).unwrap();
+        }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
     assert!(reads > 0);
