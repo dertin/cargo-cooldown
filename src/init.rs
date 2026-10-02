@@ -269,9 +269,10 @@ fn render_config_file(template: &ConfigTemplate, is_override: bool) -> String {
         output.push_str("# Optional allow rules.\n");
         output.push_str("# Add as many `allow.exact` and `allow.package` entries as you need.\n");
         output.push_str("# `allow.exact` fully allows one exact crate version.\n");
-        output.push_str("# `allow.package` lowers the cooldown for one crate name.\n");
+        output
+            .push_str("# `allow.package` lowers the cooldown for one crate or a list of crates.\n");
         output.push_str(
-            "# Use `min-publish-age = \"0\"` in `allow.package` to exclude that crate from cooldown.\n",
+            "# Use `min-publish-age = \"0\"` in `allow.package` to exclude the listed crates from cooldown.\n",
         );
         output.push('\n');
         output.push_str("# [allow.global]\n");
@@ -280,7 +281,7 @@ fn render_config_file(template: &ConfigTemplate, is_override: bool) -> String {
         output.push_str("# crate = \"tokio\"\n");
         output.push_str("# min-publish-age = \"1 hour\"\n\n");
         output.push_str("# [[allow.package]]\n");
-        output.push_str("# crate = \"openssl\"\n");
+        output.push_str("# crates = [\"internal-a\", \"internal-b\"]\n");
         output.push_str("# min-publish-age = \"0\"\n\n");
         output.push_str("# [[allow.exact]]\n");
         output.push_str("# crate = \"serde\"\n");

@@ -11,6 +11,8 @@ The authoritative automated suite lives in `./tests`.
 - fail-closed behavior for registries without release-time metadata
 - `incompatible-publish-age = "fallback"` behavior for the same condition
 - `skip_registries` by name and by URL
+- grouped package allow rules: zero and positive cooldowns, per-crate merging,
+  invalid selectors, and continued enforcement for unlisted crates
 - snapshot reachability for the metadata-derived resolver state
 - batch solver coverage for independent, duplicate, optional, target-specific,
   and newly introduced transitive dependencies

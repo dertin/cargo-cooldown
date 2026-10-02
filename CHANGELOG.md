@@ -2,6 +2,13 @@
 
 ## 0.3.5 - 2026-09-10
 
+### Added
+
+- `[[allow.package]]` accepts `crates = ["internal-a", "internal-b"]` to share
+  one cooldown window, including `min-publish-age = "0"`, across several crates.
+  Existing `crate = "name"` rules and per-crate configuration precedence remain
+  supported.
+
 ### Fixed
 
 - Targeted `cargo cooldown update -p` now checks the shared workspace graph in

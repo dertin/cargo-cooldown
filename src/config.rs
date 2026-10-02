@@ -1241,6 +1241,100 @@ min-publish-age = "1 day"
     }
 
     #[test]
+    fn loads_grouped_allow_packages_with_both_duration_forms() {
+        let _guard = env_lock().lock().unwrap();
+        for duration in ["min-publish-age = \"1 hour\"", "minutes = 60"] {
+            let root = TempDir::new().unwrap();
+            root.child("cooldown.toml")
+                .write_str(&format!(
+                    "[[allow.package]]\ncrates = [\"internal-a\", \"internal-b\"]\n{duration}\n"
+                ))
+                .unwrap();
+
+            let config = Config::load(&project_fixture(root.path(), None)).unwrap();
+            let per_crate = config.allow_rules.per_crate_min_publish_age_seconds();
+            assert_eq!(per_crate.len(), 2);
+            assert_eq!(per_crate.get("internal-a"), Some(&SECONDS_PER_HOUR));
+            assert_eq!(per_crate.get("internal-b"), Some(&SECONDS_PER_HOUR));
+            assert!(!per_crate.contains_key("other"));
+        }
+    }
+
+    #[test]
+    fn grouped_allow_packages_merge_by_individual_crate() {
+        let _guard = env_lock().lock().unwrap();
+        let root = TempDir::new().unwrap();
+        let member = root.child("member-a");
+        member.create_dir_all().unwrap();
+        root.child("cooldown.toml")
+            .write_str(
+                r#"[[allow.package]]
+crate = "internal-a"
+min-publish-age = "1 day"
+
+[[allow.package]]
+crates = ["internal-a", "internal-b", "internal-c"]
+min-publish-age = "0"
+
+[[allow.package]]
+crate = "internal-c"
+min-publish-age = "1 hour"
+"#,
+            )
+            .unwrap();
+        member
+            .child("cooldown.toml")
+            .write_str(
+                r#"[[allow.package]]
+crates = ["internal-a", "internal-d"]
+min-publish-age = "2 hours"
+
+[[allow.package]]
+crate = "internal-c"
+min-publish-age = "3 hours"
+"#,
+            )
+            .unwrap();
+
+        let config = Config::load(&project_fixture(root.path(), Some(member.path()))).unwrap();
+        let per_crate = config.allow_rules.per_crate_min_publish_age_seconds();
+        assert_eq!(per_crate.len(), 4);
+        assert_eq!(per_crate.get("internal-a"), Some(&(2 * SECONDS_PER_HOUR)));
+        assert_eq!(per_crate.get("internal-b"), Some(&0));
+        assert_eq!(per_crate.get("internal-c"), Some(&(3 * SECONDS_PER_HOUR)));
+        assert_eq!(per_crate.get("internal-d"), Some(&(2 * SECONDS_PER_HOUR)));
+    }
+
+    #[test]
+    fn rejects_invalid_grouped_allow_packages() {
+        let _guard = env_lock().lock().unwrap();
+        for (selector, expected_error) in [
+            (
+                "crate = \"one\"\ncrates = [\"two\"]",
+                "exactly one of `crate` or `crates`",
+            ),
+            ("", "exactly one of `crate` or `crates`"),
+            ("crates = []", "must not be empty"),
+            ("crates = [\"one\", \" \"]", "crate names must not be blank"),
+            ("crates = [\"one\", 42]", "string"),
+            ("crates = \"one\"", "sequence"),
+            ("crates = [\"one\"]\nseconds = 60", "unknown field"),
+            ("crates = [\"one\"]\nminutes = 1", "defines incompatible"),
+        ] {
+            let root = TempDir::new().unwrap();
+            root.child("cooldown.toml")
+                .write_str(&format!(
+                    "[[allow.package]]\n{selector}\nmin-publish-age = \"0\"\n"
+                ))
+                .unwrap();
+            let err = Config::load(&project_fixture(root.path(), None)).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(message.contains(expected_error), "{selector}: {message}");
+            assert!(message.contains("cooldown.toml"), "{message}");
+        }
+    }
+
+    #[test]
     fn rejects_conflicting_allow_package_duration_forms() {
         let _guard = env_lock().lock().unwrap();
         let root = TempDir::new().unwrap();

@@ -729,6 +729,44 @@ min-publish-age = "0"
 }
 
 #[test]
+fn grouped_allow_packages_exempt_only_listed_crates() {
+    for duration in ["0", "6 hours"] {
+        let mut harness = MultiPassBenchmarkHarness::new(3).expect("harness should build");
+        harness.generate_lockfile();
+        let first = benchmark_crate_name(0);
+        let second = benchmark_crate_name(1);
+        let unlisted = benchmark_crate_name(2);
+        fs::write(
+            harness.workspace_dir.join("cooldown.toml"),
+            format!(
+                "[[allow.package]]\ncrates = [\"{first}\", \"{second}\"]\nmin-publish-age = \"{duration}\"\n"
+            ),
+        )
+        .unwrap();
+
+        let output = harness.run_cooldown(&[]);
+        assert!(
+            output.status.success(),
+            "grouped allow rule ({duration}): {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lockfile = harness.lockfile_contents();
+        assert_eq!(
+            parse_lockfile_version(&lockfile, &first).as_deref(),
+            Some(FRESH_VERSION)
+        );
+        assert_eq!(
+            parse_lockfile_version(&lockfile, &second).as_deref(),
+            Some(FRESH_VERSION)
+        );
+        assert_eq!(
+            parse_lockfile_version(&lockfile, &unlisted).as_deref(),
+            Some(OLD_VERSION)
+        );
+    }
+}
+
+#[test]
 fn cooldown_update_dry_run_shows_cooled_versions_without_modifying_lockfile() {
     let mut harness =
         TestHarness::new_with_dependency_req(RegistryMode::PubtimeOnly, &format!("={OLD_VERSION}"))
