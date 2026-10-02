@@ -22,6 +22,8 @@
 - Add regression coverage for targeted updates, concurrent readers and writers,
   interruption recovery, and external paths, with Linux/macOS/Windows CI.
 - Update the test dependency `crossbeam-epoch` to 0.9.20 for RUSTSEC-2026-0204.
+- Update `rustls` to 0.23.45 and its required TLS dependencies for
+  RUSTSEC-2026-0285.
 
 ## 0.3.4 - 2026-07-05
 
