@@ -292,16 +292,22 @@ crate = "tokio"
 min-publish-age = "1 hour"
 
 [[allow.package]]
-crate = "openssl"
+crates = ["internal-a", "internal-b", "internal-c"]
 min-publish-age = "0"
 ```
 
 Rules:
 
 - `[[allow.exact]]`: allow one exact `(crate, version)` pair
-- `[[allow.package]]`: use a shorter cooldown for one crate name
-- `min-publish-age = "0"`: exclude that crate from cooldown
+- `[[allow.package]]`: use a shorter cooldown for one crate name or a list of names
+- `min-publish-age = "0"`: exclude the listed crates from cooldown
 - `[allow.global]`: define a shorter default cooldown for all registry crates
+
+Each `[[allow.package]]` entry accepts either `crate = "name"` or
+`crates = ["name-a", "name-b"]`, with the same `min-publish-age` (or legacy
+`minutes`) applied to every listed name. Use exactly one of these keys; lists
+must be nonempty and names must not be blank. Names match exactly, without
+wildcards.
 
 `allow.global` and `allow.package` only reduce the effective cooldown. They do
 not increase it above the configured min publish age.
@@ -309,7 +315,9 @@ not increase it above the configured min publish age.
 Workspace merge behavior:
 
 - `allow.global`: member value replaces workspace value
-- `allow.package`: member entries override workspace entries with the same crate
+- `allow.package`: entries merge by individual crate name, including names in
+  groups. Later entries in one file win for overlapping names; member entries
+  override workspace entries only for matching names
 - `allow.exact`: member and workspace entries are unioned and deduplicated
 
 ## `skip_registries`

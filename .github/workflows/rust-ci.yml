@@ -31,16 +31,30 @@ jobs:
         run: cargo fmt --check
 
       - name: Check compilation
-        run: cargo check
+        run: cargo check --locked
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
       - name: Audit dependencies
         run: cargo audit
+
+  regression-tests:
+    name: Regression tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked --all-features
+        env:
+          CARGO_TERM_COLOR: never
 
   cooldown-self-check:
     name: Cargo cooldown self-check

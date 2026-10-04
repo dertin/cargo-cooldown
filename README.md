@@ -149,15 +149,21 @@ crate = "tokio"
 min-publish-age = "1 hour"
 
 [[allow.package]]
-crate = "openssl"
+crates = ["internal-a", "internal-b", "internal-c"]
 min-publish-age = "0"
 ```
 
 Use:
 
 - `[[allow.exact]]` to allow one exact crate version
-- `[[allow.package]]` to use a shorter cooldown for one crate
-- `min-publish-age = "0"` to exclude one crate from cooldown
+- `[[allow.package]]` to use a shorter cooldown for one crate or a list of crates
+- `min-publish-age = "0"` to exclude the listed crates from cooldown
+
+Each `[[allow.package]]` entry accepts either `crate = "name"` or
+`crates = ["name-a", "name-b"]`, with the same `min-publish-age` (or legacy
+`minutes`) applied to every listed name. Use exactly one of these keys; lists
+must be nonempty and names must not be blank. Names match exactly, without
+wildcards.
 
 Allow rules only reduce the effective cooldown window. They do not make a crate
 wait longer than the configured min publish age.

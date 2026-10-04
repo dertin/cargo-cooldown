@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, de};
 
 /// Root allow-rule object embedded in `cooldown.toml`.
 #[derive(Debug, Default, Clone, Deserialize, PartialEq, Eq)]
@@ -18,7 +18,7 @@ pub struct AllowRules {
 pub struct AllowSection {
     #[serde(default)]
     pub exact: Vec<AllowExact>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_package_rules")]
     pub package: Vec<AllowPackage>,
     pub global: Option<AllowGlobal>,
 }
@@ -33,17 +33,62 @@ pub struct AllowExact {
 }
 
 /// Overrides the cooldown window for one crate name.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AllowPackage {
-    #[serde(rename = "crate")]
     pub crate_name: String,
-    #[serde(default)]
     pub minutes: Option<u64>,
-    #[serde(rename = "min-publish-age")]
     pub min_publish_age: Option<String>,
-    #[serde(skip)]
     pub(crate) min_publish_age_seconds: Option<u64>,
+}
+
+/// File entries expand before duration validation and per-crate merging.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AllowPackageEntry {
+    #[serde(rename = "crate")]
+    crate_name: Option<String>,
+    crates: Option<Vec<String>>,
+    minutes: Option<u64>,
+    #[serde(rename = "min-publish-age")]
+    min_publish_age: Option<String>,
+}
+
+fn deserialize_package_rules<'de, D>(deserializer: D) -> Result<Vec<AllowPackage>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let entries = Vec::<AllowPackageEntry>::deserialize(deserializer)?;
+    let mut packages = Vec::new();
+    for entry in entries {
+        let names: Vec<String> = match (entry.crate_name, entry.crates) {
+            (Some(name), None) => vec![name],
+            (None, Some(names)) => names,
+            _ => {
+                return Err(de::Error::custom(
+                    "[[allow.package]] requires exactly one of `crate` or `crates`",
+                ));
+            }
+        };
+        if names.is_empty() {
+            return Err(de::Error::custom(
+                "[[allow.package]] `crates` must not be empty",
+            ));
+        }
+        for name in names {
+            if name.trim().is_empty() {
+                return Err(de::Error::custom(
+                    "[[allow.package]] crate names must not be blank",
+                ));
+            }
+            packages.push(AllowPackage {
+                crate_name: name,
+                minutes: entry.minutes,
+                min_publish_age: entry.min_publish_age.clone(),
+                min_publish_age_seconds: None,
+            });
+        }
+    }
+    Ok(packages)
 }
 
 /// Provides a lower default cooldown window for all registry crates.

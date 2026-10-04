@@ -576,7 +576,7 @@ fn run_update_with_cooldown_isolation(
             match executor::run_pinning_flow_with_snapshot(
                 config,
                 isolated.manifest(),
-                &cli.workspace,
+                &update_scan_workspace(),
                 &cli.features,
                 initial_lockfile,
                 success_message,
@@ -707,6 +707,15 @@ fn main() -> Result<()> {
 fn should_run_cooldown_guard(config: &config::Config) -> bool {
     config.incompatible_publish_age != IncompatiblePublishAgePolicy::Allow
         && config.has_positive_min_publish_age()
+}
+
+/// Update package specs select lockfile entries, not workspace roots. Cargo
+/// updates a shared workspace lockfile even with a member manifest, so every
+/// member must participate in both the scan and the solver's progress checks.
+fn update_scan_workspace() -> Workspace {
+    let mut workspace = Workspace::default();
+    workspace.workspace = true;
+    workspace
 }
 
 /// Unit tests for CLI parsing and forwarded Cargo argument assembly.

@@ -32,8 +32,8 @@ Cargo consumes them.
 
 For guard-style commands:
 
-1. copy the workspace to a temporary directory when cooldown is enabled
-2. hold the real root `Cargo.lock` with a backup plus sentinel
+1. acquire `Cargo.lock.cooldown-hold` and capture the original lockfile
+2. copy the workspace while keeping the real `Cargo.lock` readable
 3. snapshot the temp copy of the current `Cargo.lock`
 4. read Cargo metadata in the temp workspace
 5. inspect reachable registry packages
@@ -60,8 +60,8 @@ pass.
 
 For `cargo cooldown update`:
 
-1. copy the workspace to a temporary directory
-2. hold the real root `Cargo.lock` with a backup plus sentinel
+1. acquire `Cargo.lock.cooldown-hold` and capture the original lockfile
+2. copy the workspace while keeping the real `Cargo.lock` readable
 3. snapshot the temp copy of the current `Cargo.lock`
 4. run `cargo update` in the temp workspace
 5. cool the updated temp lockfile
@@ -69,6 +69,11 @@ For `cargo cooldown update`:
 7. restore the original lockfile if `incompatible-publish-age = "deny"` fails
 
 ## Important Ideas
+
+`update -p` selects Cargo lockfile entries, including transitive dependencies.
+Cooldown scans the shared workspace graph for updates while forwarding the
+original package specifications to Cargo. Other commands retain their normal
+workspace/member selection.
 
 - `[registry].global-min-publish-age` defines what "fresh" means.
 - `[cooldown].incompatible-publish-age` decides whether remaining fresh versions

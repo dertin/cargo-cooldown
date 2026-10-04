@@ -12,8 +12,8 @@ re-reading the same registry metadata inside one cooldown execution.
 flowchart TD
     Start([Start cargo-cooldown]) --> Config[Load cooldown.toml and embedded allow rules]
     Config --> Command{Requested command}
-    Command -->|update| IsolateUpdate[Copy workspace to temp dir and hold real Cargo.lock]
-    Command -->|other forwarded command with cooldown enabled| IsolateGuard[Copy workspace to temp dir and hold real Cargo.lock]
+    Command -->|update| IsolateUpdate[Copy workspace and coordinate with lock marker]
+    Command -->|other forwarded command with cooldown enabled| IsolateGuard[Copy workspace and coordinate with lock marker]
     Command -->|other forwarded command with cooldown disabled| DoneNoCooldown([Run Cargo without cooldown rewrites])
     IsolateUpdate --> Baseline[Snapshot temp Cargo.lock from initial real lockfile]
     IsolateGuard --> Baseline
@@ -66,10 +66,10 @@ flowchart TD
 At the beginning of one `cargo-cooldown` execution, the resolver:
 
 1. loads config and embedded allow rules;
-2. copies the Cargo workspace to a temporary directory when it needs to resolve
-   or cool a lockfile;
-3. renames the real root `Cargo.lock` to a temporary backup name and writes an
-   invalid sentinel `Cargo.lock` while the temporary workspace is active;
+2. acquires the auxiliary `Cargo.lock.cooldown-hold` marker and captures the
+   original lockfile before copying anything;
+3. copies the Cargo workspace to a temporary directory; the real `Cargo.lock`
+   remains readable throughout resolution;
 4. snapshots the temp `Cargo.lock` once as the initial baseline;
 5. if the requested command is `cargo cooldown update`, runs `cargo update`
    inside the temp workspace;
@@ -82,25 +82,32 @@ the whole workspace instead of asking Cargo to use another `Cargo.lock`.
 
 The workspace copy preserves workspace members and member manifests, so commands
 with multiple `Cargo.toml` files keep the same Cargo workspace shape. The copied
-workspace skips heavy generated directories such as `.git` and `target`; normal
-workspace-local path dependencies are copied with the rest of the tree.
+workspace skips heavy generated directories such as `.git` and `target`.
+Only dependency paths in the copied manifests are rewritten. Workspace-local
+dependencies point into the copy; external dependencies point to their original
+absolute locations. This also handles patch, replacement, workspace-inherited,
+and target-specific dependency declarations. External checkouts keep their own
+relative dependencies and workspace inheritance. Their files are not copied or
+rewritten, and no external mapping symlink is created on Unix or Windows.
 
-The real root lockfile is held while cooldown works:
+The real root lockfile remains in place while cooldown works. An atomic marker
+file named `Cargo.lock.cooldown-hold` serializes concurrent cooldown processes;
+the second process waits with a visible message and bounded backoff, then
+captures the newly published baseline before copying. Before
+publication, cooldown verifies that the original lockfile bytes are unchanged,
+stages and syncs the result in a sibling temporary file, rechecks the baseline,
+and replaces `Cargo.lock` atomically on Unix and Windows without first deleting
+the original. Detected external changes reject publication.
 
-- if a real `Cargo.lock` existed, it is renamed to
-  `Cargo.lock.cooldown-backup.<id>`;
-- an invalid sentinel is written at `Cargo.lock`, so an accidental plain
-  `cargo build` against the real workspace fails instead of resolving from a
-  half-finished lockfile;
-- on normal failure, rejection, or `incompatible-publish-age = "deny"`, the
-  backup is restored;
-- on success, the final temp `Cargo.lock` is published back to the real
-  workspace and the backup is removed.
+The marker coordinates cooldown instances only. Cargo and editors do not honor
+it, and comparison followed by replacement cannot prevent an uncooperative
+writer from changing the file in the final interval between those operations.
+Avoid concurrent lockfile writers. This is resolution isolation, not a security
+sandbox: external local dependencies remain readable, and subsequent forwarded
+Cargo commands can execute build scripts in the usual way.
 
-If the process is killed abruptly, Rust destructors may not run. In that case
-the real workspace can be left with the sentinel plus the
-`Cargo.lock.cooldown-backup.<id>` file; restore by moving the backup back to
-`Cargo.lock`.
+If the process is killed abruptly, the marker can remain. Confirm that no
+`cargo-cooldown` process is running before removing that marker and retrying.
 
 The baseline snapshot is taken before any Cargo command is allowed to rewrite
 the temp lockfile.
@@ -161,8 +168,8 @@ of silently leaving the real lockfile unchanged.
 
 That means `cargo cooldown update` has this exact shape:
 
-1. copy the workspace to a temp directory;
-2. hold the real root `Cargo.lock` with a backup plus sentinel;
+1. acquire `Cargo.lock.cooldown-hold` and capture the real root lockfile;
+2. copy the workspace to a temp directory;
 3. read and snapshot the temp copy of the current `Cargo.lock`;
 4. run `cargo update`, letting Cargo write the newest graph it accepts to the
    temp `Cargo.lock`;

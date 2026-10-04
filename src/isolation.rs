@@ -2,15 +2,16 @@
 //!
 //! Cargo's stable interface does not let us resolve against an alternate
 //! lockfile path, so cooldown copies the workspace to a temporary directory and
-//! runs Cargo there. The user-visible `Cargo.lock` is held with a sentinel while
-//! the temporary lockfile is being updated and cooled.
+//! runs Cargo there. A separate marker coordinates cooldown processes while the
+//! user-visible `Cargo.lock` remains valid for editors and other readers.
 
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap_cargo::Manifest;
@@ -19,7 +20,9 @@ use tracing::{debug, warn};
 
 use crate::project::ProjectContext;
 
-const HELD_LOCKFILE_PREFIX: &str = "cargo-cooldown lockfile hold";
+const LOCKFILE_MARKER_PREFIX: &str = "cargo-cooldown lockfile lock";
+const LOCKFILE_MARKER_NAME: &str = "Cargo.lock.cooldown-hold";
+const LOCK_ACQUIRE_ATTEMPTS: usize = 600;
 
 /// Workspace copy used for all speculative Cargo operations in one run.
 pub struct IsolatedWorkspace {
@@ -34,6 +37,7 @@ impl IsolatedWorkspace {
     /// Copy the workspace and hold the real root lockfile.
     pub fn create(project: &ProjectContext, manifest: &Manifest) -> Result<Self> {
         let real_lockfile_path = project.workspace_root.join("Cargo.lock");
+        let real_lockfile = LockfileHoldGuard::hold(&real_lockfile_path)?;
         ensure_no_existing_lockfile_hold(&real_lockfile_path)?;
 
         let temp_dir = Builder::new()
@@ -46,11 +50,17 @@ impl IsolatedWorkspace {
             &workspace_root,
             &project.target_directory,
         )?;
+        map_path_dependencies(project, &workspace_root)?;
 
         let current_dir = map_current_dir(project, &workspace_root)?;
         let manifest = map_manifest(project, manifest, &workspace_root)?;
         let lockfile_path = workspace_root.join("Cargo.lock");
-        let real_lockfile = LockfileHoldGuard::hold(&real_lockfile_path)?;
+        real_lockfile.ensure_original_unchanged()?;
+        match &real_lockfile.original_contents {
+            Some(contents) => fs::write(&lockfile_path, contents)?,
+            None if lockfile_path.exists() => fs::remove_file(&lockfile_path)?,
+            None => {}
+        }
 
         debug!(
             temp_workspace = %workspace_root.display(),
@@ -161,116 +171,100 @@ impl Drop for CurrentDirGuard {
 
 struct LockfileHoldGuard {
     lockfile_path: PathBuf,
-    backup_path: Option<PathBuf>,
-    sentinel: String,
-    id: String,
+    marker_path: PathBuf,
+    original_contents: Option<Vec<u8>>,
     committed: bool,
 }
 
 impl LockfileHoldGuard {
     fn hold(lockfile_path: &Path) -> Result<Self> {
         let id = unique_hold_id();
-        let backup_candidate =
-            lockfile_path.with_file_name(format!("Cargo.lock.cooldown-backup.{id}"));
-
-        let backup_path = if lockfile_path.exists() {
-            fs::rename(lockfile_path, &backup_candidate).with_context(|| {
-                format!(
-                    "failed to hold lockfile {} at {}",
-                    lockfile_path.display(),
-                    backup_candidate.display()
-                )
-            })?;
-            Some(backup_candidate)
-        } else {
-            None
-        };
-        let backup_label = backup_path
-            .as_ref()
-            .and_then(|path| path.file_name())
-            .and_then(OsStr::to_str)
-            .unwrap_or("<none>");
-        let sentinel = format!(
-            "{HELD_LOCKFILE_PREFIX} {id}\n\
-             The real Cargo.lock is temporarily held while cargo-cooldown resolves and cools a lockfile in an isolated workspace.\n\
-             Backup: {backup_label}\n",
-        );
-
-        if let Err(err) = fs::write(lockfile_path, &sentinel) {
-            if let Some(backup_path) = &backup_path {
-                let _ = fs::rename(backup_path, lockfile_path);
+        let marker_path = lockfile_path.with_file_name(LOCKFILE_MARKER_NAME);
+        acquire_marker(&marker_path, &id)?;
+        let original_contents = match fs::read(lockfile_path) {
+            Ok(contents) => Some(contents),
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => {
+                let _ = fs::remove_file(&marker_path);
+                return Err(err).with_context(|| {
+                    format!("failed to read lockfile {}", lockfile_path.display())
+                });
             }
-            return Err(err).with_context(|| {
-                format!("failed to write lockfile hold {}", lockfile_path.display())
-            });
-        }
+        };
 
         debug!(
             lockfile = %lockfile_path.display(),
-            backup = backup_path.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "<none>".to_string()),
-            "held real Cargo.lock while cooling temporary lockfile"
+            marker = %marker_path.display(),
+            "coordinating isolated cooldown while keeping Cargo.lock valid"
         );
 
         Ok(Self {
             lockfile_path: lockfile_path.to_path_buf(),
-            backup_path,
-            sentinel,
-            id,
+            marker_path,
+            original_contents,
             committed: false,
         })
     }
 
     fn commit_from(&mut self, source_lockfile: &Path) -> Result<()> {
-        self.ensure_sentinel_unchanged()?;
+        self.ensure_original_unchanged()?;
         let final_contents = fs::read(source_lockfile).with_context(|| {
             format!(
                 "temporary cooldown workspace did not produce {}",
                 source_lockfile.display()
             )
         })?;
-        let pending_path = self
+        let parent = self
             .lockfile_path
-            .with_file_name(format!("Cargo.lock.cooldown-final.{}", self.id));
-        fs::write(&pending_path, final_contents).with_context(|| {
-            format!("failed to stage cooled lockfile {}", pending_path.display())
-        })?;
-
-        publish_pending_lockfile(&pending_path, &self.lockfile_path).with_context(|| {
-            format!(
-                "failed to publish cooled lockfile to {}",
-                self.lockfile_path.display()
-            )
-        })?;
-        self.committed = true;
-
-        if let Some(backup_path) = &self.backup_path
-            && let Err(err) = fs::remove_file(backup_path)
+            .parent()
+            .context("lockfile has no parent")?;
+        let mut builder = Builder::new();
+        builder.prefix("Cargo.lock.cooldown-final.");
+        // For new lockfiles use normal file creation permissions, respecting umask.
+        #[cfg(unix)]
         {
-            warn!(
-                backup = %backup_path.display(),
-                error = %err,
-                "cooled lockfile was published but the temporary lockfile backup could not be removed"
-            );
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(fs::Permissions::from_mode(0o666));
+        }
+        let mut pending = builder.tempfile_in(parent)?;
+        pending.write_all(&final_contents)?;
+        if self.original_contents.is_some() {
+            pending
+                .as_file()
+                .set_permissions(fs::metadata(&self.lockfile_path)?.permissions())?;
+        }
+        pending.as_file().sync_all()?;
+        // Stage first, then check immediately before the atomic replacement.
+        self.ensure_original_unchanged()?;
+        pending
+            .persist(&self.lockfile_path)
+            .context("failed to atomically publish Cargo.lock")?;
+        self.committed = true;
+        if let Err(err) = fs::remove_file(&self.marker_path) {
+            warn!(error = %err, "published Cargo.lock but could not remove coordination marker");
         }
 
         Ok(())
     }
 
-    fn ensure_sentinel_unchanged(&self) -> Result<()> {
-        let contents = fs::read_to_string(&self.lockfile_path).with_context(|| {
-            format!(
-                "failed to verify lockfile hold {}",
-                self.lockfile_path.display()
-            )
-        })?;
-        if contents != self.sentinel {
+    fn ensure_original_unchanged(&self) -> Result<()> {
+        let contents = match fs::read(&self.lockfile_path) {
+            Ok(contents) => Some(contents),
+            Err(err) if err.kind() == ErrorKind::NotFound => None,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to verify lockfile hold {}",
+                        self.lockfile_path.display()
+                    )
+                });
+            }
+        };
+        if contents != self.original_contents {
             bail!(
-                "{} changed while cargo-cooldown was resolving in an isolated workspace; refusing to overwrite it. The original lockfile backup is at {}.",
+                "{} changed while cargo-cooldown was resolving in an isolated workspace; refusing to overwrite it. The auxiliary coordination marker is {}.",
                 self.lockfile_path.display(),
-                self.backup_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "<none>".to_string())
+                self.marker_path.display()
             );
         }
         Ok(())
@@ -281,53 +275,21 @@ impl LockfileHoldGuard {
             return;
         }
 
-        match fs::read_to_string(&self.lockfile_path) {
-            Ok(contents) if contents == self.sentinel => {
-                if let Err(err) = fs::remove_file(&self.lockfile_path) {
-                    warn!(
-                        lockfile = %self.lockfile_path.display(),
-                        error = %err,
-                        "failed to remove cooldown lockfile hold"
-                    );
-                    return;
-                }
-                if let Some(backup_path) = &self.backup_path
-                    && let Err(err) = fs::rename(backup_path, &self.lockfile_path)
-                {
-                    warn!(
-                        backup = %backup_path.display(),
-                        lockfile = %self.lockfile_path.display(),
-                        error = %err,
-                        "failed to restore original Cargo.lock after cooldown isolation"
-                    );
-                }
-            }
-            Ok(_) => {
-                warn!(
-                    lockfile = %self.lockfile_path.display(),
-                    backup = self.backup_path.as_ref().map(|path| path.display().to_string()).unwrap_or_else(|| "<none>".to_string()),
-                    "Cargo.lock changed while cargo-cooldown held it; leaving the changed file and backup in place"
-                );
-            }
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                if let Some(backup_path) = &self.backup_path
-                    && let Err(err) = fs::rename(backup_path, &self.lockfile_path)
-                {
-                    warn!(
-                        backup = %backup_path.display(),
-                        lockfile = %self.lockfile_path.display(),
-                        error = %err,
-                        "failed to restore original Cargo.lock after lockfile hold disappeared"
-                    );
-                }
-            }
-            Err(err) => {
-                warn!(
-                    lockfile = %self.lockfile_path.display(),
-                    error = %err,
-                    "failed to inspect cooldown lockfile hold during restore"
-                );
-            }
+        if let Err(err) = self.ensure_original_unchanged() {
+            warn!(
+                lockfile = %self.lockfile_path.display(),
+                error = %err,
+                "leaving externally changed Cargo.lock untouched"
+            );
+        }
+        if let Err(err) = fs::remove_file(&self.marker_path)
+            && err.kind() != ErrorKind::NotFound
+        {
+            warn!(
+                marker = %self.marker_path.display(),
+                error = %err,
+                "failed to remove cooldown coordination marker"
+            );
         }
     }
 }
@@ -336,34 +298,6 @@ impl Drop for LockfileHoldGuard {
     fn drop(&mut self) {
         self.restore();
     }
-}
-
-#[cfg(unix)]
-fn publish_pending_lockfile(pending_path: &Path, lockfile_path: &Path) -> Result<()> {
-    fs::rename(pending_path, lockfile_path).with_context(|| {
-        format!(
-            "failed to rename {} to {}",
-            pending_path.display(),
-            lockfile_path.display()
-        )
-    })
-}
-
-#[cfg(windows)]
-fn publish_pending_lockfile(pending_path: &Path, lockfile_path: &Path) -> Result<()> {
-    fs::remove_file(lockfile_path).with_context(|| {
-        format!(
-            "failed to remove held lockfile {} before publishing",
-            lockfile_path.display()
-        )
-    })?;
-    fs::rename(pending_path, lockfile_path).with_context(|| {
-        format!(
-            "failed to rename {} to {}",
-            pending_path.display(),
-            lockfile_path.display()
-        )
-    })
 }
 
 fn map_manifest(
@@ -409,7 +343,50 @@ fn canonicalize_existing(path: &Path) -> Result<PathBuf> {
     fs::canonicalize(path).with_context(|| format!("failed to canonicalize {}", path.display()))
 }
 
+fn acquire_marker(marker_path: &Path, id: &str) -> Result<()> {
+    for attempt in 0..LOCK_ACQUIRE_ATTEMPTS {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker_path)
+        {
+            Ok(file) => {
+                use std::io::Write;
+                let mut file = file;
+                if let Err(err) = writeln!(file, "{LOCKFILE_MARKER_PREFIX} {id}") {
+                    drop(file);
+                    let _ = fs::remove_file(marker_path);
+                    return Err(err).context("failed to write cooldown coordination marker");
+                }
+                return Ok(());
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                if attempt == 0 {
+                    eprintln!("Waiting for cargo-cooldown lock: {}", marker_path.display());
+                }
+                thread::sleep(Duration::from_millis(50 + (attempt.min(15) as u64) * 10));
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "failed to acquire cooldown marker {}",
+                        marker_path.display()
+                    )
+                });
+            }
+        }
+    }
+
+    bail!(
+        "timed out waiting for {}; another cargo-cooldown process may be interrupted; remove the marker only after confirming no cooldown process is running",
+        marker_path.display()
+    )
+}
+
 fn ensure_no_existing_lockfile_hold(lockfile_path: &Path) -> Result<()> {
+    // Older releases wrote an invalid sentinel into Cargo.lock. Keep a clear
+    // recovery diagnostic for that state rather than treating it as a valid
+    // lockfile or silently overwriting it.
     let contents = match fs::read_to_string(lockfile_path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
@@ -419,7 +396,7 @@ fn ensure_no_existing_lockfile_hold(lockfile_path: &Path) -> Result<()> {
         }
     };
 
-    if !contents.starts_with(HELD_LOCKFILE_PREFIX) {
+    if !contents.starts_with("cargo-cooldown lockfile hold") {
         return Ok(());
     }
 
@@ -429,12 +406,12 @@ fn ensure_no_existing_lockfile_hold(lockfile_path: &Path) -> Result<()> {
         .unwrap_or("<unknown>");
     if backup == "<none>" {
         bail!(
-            "{} is a cargo-cooldown hold sentinel from a previous interrupted run. No original lockfile existed before that run; delete the sentinel Cargo.lock before retrying.",
+            "{} is an obsolete cargo-cooldown hold sentinel from a previous interrupted run. No original lockfile backup was recorded; restore Cargo.lock manually before retrying.",
             lockfile_path.display()
         )
     } else {
         bail!(
-            "{} is a cargo-cooldown hold sentinel from a previous interrupted run. Restore the original lockfile first by moving {} back to Cargo.lock.",
+            "{} is an obsolete cargo-cooldown hold sentinel from a previous interrupted run. Restore the original lockfile first from {}.",
             lockfile_path.display(),
             backup
         )
@@ -508,8 +485,149 @@ fn copy_entry(source: &Path, destination: &Path, target_directory: Option<&Path>
     }
 }
 
+/// Rewrite only dependency paths in copied workspace manifests. External
+/// checkouts remain at their original absolute locations, preserving their own
+/// relative dependencies and workspace inheritance without symlink privileges.
+fn map_path_dependencies(project: &ProjectContext, temp_root: &Path) -> Result<()> {
+    let source_root = canonicalize_existing(&project.workspace_root)?;
+    let mut manifests = vec![source_root.join("Cargo.toml")];
+    manifests.extend(
+        project
+            .members
+            .iter()
+            .map(|member| member.manifest_path.clone()),
+    );
+    let mut seen = std::collections::HashSet::new();
+    while let Some(manifest) = manifests.pop() {
+        let manifest = canonicalize_existing(&manifest)?;
+        if !seen.insert(manifest.clone()) {
+            continue;
+        }
+        let relative = manifest
+            .strip_prefix(&source_root)
+            .with_context(|| format!("manifest {} is outside workspace", manifest.display()))?;
+        let destination = temp_root.join(relative);
+        if fs::symlink_metadata(&destination)?.file_type().is_symlink() {
+            bail!(
+                "cannot safely rewrite symlinked manifest {}",
+                manifest.display()
+            );
+        }
+        let contents = fs::read_to_string(&destination)?;
+        let mut value: toml::Value = toml::from_str(&contents)?;
+        let parent = manifest.parent().context("manifest has no parent")?;
+        rewrite_dependency_tables(&mut value, parent, &source_root, temp_root, &mut manifests)
+            .with_context(|| format!("cannot map dependencies in {}", manifest.display()))?;
+        fs::write(destination, toml::to_string(&value)?)?;
+    }
+    Ok(())
+}
+
+fn rewrite_dependency_tables(
+    value: &mut toml::Value,
+    manifest_dir: &Path,
+    source_root: &Path,
+    temp_root: &Path,
+    manifests: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(table) = value.get_mut(key).and_then(toml::Value::as_table_mut) {
+            for (_, dependency) in table.iter_mut() {
+                rewrite_dependency_path(
+                    dependency,
+                    manifest_dir,
+                    source_root,
+                    temp_root,
+                    manifests,
+                )?;
+            }
+        }
+    }
+    for key in ["workspace", "target"] {
+        if let Some(section) = value.get_mut(key) {
+            if key == "workspace" {
+                rewrite_dependency_tables(
+                    section,
+                    manifest_dir,
+                    source_root,
+                    temp_root,
+                    manifests,
+                )?;
+            } else if let Some(targets) = section.as_table_mut() {
+                for (_, target) in targets.iter_mut() {
+                    rewrite_dependency_tables(
+                        target,
+                        manifest_dir,
+                        source_root,
+                        temp_root,
+                        manifests,
+                    )?;
+                }
+            }
+        }
+    }
+    if let Some(patches) = value.get_mut("patch").and_then(toml::Value::as_table_mut) {
+        for registry in patches
+            .iter_mut()
+            .filter_map(|(_, value)| value.as_table_mut())
+        {
+            for (_, dependency) in registry.iter_mut() {
+                rewrite_dependency_path(
+                    dependency,
+                    manifest_dir,
+                    source_root,
+                    temp_root,
+                    manifests,
+                )?;
+            }
+        }
+    }
+    if let Some(replacements) = value.get_mut("replace").and_then(toml::Value::as_table_mut) {
+        for (_, dependency) in replacements.iter_mut() {
+            rewrite_dependency_path(dependency, manifest_dir, source_root, temp_root, manifests)?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_dependency_path(
+    dependency: &mut toml::Value,
+    manifest_dir: &Path,
+    source_root: &Path,
+    temp_root: &Path,
+    manifests: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let Some(path) = dependency.get_mut("path") else {
+        return Ok(());
+    };
+    let raw = path.as_str().context("dependency path must be a string")?;
+    let original = canonicalize_existing(&manifest_dir.join(raw))?;
+    if !original.join("Cargo.toml").is_file() {
+        bail!("path dependency {} has no Cargo.toml", original.display());
+    }
+    let mapped = match original.strip_prefix(source_root) {
+        Ok(relative) => {
+            manifests.push(original.join("Cargo.toml"));
+            temp_root.join(relative)
+        }
+        Err(_) => original,
+    };
+    *path = toml::Value::String(
+        mapped
+            .to_str()
+            .context("dependency path is not UTF-8")?
+            .to_owned(),
+    );
+    Ok(())
+}
+
 fn should_skip_top_level_workspace_entry(name: &OsStr) -> bool {
-    matches!(name.to_str(), Some(".git"))
+    // Materialize Cargo.lock from the captured bytes, never copy a symlink
+    // that could let speculative Cargo operations reach the original file.
+    matches!(
+        name.to_str(),
+        Some(".git" | "Cargo.lock" | LOCKFILE_MARKER_NAME)
+    )
 }
 
 fn target_directory_to_skip(workspace_root: &Path, target_directory: &Path) -> Option<PathBuf> {
@@ -568,13 +686,163 @@ fn unique_hold_id() -> String {
 mod tests {
     use super::*;
 
+    fn project_at(root: &Path) -> ProjectContext {
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        ProjectContext {
+            cwd: root.to_path_buf(),
+            kind: crate::project::ProjectKind::Crate,
+            workspace_root: root.to_path_buf(),
+            target_directory: root.join("target"),
+            members: vec![],
+            active_member: None,
+        }
+    }
+
+    #[test]
+    fn external_change_after_isolation_is_preserved() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = project_at(temp.path());
+        let real = temp.path().join("Cargo.lock");
+        fs::write(&real, "version = 4\n# original\n").unwrap();
+        let isolated = IsolatedWorkspace::create(&project, &Manifest::default()).unwrap();
+        let changed = "version = 4\n# external change\n";
+        fs::write(&real, changed).unwrap();
+        assert!(isolated.publish_lockfile().is_err());
+        assert_eq!(fs::read_to_string(real).unwrap(), changed);
+        assert!(!temp.path().join(LOCKFILE_MARKER_NAME).exists());
+    }
+
+    #[test]
+    fn waiting_instance_copies_the_published_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = project_at(temp.path());
+        fs::write(temp.path().join("Cargo.lock"), "version = 4\n# old\n").unwrap();
+        let first = IsolatedWorkspace::create(&project, &Manifest::default()).unwrap();
+        let second = thread::spawn(move || {
+            IsolatedWorkspace::create(&project, &Manifest::default()).unwrap()
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(!second.is_finished());
+        let updated = "version = 4\n# published\n";
+        fs::write(&first.lockfile_path, updated).unwrap();
+        first.publish_lockfile().unwrap();
+        let second = second.join().unwrap();
+        assert_eq!(fs::read_to_string(&second.lockfile_path).unwrap(), updated);
+        second.publish_lockfile().unwrap();
+    }
+
+    #[test]
+    fn publication_without_initial_lockfile_succeeds() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = project_at(temp.path());
+        let isolated = IsolatedWorkspace::create(&project, &Manifest::default()).unwrap();
+        fs::write(&isolated.lockfile_path, "version = 4\n").unwrap();
+        isolated.publish_lockfile().unwrap();
+        assert_eq!(
+            fs::read_to_string(temp.path().join("Cargo.lock")).unwrap(),
+            "version = 4\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_original_lockfile_is_not_followed_by_speculative_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = project_at(&temp.path().join("project"));
+        let shared = temp.path().join("shared.lock");
+        fs::write(&shared, "version = 4\n# original\n").unwrap();
+        std::os::unix::fs::symlink(&shared, project.workspace_root.join("Cargo.lock")).unwrap();
+        let isolated = IsolatedWorkspace::create(&project, &Manifest::default()).unwrap();
+        assert!(
+            !fs::symlink_metadata(&isolated.lockfile_path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::write(&isolated.lockfile_path, "version = 4\n# speculative\n").unwrap();
+        assert_eq!(
+            fs::read_to_string(shared).unwrap(),
+            "version = 4\n# original\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o644, 0o664, 0o444] {
+            let temp = tempfile::tempdir().unwrap();
+            let lock = temp.path().join("Cargo.lock");
+            let replacement = temp.path().join("replacement");
+            fs::write(&lock, "version = 4\n").unwrap();
+            fs::write(&replacement, "version = 4\n# updated\n").unwrap();
+            fs::set_permissions(&lock, fs::Permissions::from_mode(mode)).unwrap();
+            let mut guard = LockfileHoldGuard::hold(&lock).unwrap();
+            guard.commit_from(&replacement).unwrap();
+            assert_eq!(
+                fs::metadata(lock).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn lock_holder_child_process() {
+        let Some(root) = env::var_os("COOLDOWN_TEST_LOCK_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let _guard = LockfileHoldGuard::hold(&root.join("Cargo.lock")).unwrap();
+        fs::write(root.join("ready"), "").unwrap();
+        loop {
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn interrupted_process_preserves_lockfile_and_allows_manual_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let lockfile = temp.path().join("Cargo.lock");
+        fs::write(&lockfile, "version = 4\n").unwrap();
+        let mut child = std::process::Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "isolation::tests::lock_holder_child_process",
+                "--nocapture",
+            ])
+            .env("COOLDOWN_TEST_LOCK_ROOT", temp.path())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !temp.path().join("ready").exists() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not acquire lock");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(fs::read_to_string(&lockfile).unwrap(), "version = 4\n");
+        fs::remove_file(temp.path().join(LOCKFILE_MARKER_NAME)).unwrap();
+        let guard = LockfileHoldGuard::hold(&lockfile).unwrap();
+        drop(guard);
+    }
+
     #[test]
     fn existing_lockfile_hold_sentinel_requires_manual_restore() {
         let temp_dir = tempfile::tempdir().expect("tempdir should build");
         let lockfile_path = temp_dir.path().join("Cargo.lock");
         fs::write(
             &lockfile_path,
-            format!("{HELD_LOCKFILE_PREFIX} test\nBackup: Cargo.lock.cooldown-backup.test\n"),
+            "cargo-cooldown lockfile hold test\nBackup: Cargo.lock.cooldown-backup.test\n",
         )
         .expect("sentinel should be writable");
 
@@ -629,5 +897,71 @@ mod tests {
             fs::read_to_string(destination.join("target/fixture.txt")).unwrap(),
             "keep"
         );
+    }
+
+    #[test]
+    fn lockfile_hold_keeps_visible_lockfile_valid_and_publishes_atomically() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let lockfile = temp_dir.path().join("Cargo.lock");
+        let replacement = temp_dir.path().join("replacement.lock");
+        fs::write(&lockfile, "version = 4\n").expect("lockfile should be writable");
+        fs::write(
+            &replacement,
+            "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"1.0.0\"\n",
+        )
+        .expect("replacement should be writable");
+
+        let mut hold = LockfileHoldGuard::hold(&lockfile).expect("hold should succeed");
+        assert_eq!(fs::read_to_string(&lockfile).unwrap(), "version = 4\n");
+        assert!(hold.marker_path.exists());
+        hold.commit_from(&replacement)
+            .expect("publish should succeed");
+        assert!(!hold.marker_path.exists());
+        drop(hold);
+        assert!(!temp_dir.path().join(LOCKFILE_MARKER_NAME).exists());
+        assert!(fs::read_to_string(&lockfile).unwrap().contains("demo"));
+    }
+
+    #[test]
+    fn marker_acquisition_waits_for_previous_cooldown() {
+        let temp_dir = tempfile::tempdir().expect("tempdir should build");
+        let marker = temp_dir.path().join(LOCKFILE_MARKER_NAME);
+        fs::write(&marker, "previous run").expect("marker should be writable");
+        let release_marker = marker.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(70));
+            fs::remove_file(release_marker).expect("previous marker should be removable");
+        });
+
+        acquire_marker(&marker, "test").expect("acquisition should wait and succeed");
+        assert!(marker.exists());
+        fs::remove_file(marker).expect("test marker should be removable");
+    }
+
+    #[test]
+    fn dependency_paths_are_rewritten_without_writing_outside_temp() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original/a/b");
+        let external = temp.path().join("original/external");
+        let isolated = temp.path().join("sandbox/workspace");
+        fs::create_dir_all(&original).unwrap();
+        fs::create_dir_all(&external).unwrap();
+        fs::write(
+            external.join("Cargo.toml"),
+            "[package]\nname='external'\nversion='0.1.0'",
+        )
+        .unwrap();
+        let mut value: toml::Value = toml::from_str("[dependencies]\nexternal={path='../../external'}\n[[bin]]\nname='app'\npath='not-a-dependency.rs'").unwrap();
+        rewrite_dependency_tables(&mut value, &original, &original, &isolated, &mut Vec::new())
+            .unwrap();
+        assert_eq!(
+            value["dependencies"]["external"]["path"].as_str().unwrap(),
+            fs::canonicalize(&external).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            value["bin"][0]["path"].as_str().unwrap(),
+            "not-a-dependency.rs"
+        );
+        assert!(!temp.path().join("external").exists());
     }
 }
