@@ -184,7 +184,7 @@ impl ProjectContext {
             Some(path) => cwd.join(path),
             None => workspace_root.join("target"),
         };
-        let target_directory = canonicalize_location(&target_directory)?;
+        let target_directory = normalize_target_directory(&target_directory);
         let active_member = determine_active_member(
             selection,
             &cwd,
@@ -254,7 +254,7 @@ impl ProjectContext {
             cwd,
             kind,
             workspace_root,
-            target_directory: canonicalize_location(metadata.target_directory.as_std_path())?,
+            target_directory: normalize_target_directory(metadata.target_directory.as_std_path()),
             members,
             active_member,
         })
@@ -313,19 +313,22 @@ fn manifest_declares_workspace(path: &Path) -> Result<bool> {
     Ok(manifest.get("workspace").is_some())
 }
 
-// Cargo may retain aliases such as /var versus /private/var or Windows short
-// paths. Resolve the existing prefix even when the target directory is absent.
-fn canonicalize_location(path: &Path) -> Result<PathBuf> {
+// Resolve Cargo's path aliases even when the target directory does not exist.
+// Leave inaccessible target paths to Cargo; discovery itself does not need them.
+fn normalize_target_directory(path: &Path) -> PathBuf {
     for ancestor in path.ancestors() {
         match fs::canonicalize(ancestor) {
-            Ok(resolved) => return Ok(resolved.join(path.strip_prefix(ancestor)?)),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(err).with_context(|| format!("invalid path {}", path.display()));
+            Ok(resolved) => {
+                if let Ok(suffix) = path.strip_prefix(ancestor) {
+                    return resolved.join(suffix);
+                }
+                break;
             }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => break,
         }
     }
-    bail!("path has no existing ancestor: {}", path.display())
+    path.to_path_buf()
 }
 
 fn workspace_members(metadata: &Metadata) -> Result<Vec<ProjectMember>> {
@@ -496,6 +499,15 @@ mod tests {
         };
 
         assert!(context.member_config_path().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn target_normalization_preserves_unresolvable_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("loop");
+        std::os::unix::fs::symlink("loop", &target).unwrap();
+        assert_eq!(normalize_target_directory(&target), target);
     }
 
     #[cfg(unix)]

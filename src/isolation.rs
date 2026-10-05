@@ -473,6 +473,11 @@ fn copy_entry(source: &Path, destination: &Path, target_directory: Option<&Path>
     let file_type = metadata.file_type();
 
     if file_type.is_symlink() {
+        if target_directory
+            .is_some_and(|target| fs::canonicalize(source).is_ok_and(|resolved| resolved == target))
+        {
+            return Ok(());
+        }
         copy_symlink(source, destination)
     } else if file_type.is_dir() {
         fs::create_dir_all(destination)
@@ -897,6 +902,27 @@ mod tests {
         assert!(
             format!("{err:#}").contains("previous interrupted run"),
             "{err:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_copy_skips_target_symlink_and_its_resolved_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("isolated");
+        fs::create_dir_all(source.join("output")).unwrap();
+        fs::write(source.join("output/cache"), "original").unwrap();
+        std::os::unix::fs::symlink("output", source.join("target")).unwrap();
+        let source = fs::canonicalize(source).unwrap();
+        let target = fs::canonicalize(source.join("target")).unwrap();
+        copy_workspace(&source, &destination, &target).unwrap();
+        assert!(!destination.join("output").exists());
+        assert!(fs::symlink_metadata(destination.join("target")).is_err());
+        fs::create_dir_all(destination.join("target/debug")).unwrap();
+        assert_eq!(
+            fs::read_to_string(source.join("output/cache")).unwrap(),
+            "original"
         );
     }
 
