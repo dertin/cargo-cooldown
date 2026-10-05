@@ -638,6 +638,9 @@ impl Server {
             .or_else(|_| TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)))?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
+        // Share the nonblocking listener itself; no duplicated OS sockets are
+        // needed for threads owned by this process.
+        let listener = Arc::new(listener);
         let stop = Arc::new(AtomicBool::new(false));
         let mut server = Self {
             address,
@@ -645,7 +648,7 @@ impl Server {
             workers: Vec::new(),
         };
         for _ in 0..8 {
-            let listener = listener.try_clone()?;
+            let listener = Arc::clone(&listener);
             let stop = Arc::clone(&server.stop);
             let state = Arc::clone(&state);
             server.workers.push(thread::spawn(move || {
