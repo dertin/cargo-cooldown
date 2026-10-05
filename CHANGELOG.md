@@ -22,6 +22,8 @@
   and build guards, avoiding repeated Cargo discovery and client initialization.
 - Preserve the selected rustup compiler and toolchain during isolated resolution
   and metadata calls, including directory overrides and hard-linked proxies.
+- Normalize workspace and member paths consistently across filesystem aliases,
+  including macOS temporary directories and Windows short paths.
 - Add differential regression tests and toolchain CI.
 
 ## 0.3.5 - 2026-09-10

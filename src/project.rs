@@ -68,9 +68,9 @@ impl ProjectContext {
     /// membership, inherited target paths and external checkouts retain Cargo's
     /// authoritative metadata discovery.
     fn discover_simple(selection: &RuntimeSelection) -> Result<Option<Self>> {
-        let cwd = env::current_dir()?;
+        let cwd = fs::canonicalize(env::current_dir()?)?;
         let current_manifest = match &selection.manifest_path {
-            Some(path) => fs::canonicalize(path)?,
+            Some(path) => path.clone(),
             None => match cwd
                 .ancestors()
                 .map(|dir| dir.join("Cargo.toml"))
@@ -80,6 +80,7 @@ impl ProjectContext {
                 None => return Ok(None),
             },
         };
+        let current_manifest = fs::canonicalize(current_manifest)?;
         let current_dir = current_manifest
             .parent()
             .context("manifest has no parent")?;
@@ -183,6 +184,7 @@ impl ProjectContext {
             Some(path) => cwd.join(path),
             None => workspace_root.join("target"),
         };
+        let target_directory = canonicalize_location(&target_directory)?;
         let active_member = determine_active_member(
             selection,
             &cwd,
@@ -219,24 +221,27 @@ impl ProjectContext {
     }
 
     fn discover(selection: &RuntimeSelection) -> Result<Self> {
-        let cwd = env::current_dir().context("failed to determine current directory")?;
+        let cwd = fs::canonicalize(env::current_dir()?)
+            .context("failed to determine current directory")?;
         let current_manifest = match &selection.manifest_path {
-            Some(path) => fs::canonicalize(path).context("invalid manifest path")?,
+            Some(path) => path.clone(),
             None => cwd
                 .ancestors()
                 .map(|dir| dir.join("Cargo.toml"))
                 .find(|path| path.is_file())
                 .context("could not find Cargo.toml")?,
         };
+        let current_manifest =
+            fs::canonicalize(current_manifest).context("invalid manifest path")?;
         let metadata = read_project_metadata(selection.manifest_path.as_deref())?;
-        let workspace_root = metadata.workspace_root.clone().into_std_path_buf();
+        let workspace_root = fs::canonicalize(&metadata.workspace_root)?;
         let workspace_manifest = workspace_root.join("Cargo.toml");
         let kind = if manifest_declares_workspace(&workspace_manifest)? {
             ProjectKind::Workspace
         } else {
             ProjectKind::Crate
         };
-        let members = workspace_members(&metadata);
+        let members = workspace_members(&metadata)?;
         let active_member = determine_active_member(
             selection,
             &cwd,
@@ -249,7 +254,7 @@ impl ProjectContext {
             cwd,
             kind,
             workspace_root,
-            target_directory: metadata.target_directory.clone().into_std_path_buf(),
+            target_directory: canonicalize_location(metadata.target_directory.as_std_path())?,
             members,
             active_member,
         })
@@ -308,21 +313,36 @@ fn manifest_declares_workspace(path: &Path) -> Result<bool> {
     Ok(manifest.get("workspace").is_some())
 }
 
-fn workspace_members(metadata: &Metadata) -> Vec<ProjectMember> {
+// Cargo may retain aliases such as /var versus /private/var or Windows short
+// paths. Resolve the existing prefix even when the target directory is absent.
+fn canonicalize_location(path: &Path) -> Result<PathBuf> {
+    for ancestor in path.ancestors() {
+        match fs::canonicalize(ancestor) {
+            Ok(resolved) => return Ok(resolved.join(path.strip_prefix(ancestor)?)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("invalid path {}", path.display()));
+            }
+        }
+    }
+    bail!("path has no existing ancestor: {}", path.display())
+}
+
+fn workspace_members(metadata: &Metadata) -> Result<Vec<ProjectMember>> {
     metadata
         .workspace_packages()
         .iter()
         .map(|package| {
-            let manifest_path = package.manifest_path.clone().into_std_path_buf();
+            let manifest_path = fs::canonicalize(&package.manifest_path)?;
             let dir = manifest_path
                 .parent()
                 .map(Path::to_path_buf)
                 .expect("workspace package manifest should have a parent directory");
-            ProjectMember {
+            Ok(ProjectMember {
                 name: package.name.to_string(),
                 manifest_path,
                 dir,
-            }
+            })
         })
         .collect()
 }
@@ -550,18 +570,32 @@ mod simple_discovery_tests {
             )
             .unwrap();
         }
-        let selection = RuntimeSelection {
-            manifest_path: Some(temp.path().join("one/Cargo.toml")),
-            ..RuntimeSelection::default()
+        let manifests = vec![temp.path().join("one/Cargo.toml")];
+        #[cfg(unix)]
+        let links = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let manifests = {
+            let alias = links.path().join("workspace-link");
+            std::os::unix::fs::symlink(temp.path(), &alias).unwrap();
+            let mut manifests = manifests;
+            manifests.push(alias.join("one/Cargo.toml"));
+            manifests
         };
-        let Some(simple) = ProjectContext::discover_simple(&selection).unwrap() else {
-            // A user-level target-dir config legitimately requires Cargo discovery.
-            return;
-        };
-        let cargo = ProjectContext::discover(&selection).unwrap();
-        assert_eq!(simple.workspace_root, cargo.workspace_root);
-        assert_eq!(simple.target_directory, cargo.target_directory);
-        assert_eq!(simple.active_member, cargo.active_member);
-        assert_eq!(simple.members, cargo.members);
+        for manifest in manifests {
+            let selection = RuntimeSelection {
+                manifest_path: Some(manifest),
+                ..RuntimeSelection::default()
+            };
+            let Some(simple) = ProjectContext::discover_simple(&selection).unwrap() else {
+                // A user-level target-dir config legitimately requires Cargo discovery.
+                return;
+            };
+            let cargo = ProjectContext::discover(&selection).unwrap();
+            assert_eq!(simple.workspace_root, cargo.workspace_root);
+            assert_eq!(simple.target_directory, cargo.target_directory);
+            assert_eq!(simple.active_member, cargo.active_member);
+            assert_eq!(simple.members, cargo.members);
+            assert_eq!(cargo.active_member.as_ref().unwrap().name, "one");
+        }
     }
 }
