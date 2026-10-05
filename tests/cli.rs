@@ -114,3 +114,20 @@ fn run_cooldown_without_project(args: &[&str]) -> std::process::Output {
         .output()
         .expect("cargo-cooldown should spawn")
 }
+
+#[test]
+fn version_does_not_require_a_configured_rustup_toolchain() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .arg("version")
+        .env("RUSTUP_HOME", temp.path())
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains(env!("CARGO_PKG_VERSION")));
+}

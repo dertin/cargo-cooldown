@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.4.1 - Unreleased
+
+- Add `auto`, `filtered`, `native`, and `legacy` backends and `COOLDOWN_BACKEND`.
+- Resolve supported sparse graphs once through a process-owned loopback index;
+  retain index entries, source identities, checksum validation, baseline rules,
+  atomic lockfile publication, and workspace isolation.
+- Cache original indexes with HTTP validators, recompute age each invocation,
+  reuse connections, bound concurrency, and avoid Cargo discovery for simple
+  explicit workspace layouts. Complex layouts retain Cargo metadata discovery.
+- Neutralize native age filtering in the independent engines. Delegate only
+  policies whose semantics are known to match the selected Cargo version.
+- The filtered `generate-lockfile` command keeps its cooled result instead of
+  regenerating it with unfiltered Cargo after validation.
+- Try filtered resolution for fallback policies; retain legacy acceptance when
+  a compliant filtered resolution cannot be produced after age filtering.
+- Reuse the isolated workspace and keep lockfile coordination when an automatic
+  filtered update needs legacy fallback. Restore the original baseline before
+  retrying and retain the configured fallback acceptance rules.
+- Reuse the known lockfile path and registry context throughout legacy updates
+  and build guards, avoiding repeated Cargo discovery and client initialization.
+- Preserve the selected rustup compiler and toolchain during isolated resolution
+  and metadata calls, including directory overrides and hard-linked proxies.
+- Normalize workspace and member paths consistently across filesystem aliases,
+  including macOS temporary directories and Windows short paths.
+- Honor Cargo's HTTP proxy configuration for filtered upstream requests, and retry
+  legacy automatically in `auto` mode for unsupported cross-registry metadata.
+- Keep loopback connections alive across delayed or fragmented Cargo requests
+  while retaining bounded requests and cancellation on shutdown.
+- Share one listening socket across server workers to ensure Windows shutdown
+  completes. Keep unchanged lockfiles in place and retry temporary Windows
+  publication conflicts without overwriting external changes.
+- Add differential regression tests and toolchain CI.
+
 ## 0.3.5 - 2026-09-10
 
 ### Added

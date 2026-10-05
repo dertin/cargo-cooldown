@@ -56,6 +56,12 @@ cargo cooldown check --manifest-path member/Cargo.toml
 They do not apply to workspace-wide runs such as `--workspace`,
 `--package a --package b`, or `--exclude`.
 
+## Backend
+
+`[cooldown].backend` selects `auto` (default), `filtered`, `native`, or `legacy`.
+`COOLDOWN_BACKEND` overrides the file. See [backends](backends.md) for the support
+matrix, conservative native equivalence conditions, and cache lifecycle.
+
 ## Supported Keys
 
 `cooldown.toml` supports:
@@ -65,6 +71,7 @@ They do not apply to workspace-wide runs such as `--workspace`,
 - `[registries.<name>].min-publish-age`
 - `[registries.<name>].index`
 - `[cooldown].incompatible-publish-age`
+- `[cooldown].backend`
 - `[cooldown].fallback-accept`
 - `[cooldown].lockfile-baseline`
 - `now`
@@ -81,6 +88,7 @@ Environment variables:
 - `CARGO_REGISTRY_MIN_PUBLISH_AGE`
 - `CARGO_REGISTRIES_<name>_MIN_PUBLISH_AGE`
 - `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE`
+- `COOLDOWN_BACKEND`
 - `COOLDOWN_FALLBACK_ACCEPT`
 - `COOLDOWN_LOCKFILE_BASELINE`
 - `COOLDOWN_NOW`

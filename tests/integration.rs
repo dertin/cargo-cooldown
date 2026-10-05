@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -144,6 +144,7 @@ fn targeted_update_cools_h2_transitive_across_workspace_members() {
     .unwrap();
     let manifest = root.join("one/Cargo.toml");
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+    command.env("COOLDOWN_BACKEND", "legacy");
     let output = command
         .args(["update", "-p", "h2", "--manifest-path"])
         .arg(&manifest)
@@ -287,6 +288,32 @@ fn fills_missing_pubtime_via_fallback_api() {
 }
 
 #[test]
+fn legacy_refreshes_registry_config_after_cargo_populates_a_cold_index() {
+    for command in ["check", "update"] {
+        let mut harness = TestHarness::new(RegistryMode::MissingPubtimeWithApi).unwrap();
+        harness.generate_lockfile();
+        fs::remove_dir_all(harness.cargo_home.join("registry")).unwrap();
+        harness.server.reset_counts();
+        let cache = harness.temp_root.join("cooldown-cache");
+        let output = harness.run_command(
+            &[command],
+            &[
+                LOCKFILE_BASELINE_IGNORE,
+                ("COOLDOWN_BACKEND", "legacy"),
+                ("COOLDOWN_CACHE_DIR", cache.to_str().unwrap()),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(harness.locked_version(), OLD_VERSION);
+        assert!(harness.server.api_hits() > 0);
+    }
+}
+
+#[test]
 fn fails_closed_when_registry_lacks_release_time_metadata() {
     let mut harness =
         TestHarness::new(RegistryMode::MissingPubtimeNoApi).expect("harness should build");
@@ -333,6 +360,7 @@ fn fallback_update_keeps_cargo_updated_lockfile_when_metadata_is_missing() {
         &["update"],
         &[
             ("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", "fallback"),
+            ("COOLDOWN_BACKEND", "auto"),
             ("COOLDOWN_FALLBACK_ACCEPT", "auto"),
         ],
     );
@@ -556,6 +584,52 @@ fn guard_command_cools_dependency_added_by_manifest_change() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(harness.locked_version(), OLD_VERSION);
+}
+
+#[test]
+fn existing_lockfile_guard_preserves_unselected_member_scope() {
+    for backend in ["auto", "legacy", "filtered"] {
+        let mut harness = TestHarness::new_without_dependencies(RegistryMode::PubtimeOnly).unwrap();
+        let root_manifest = harness.workspace_dir.join("Cargo.toml");
+        let mut manifest = fs::read_to_string(&root_manifest).unwrap();
+        manifest.push_str("\n[workspace]\nmembers = [\"member\"]\nresolver = \"3\"\n");
+        fs::write(root_manifest, manifest).unwrap();
+        let member = harness.workspace_dir.join("member");
+        fs::create_dir_all(member.join("src")).unwrap();
+        fs::write(member.join("src/lib.rs"), "").unwrap();
+        let member_manifest = |version: &str| {
+            format!(
+                "[package]\nname = \"unselected\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\n{CRATE_NAME} = {{ version = \"={version}\", registry = \"{REGISTRY_NAME}\" }}\n"
+            )
+        };
+        fs::write(member.join("Cargo.toml"), member_manifest(OLD_VERSION)).unwrap();
+        harness.generate_lockfile();
+        let original = fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap();
+        fs::write(member.join("Cargo.toml"), member_manifest(FRESH_VERSION)).unwrap();
+
+        let output = harness.run_command(
+            &["check", "--package", "cooldown-workspace"],
+            &[("COOLDOWN_BACKEND", backend)],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if backend == "filtered" {
+            assert!(!output.status.success(), "{stderr}");
+            assert!(stderr.contains("existing lockfile uses legacy"), "{stderr}");
+            assert_eq!(
+                original,
+                fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap()
+            );
+        } else {
+            assert!(output.status.success(), "{backend}: {stderr}");
+            assert_eq!(harness.locked_version(), FRESH_VERSION);
+        }
+        assert!(
+            !harness
+                .workspace_dir
+                .join("Cargo.lock.cooldown-hold")
+                .exists()
+        );
+    }
 }
 
 #[test]
@@ -884,6 +958,7 @@ fn cooldown_update_holds_real_lockfile_and_uses_temp_workspace() {
     let manifest_path = harness.workspace_dir.join("Cargo.toml");
 
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .env("COOLDOWN_BACKEND", "legacy")
         .args([
             "update",
             "--manifest-path",
@@ -1051,6 +1126,7 @@ fn cooldown_update_can_restore_a_fresh_baseline_version() {
 
     write_root_manifest(&workspace_dir, &[(CRATE_NAME, "1")]).expect("manifest should update");
     let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .env("COOLDOWN_BACKEND", "legacy")
         .arg("update")
         .current_dir(&workspace_dir)
         .env("CARGO_HOME", &cargo_home)
@@ -1162,6 +1238,7 @@ fn assert_cooldown_update_with_existing_fresh_lockfile_version(
     .expect("manifest should update");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+    command.env("COOLDOWN_BACKEND", "legacy");
     command
         .arg("update")
         .current_dir(&workspace_dir)
@@ -1174,7 +1251,7 @@ fn assert_cooldown_update_with_existing_fresh_lockfile_version(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let output = command.output().expect("cargo-cooldown should run");
+    let output = cooldown_output(&mut command);
 
     let final_lockfile =
         fs::read_to_string(workspace_dir.join("Cargo.lock")).expect("lockfile should exist");
@@ -1800,6 +1877,38 @@ fn deny_policy_rejects_resolver_constrained_versions_outside_selected_scope() {
     assert!(stderr.contains("scopedfresh 1.0.1"), "{stderr}");
 }
 
+// Bound fixture commands so a platform-specific hang reports its captured
+// diagnostics instead of leaving the entire CI job waiting indefinitely.
+fn cooldown_output(command: &mut Command) -> Output {
+    let stdout = tempfile::NamedTempFile::new().unwrap();
+    let stderr = tempfile::NamedTempFile::new().unwrap();
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(stdout.reopen().unwrap())
+        .stderr(stderr.reopen().unwrap())
+        .spawn()
+        .expect("cargo-cooldown should run");
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Output {
+                status,
+                stdout: fs::read(stdout.path()).unwrap(),
+                stderr: fs::read(stderr.path()).unwrap(),
+            };
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "cargo-cooldown exceeded 60 seconds: {}",
+                fs::read_to_string(stderr.path()).unwrap()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 struct TestHarness {
     _temp_dir: TempDir,
     temp_root: PathBuf,
@@ -1896,6 +2005,7 @@ impl TestHarness {
         include_default_min_publish_age: bool,
     ) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command.env("COOLDOWN_BACKEND", "legacy");
         command
             .args(args)
             .current_dir(current_dir)
@@ -1911,7 +2021,7 @@ impl TestHarness {
             command.env(key, value);
         }
 
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn runner_dir(&self) -> PathBuf {
@@ -2075,6 +2185,7 @@ impl CoordinatedBundleHarness {
 
     fn run_cooldown(&self, extra_env: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command.env("COOLDOWN_BACKEND", "legacy");
         command
             .arg("check")
             .current_dir(&self.workspace_dir)
@@ -2088,7 +2199,7 @@ impl CoordinatedBundleHarness {
             command.env(key, value);
         }
 
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn locked_version(&self, crate_name: &str) -> String {
@@ -2225,6 +2336,7 @@ impl BacktrackingBundleHarness {
 
     fn run_cooldown(&self) -> Output {
         Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .env("COOLDOWN_BACKEND", "legacy")
             .arg("check")
             .current_dir(&self.workspace_dir)
             .env("CARGO_HOME", &self.cargo_home)
@@ -2330,6 +2442,7 @@ impl DuplicateNameBatchHarness {
 
     fn run_cooldown(&self) -> Output {
         Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .env("COOLDOWN_BACKEND", "legacy")
             .arg("check")
             .current_dir(&self.workspace_dir)
             .env("CARGO_HOME", &self.cargo_home)
@@ -2458,6 +2571,7 @@ impl DuplicateTransitiveBatchHarness {
 
     fn run_cooldown(&self) -> Output {
         Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .env("COOLDOWN_BACKEND", "legacy")
             .arg("check")
             .current_dir(&self.workspace_dir)
             .env("CARGO_HOME", &self.cargo_home)
@@ -2573,6 +2687,7 @@ impl DependencyChainHarness {
 
     fn run_cooldown(&self, extra_env: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command.env("COOLDOWN_BACKEND", "legacy");
         command
             .arg("check")
             .current_dir(&self.workspace_dir)
@@ -2586,7 +2701,7 @@ impl DependencyChainHarness {
             command.env(key, value);
         }
 
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn lockfile_contents(&self) -> String {
@@ -2676,6 +2791,7 @@ impl MultiPassBenchmarkHarness {
 
     fn run_cooldown(&self, extra_env: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command.env("COOLDOWN_BACKEND", "legacy");
         command
             .arg("check")
             .current_dir(&self.workspace_dir)
@@ -2691,7 +2807,7 @@ impl MultiPassBenchmarkHarness {
             command.env(key, value);
         }
 
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn lockfile_contents(&self) -> String {
@@ -2774,6 +2890,7 @@ index = "sparse+{base_url}/index/"
 
     fn run_cooldown(&self) -> Output {
         Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .env("COOLDOWN_BACKEND", "legacy")
             .arg("check")
             .current_dir(&self.workspace_dir)
             .env("CARGO_HOME", &self.cargo_home)
@@ -2861,17 +2978,18 @@ impl ScopedConflictHarness {
             }
         }
 
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn run_cooldown_requiring_prompt(&self) -> Output {
         let mut command = self.cooldown_command();
         command.env("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", "fallback");
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn cooldown_command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command.env("COOLDOWN_BACKEND", "legacy");
         command
             .args(["check", "--package", SCOPED_MEMBER_A])
             .current_dir(&self.workspace_dir)
@@ -2940,6 +3058,7 @@ impl WorkspaceMemberHarness {
 
     fn run_cooldown(&self) -> Output {
         Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .env("COOLDOWN_BACKEND", "legacy")
             .args([
                 "check",
                 "--manifest-path",
@@ -3089,13 +3208,24 @@ impl ServerState {
 }
 
 fn handle_stream(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
-    let bytes = stream.read(&mut buffer)?;
-    if bytes == 0 {
-        return Ok(());
+    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+        let bytes = stream.read(&mut buffer)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        request.extend_from_slice(&buffer[..bytes]);
+        if request.len() > 8192 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP headers too large",
+            ));
+        }
     }
-
-    let request = String::from_utf8_lossy(&buffer[..bytes]);
+    let request = String::from_utf8_lossy(&request);
     let mut parts = request
         .lines()
         .next()
@@ -4002,5 +4132,1247 @@ impl RegistryMode {
             self,
             RegistryMode::PubtimeOnly | RegistryMode::MissingPubtimeWithApi
         )
+    }
+}
+
+#[test]
+fn filtered_matches_legacy_for_fresh_updates_and_baseline() {
+    for baseline in ["floor", "ignore"] {
+        for command in [vec!["update"], vec!["update", "-p", CRATE_NAME]] {
+            let mut expected = None;
+            for backend in ["legacy", "filtered"] {
+                let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+                harness.generate_lockfile();
+                let output = harness.run_command(
+                    &command,
+                    &[
+                        ("COOLDOWN_BACKEND", backend),
+                        ("COOLDOWN_LOCKFILE_BASELINE", baseline),
+                    ],
+                );
+                assert!(
+                    output.status.success(),
+                    "{backend}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let actual = harness.locked_version();
+                if let Some(expected) = &expected {
+                    assert_eq!(&actual, expected, "{baseline} {command:?}");
+                } else {
+                    expected = Some(actual);
+                }
+                let output = Command::new("cargo")
+                    .args(["check", "--locked"])
+                    .current_dir(&harness.workspace_dir)
+                    .env("CARGO_HOME", &harness.cargo_home)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "normal Cargo: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let lock = fs::read_to_string(harness.workspace_dir.join("Cargo.lock")).unwrap();
+                assert!(!lock.contains("cooldown-filter"));
+            }
+        }
+    }
+}
+
+#[test]
+fn filtered_initial_lockfile_and_dry_run_preserve_publication_contract() {
+    let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+    let output = harness.run_command(
+        &["update", "--dry-run"],
+        &[("COOLDOWN_BACKEND", "filtered")],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!harness.workspace_dir.join("Cargo.lock").exists());
+    assert!(
+        !harness
+            .workspace_dir
+            .join("Cargo.lock.cooldown-hold")
+            .exists()
+    );
+    let output = harness.run_command(&["check"], &[("COOLDOWN_BACKEND", "filtered")]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+}
+
+#[test]
+fn filtered_recomputes_cached_policy_and_time() {
+    let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+    for (now, expected) in [
+        (NOW, OLD_VERSION),
+        (NOW, OLD_VERSION),
+        ("2026-04-05T00:00:00Z", FRESH_VERSION),
+        (NOW, OLD_VERSION),
+    ] {
+        let output = harness.run_command(
+            &["update"],
+            &[
+                ("COOLDOWN_BACKEND", "filtered"),
+                LOCKFILE_BASELINE_IGNORE,
+                ("COOLDOWN_NOW", now),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(harness.locked_version(), expected);
+    }
+}
+
+#[test]
+fn filtered_honors_exact_and_package_exceptions() {
+    for rule in [
+        format!("[[allow.exact]]\ncrate='{CRATE_NAME}'\nversion='{FRESH_VERSION}'\n"),
+        format!("[[allow.package]]\ncrates=['{CRATE_NAME}']\nminutes=0\n"),
+    ] {
+        let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+        fs::write(harness.workspace_dir.join("cooldown.toml"), rule).unwrap();
+        let output = harness.run_command(&["update"], &[("COOLDOWN_BACKEND", "filtered")]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(harness.locked_version(), FRESH_VERSION);
+    }
+}
+
+#[test]
+fn forced_filtered_rejects_offline_without_changing_lockfile() {
+    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+    harness.generate_lockfile();
+    let before = fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap();
+    let output = harness.run_command(
+        &["update", "--offline"],
+        &[("COOLDOWN_BACKEND", "filtered")],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("require legacy"));
+    assert_eq!(
+        before,
+        fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap()
+    );
+}
+
+#[test]
+fn filtered_generate_lockfile_retains_cooled_result() {
+    let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+    let output = harness.run_command(&["generate-lockfile"], &[("COOLDOWN_BACKEND", "filtered")]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+}
+
+#[test]
+fn filtered_and_legacy_neutralize_coexisting_native_policy() {
+    for backend in ["filtered", "legacy"] {
+        let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+        let path = harness.workspace_dir.join(".cargo/config.toml");
+        let mut contents = fs::read_to_string(&path).unwrap();
+        contents
+            .push_str("min-publish-age='600 days'\n[resolver]\nincompatible-publish-age='deny'\n");
+        fs::write(path, contents).unwrap();
+        fs::write(
+            harness.workspace_dir.join("cooldown.toml"),
+            format!("[[allow.exact]]\ncrate='{CRATE_NAME}'\nversion='{FRESH_VERSION}'\n"),
+        )
+        .unwrap();
+        let output = harness.run_command(&["update"], &[("COOLDOWN_BACKEND", backend)]);
+        assert!(
+            output.status.success(),
+            "{backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(harness.locked_version(), FRESH_VERSION);
+    }
+}
+
+#[test]
+fn rustup_directory_override_survives_isolation_and_metadata() {
+    let toolchain = Command::new("rustup")
+        .args(["which", "rustc"])
+        .output()
+        .unwrap();
+    assert!(
+        toolchain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&toolchain.stderr)
+    );
+    let rustc = PathBuf::from(String::from_utf8(toolchain.stdout).unwrap().trim());
+    let toolchain_root = rustc.parent().unwrap().parent().unwrap();
+    let rustup_name = format!("rustup{}", std::env::consts::EXE_SUFFIX);
+    let rustup = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|dir| dir.join(&rustup_name))
+        .find(|path| path.is_file())
+        .expect("test toolchain must provide rustup");
+
+    let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+    let rustup_home = harness.temp_root.join("rustup-home");
+    let bin = harness.temp_root.join("proxy-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let rustup_proxy = bin.join(&rustup_name);
+    fs::copy(rustup, &rustup_proxy).unwrap();
+    // Rustup proxies can be hard links, including on Windows.
+    for name in ["cargo", "rustc", "rustdoc"] {
+        fs::hard_link(
+            &rustup_proxy,
+            bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .unwrap();
+    }
+    let linked = Command::new(&rustup_proxy)
+        .args(["toolchain", "link", "selected"])
+        .arg(toolchain_root)
+        .env("RUSTUP_HOME", &rustup_home)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output()
+        .unwrap();
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+    let settings = toml::toml! {
+        version = "12"
+        default_toolchain = "unavailable-default"
+        profile = "minimal"
+    };
+    fs::write(
+        rustup_home.join("settings.toml"),
+        toml::to_string(&settings).unwrap(),
+    )
+    .unwrap();
+    let override_result = Command::new(&rustup_proxy)
+        .args(["override", "set", "selected", "--path"])
+        .arg(&harness.workspace_dir)
+        .env("RUSTUP_HOME", &rustup_home)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .output()
+        .unwrap();
+    assert!(
+        override_result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&override_result.stderr)
+    );
+
+    // Path dependencies also exercise discovery through Cargo metadata.
+    let local = harness.workspace_dir.join("local");
+    fs::create_dir_all(local.join("src")).unwrap();
+    fs::write(
+        local.join("Cargo.toml"),
+        "[package]\nname='local'\nversion='0.1.0'\nedition='2024'\n",
+    )
+    .unwrap();
+    fs::write(local.join("src/lib.rs"), "").unwrap();
+    let manifest = harness.workspace_dir.join("Cargo.toml");
+    let contents = fs::read_to_string(&manifest).unwrap();
+    fs::write(
+        &manifest,
+        format!("{contents}\nlocal = {{ path = 'local' }}\n"),
+    )
+    .unwrap();
+
+    for backend in ["filtered", "legacy"] {
+        let _ = fs::remove_file(harness.workspace_dir.join("Cargo.lock"));
+        for args in [vec!["update"], vec!["check", "--locked"]] {
+            let selected_backend = if args[0] == "check" {
+                "legacy"
+            } else {
+                backend
+            };
+            let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+                .args(&args)
+                .current_dir(&harness.workspace_dir)
+                .env("PATH", prepend_to_path(&bin).unwrap())
+                .env("CARGO_HOME", &harness.cargo_home)
+                .env("RUSTUP_HOME", &rustup_home)
+                .env_remove("RUSTUP_TOOLCHAIN")
+                .env_remove("RUSTC")
+                .env_remove("RUSTDOC")
+                .env("COOLDOWN_NOW", NOW)
+                .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
+                .env("COOLDOWN_BACKEND", selected_backend)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{backend} {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(harness.locked_version(), OLD_VERSION);
+        }
+    }
+}
+
+fn native_test_supported(version: &semver::Version) -> bool {
+    version.major > 1
+        || version.major == 1
+            && (version.minor > 100
+                || version.minor == 100
+                    && (version.pre.is_empty() || version.pre.as_str().starts_with("beta")))
+}
+
+#[test]
+fn native_test_gate_includes_stabilized_channels_and_later_versions() {
+    for (version, expected) in [
+        ("1.99.0", false),
+        ("1.100.0-nightly", false),
+        ("1.100.0-beta.1", true),
+        ("1.100.0", true),
+        ("1.101.0-nightly", true),
+        ("2.0.0", true),
+    ] {
+        assert_eq!(
+            native_test_supported(&semver::Version::parse(version).unwrap()),
+            expected,
+            "{version}"
+        );
+    }
+}
+
+#[test]
+fn native_uses_selected_cargo_and_enforces_age_when_supported() {
+    let version = Command::new("cargo").arg("--version").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let parsed = semver::Version::parse(version.split_whitespace().nth(1).unwrap()).unwrap();
+    let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+    let cutoff = chrono::DateTime::parse_from_rfc3339("2026-03-15T00:00:00Z").unwrap();
+    let seconds = (chrono::Utc::now() - cutoff.with_timezone(&chrono::Utc)).num_seconds();
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .arg("update")
+        .current_dir(&harness.workspace_dir)
+        .env("CARGO_HOME", &harness.cargo_home)
+        .env("COOLDOWN_BACKEND", "native")
+        .env("COOLDOWN_VERBOSE", "true")
+        .env_remove("COOLDOWN_NOW")
+        .env(
+            "CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE",
+            format!("{seconds} seconds"),
+        )
+        .output()
+        .unwrap();
+    if !native_test_supported(&parsed) {
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("Cargo >= 1.100"));
+    } else {
+        assert!(
+            output.status.success(),
+            "{version}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(harness.locked_version(), OLD_VERSION);
+        assert_eq!(
+            harness.server.state.count_for("/index/co/ol/cooldowndep"),
+            1
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("requests=0 bytes=0"));
+    }
+}
+
+#[test]
+fn auto_uses_legacy_for_missing_timestamps_and_forced_filtered_is_atomic() {
+    let harness = TestHarness::new(RegistryMode::MissingPubtimeWithApi).unwrap();
+    let output = harness.run_command(&["update"], &[("COOLDOWN_BACKEND", "filtered")]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing pubtime"));
+    assert!(!harness.workspace_dir.join("Cargo.lock").exists());
+    assert!(
+        !harness
+            .workspace_dir
+            .join("Cargo.lock.cooldown-hold")
+            .exists()
+    );
+    let output = harness.run_command(&["update"], &[("COOLDOWN_BACKEND", "auto")]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+}
+
+#[test]
+fn filtered_rejects_unavailable_registry_without_publishing() {
+    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+    harness.generate_lockfile();
+    let before = fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap();
+    harness.server.shutdown.store(true, Ordering::Relaxed);
+    if let Some(handle) = harness.server.handle.take() {
+        handle.join().unwrap();
+    }
+    let output = harness.run_command(
+        &["update"],
+        &[("COOLDOWN_BACKEND", "filtered"), LOCKFILE_BASELINE_IGNORE],
+    );
+    assert!(!output.status.success());
+    assert_eq!(
+        before,
+        fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap()
+    );
+    assert!(
+        !harness
+            .workspace_dir
+            .join("Cargo.lock.cooldown-hold")
+            .exists()
+    );
+}
+
+#[test]
+fn filtered_resolves_coupled_transitives_in_one_cargo_resolution() {
+    for (backend, policy) in [
+        ("filtered", "deny"),
+        ("auto", "fallback"),
+        ("legacy", "fallback"),
+    ] {
+        let harness = CoordinatedBundleHarness::new().unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .arg("update")
+            .current_dir(&harness.workspace_dir)
+            .env("CARGO_HOME", &harness.cargo_home)
+            .env("COOLDOWN_BACKEND", backend)
+            .env("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", policy)
+            .env("COOLDOWN_NOW", NOW)
+            .env("COOLDOWN_VERBOSE", "true")
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for name in [BUNDLE_A_NAME, BUNDLE_B_NAME, BUNDLE_SHARED_NAME] {
+            assert_eq!(harness.locked_version(name), BUNDLE_OLD_VERSION);
+        }
+        if backend != "legacy" {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("cargo_resolutions=1"));
+        }
+    }
+}
+
+#[test]
+fn filtered_unsatisfiable_requirement_preserves_original_lockfile() {
+    let mut harness =
+        TestHarness::new_with_dependency_req(RegistryMode::PubtimeOnly, &format!("={OLD_VERSION}"))
+            .unwrap();
+    harness.generate_lockfile();
+    let before = fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap();
+    harness.set_dependency_requirement(&format!("={FRESH_VERSION}"));
+    let output = harness.run_command(&["update"], &[("COOLDOWN_BACKEND", "filtered")]);
+    assert!(!output.status.success());
+    assert_eq!(
+        before,
+        fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap()
+    );
+    assert!(
+        !harness
+            .workspace_dir
+            .join("Cargo.lock.cooldown-hold")
+            .exists()
+    );
+}
+
+#[test]
+fn filtered_preserves_yanked_status() {
+    let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+    {
+        let mut responses = harness.server.state.responses.lock().unwrap();
+        let index = responses.get_mut("/index/co/ol/cooldowndep").unwrap();
+        let text = String::from_utf8(index.body.clone()).unwrap();
+        let lines: Vec<String> = text
+            .lines()
+            .map(|line| {
+                let mut entry: serde_json::Value = serde_json::from_str(line).unwrap();
+                if entry["vers"] == OLD_VERSION {
+                    entry["yanked"] = true.into();
+                }
+                serde_json::to_string(&entry).unwrap()
+            })
+            .collect();
+        index.body = lines.join("\n").into_bytes();
+    }
+    let output = harness.run_command(&["update"], &[("COOLDOWN_BACKEND", "filtered")]);
+    assert!(!output.status.success());
+    assert!(!harness.workspace_dir.join("Cargo.lock").exists());
+}
+
+#[test]
+fn filtered_concurrent_updates_preserve_lockfile_and_release_marker() {
+    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+    harness.generate_lockfile();
+    let children: Vec<_> = (0..2)
+        .map(|_| {
+            Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+                .arg("update")
+                .current_dir(&harness.workspace_dir)
+                .env("CARGO_HOME", &harness.cargo_home)
+                .env("COOLDOWN_BACKEND", "filtered")
+                .env("COOLDOWN_NOW", NOW)
+                .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
+                .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+    assert!(
+        !harness
+            .workspace_dir
+            .join("Cargo.lock.cooldown-hold")
+            .exists()
+    );
+}
+
+#[test]
+fn filtered_targeted_update_matches_legacy_for_unselected_fresh_dependency() {
+    for backend in ["legacy", "filtered"] {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("workspace");
+        let home = temp.path().join("cargo-home");
+        fs::create_dir_all(&home).unwrap();
+        let server = RegistryServer::with_crates(
+            ["firstdep", "seconddep"]
+                .into_iter()
+                .map(|name| {
+                    PublishedCrate::new(
+                        name,
+                        vec![
+                            PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                            PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                        ],
+                    )
+                })
+                .collect(),
+            false,
+        )
+        .unwrap();
+        create_workspace_with_dependencies(
+            &root,
+            &server,
+            &[("firstdep", "1"), ("seconddep", "1")],
+        )
+        .unwrap();
+        write_registry_config(&home, &server).unwrap();
+        let initial = Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(&root)
+            .env("CARGO_HOME", &home)
+            .output()
+            .unwrap();
+        assert!(initial.status.success());
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .args(["update", "-p", "firstdep"])
+            .current_dir(&root)
+            .env("CARGO_HOME", &home)
+            .env("COOLDOWN_BACKEND", backend)
+            .env("COOLDOWN_NOW", NOW)
+            .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{backend}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+        for name in ["firstdep", "seconddep"] {
+            assert_eq!(
+                parse_lockfile_version(&lock, name).as_deref(),
+                Some(OLD_VERSION)
+            );
+        }
+    }
+}
+
+#[test]
+fn filtered_does_not_treat_partial_network_failure_as_a_missing_dependency() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("cargo-home");
+    let server = RegistryServer::with_crates(
+        vec![PublishedCrate::new(
+            "networkroot",
+            vec![
+                PackageVersion::new("1.0.0", Some(OLD_PUBTIME), false),
+                PackageVersion::new("1.1.0", Some(OLD_PUBTIME), false)
+                    .with_dependencies(vec![RegistryDependency::new("networkleaf", "1")]),
+            ],
+        )],
+        false,
+    )
+    .unwrap();
+    server.state.responses.lock().unwrap().insert(
+        "/index/ne/tw/networkleaf".to_string(),
+        ResponseSpec {
+            status: "503 Service Unavailable",
+            content_type: "text/plain",
+            body: b"temporary outage".to_vec(),
+        },
+    );
+    fs::create_dir_all(&home).unwrap();
+    write_registry_config(&home, &server).unwrap();
+    create_workspace_with_dependencies(&root, &server, &[("networkroot", "=1.0.0")]).unwrap();
+    let initial = Command::new("cargo")
+        .arg("generate-lockfile")
+        .current_dir(&root)
+        .env("CARGO_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(initial.status.success());
+    let before = fs::read(root.join("Cargo.lock")).unwrap();
+    create_workspace_with_dependencies(&root, &server, &[("networkroot", "1")]).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .arg("update")
+        .current_dir(&root)
+        .env("CARGO_HOME", &home)
+        .env("COOLDOWN_BACKEND", "filtered")
+        .env("COOLDOWN_NOW", NOW)
+        .env("COOLDOWN_HTTP_RETRIES", "0")
+        .env("CARGO_NET_RETRY", "0")
+        .env("COOLDOWN_CACHE_DIR", home.join("cooldown-cache"))
+        .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "an upstream outage must not silently select an older graph: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(before, fs::read(root.join("Cargo.lock")).unwrap());
+    assert!(!root.join("Cargo.lock.cooldown-hold").exists());
+}
+
+#[test]
+fn native_rechecks_baseline_after_waiting_for_another_writer() {
+    let version = Command::new("cargo").arg("--version").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let parsed = semver::Version::parse(version.split_whitespace().nth(1).unwrap()).unwrap();
+    if !native_test_supported(&parsed) {
+        return;
+    }
+    for backend in ["native", "auto"] {
+        let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+        harness.generate_lockfile();
+        let lockfile = harness.workspace_dir.join("Cargo.lock");
+        let baseline = fs::read(&lockfile).unwrap();
+        fs::remove_file(&lockfile).unwrap();
+        let marker = harness.workspace_dir.join("Cargo.lock.cooldown-hold");
+        fs::write(&marker, "test writer holds coordination\n").unwrap();
+        let stderr = tempfile::NamedTempFile::new().unwrap();
+        let cutoff = chrono::DateTime::parse_from_rfc3339("2026-03-15T00:00:00Z").unwrap();
+        let seconds = (chrono::Utc::now() - cutoff.with_timezone(&chrono::Utc)).num_seconds();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .arg("update")
+            .current_dir(&harness.workspace_dir)
+            .env("CARGO_HOME", &harness.cargo_home)
+            .env("COOLDOWN_BACKEND", backend)
+            .env_remove("COOLDOWN_NOW")
+            .env(
+                "CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE",
+                format!("{seconds} seconds"),
+            )
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr.reopen().unwrap())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fs::read_to_string(stderr.path())
+            .unwrap()
+            .contains("Waiting for cargo-cooldown lock")
+        {
+            if Instant::now() >= deadline || child.try_wait().unwrap().is_some() {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "did not reach coordination wait: {}",
+                    fs::read_to_string(stderr.path()).unwrap()
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        fs::write(&lockfile, &baseline).unwrap();
+        fs::remove_file(marker).unwrap();
+        let status = child.wait().unwrap();
+        if backend == "native" {
+            assert!(
+                !status.success(),
+                "native must reject the newly observed baseline"
+            );
+            assert_eq!(baseline, fs::read(&lockfile).unwrap());
+        } else {
+            assert!(
+                status.success(),
+                "{}",
+                fs::read_to_string(stderr.path()).unwrap()
+            );
+            assert_eq!(harness.locked_version(), FRESH_VERSION);
+        }
+    }
+}
+
+#[test]
+fn native_cached_index_keeps_missing_timestamp_rejection() {
+    let version = Command::new("cargo").arg("--version").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let parsed = semver::Version::parse(version.split_whitespace().nth(1).unwrap()).unwrap();
+    if !native_test_supported(&parsed) {
+        return;
+    }
+    let harness = TestHarness::new(RegistryMode::MissingPubtimeWithApi).unwrap();
+    let cutoff = chrono::DateTime::parse_from_rfc3339("2026-03-15T00:00:00Z").unwrap();
+    let seconds = (chrono::Utc::now() - cutoff.with_timezone(&chrono::Utc)).num_seconds();
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .arg("update")
+        .current_dir(&harness.workspace_dir)
+        .env("CARGO_HOME", &harness.cargo_home)
+        .env(
+            "COOLDOWN_CACHE_DIR",
+            harness.cargo_home.join("cooldown-cache"),
+        )
+        .env("COOLDOWN_BACKEND", "native")
+        .env_remove("COOLDOWN_NOW")
+        .env(
+            "CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE",
+            format!("{seconds} seconds"),
+        )
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("missing pubtime"));
+    assert!(!harness.workspace_dir.join("Cargo.lock").exists());
+    assert!(
+        !harness
+            .workspace_dir
+            .join("Cargo.lock.cooldown-hold")
+            .exists()
+    );
+    assert_eq!(
+        harness.server.state.count_for("/index/co/ol/cooldowndep"),
+        1
+    );
+}
+
+#[test]
+fn long_cooldown_package_exception_does_not_relax_other_packages() {
+    for days in [30, 90, 180] {
+        for backend in ["filtered", "legacy"] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("workspace");
+            let home = temp.path().join("cargo-home");
+            fs::create_dir_all(&home).unwrap();
+            let server = RegistryServer::with_crates(
+                ["urgentdep", "ordinarydep"]
+                    .into_iter()
+                    .map(|name| {
+                        PublishedCrate::new(
+                            name,
+                            vec![
+                                PackageVersion::new("1.0.0", Some("2025-01-01T00:00:00Z"), false),
+                                PackageVersion::new("1.1.0", Some("2026-03-15T00:00:00Z"), false),
+                            ],
+                        )
+                    })
+                    .collect(),
+                false,
+            )
+            .unwrap();
+            create_workspace_with_dependencies(
+                &root,
+                &server,
+                &[("urgentdep", "=1.1.0"), ("ordinarydep", "1")],
+            )
+            .unwrap();
+            write_registry_config(&home, &server).unwrap();
+            let run_update = || {
+                Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+                    .arg("update")
+                    .current_dir(&root)
+                    .env("CARGO_HOME", &home)
+                    .env("COOLDOWN_CACHE_DIR", home.join("cooldown-cache"))
+                    .env("COOLDOWN_BACKEND", backend)
+                    .env("COOLDOWN_NOW", NOW)
+                    .env(
+                        "CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE",
+                        format!("{days} days"),
+                    )
+                    .output()
+                    .unwrap()
+            };
+            let denied = run_update();
+            assert!(!denied.status.success(), "{backend} {days}");
+            assert!(!root.join("Cargo.lock").exists());
+            fs::write(
+                root.join("cooldown.toml"),
+                "[[allow.package]]\ncrate='urgentdep'\nmin-publish-age='7 days'\n",
+            )
+            .unwrap();
+            let allowed = run_update();
+            assert!(
+                allowed.status.success(),
+                "{backend} {days}: {}",
+                String::from_utf8_lossy(&allowed.stderr)
+            );
+            let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+            assert_eq!(
+                parse_lockfile_version(&lock, "urgentdep").as_deref(),
+                Some("1.1.0")
+            );
+            assert_eq!(
+                parse_lockfile_version(&lock, "ordinarydep").as_deref(),
+                Some("1.0.0")
+            );
+            assert!(!root.join("Cargo.lock.cooldown-hold").exists());
+        }
+    }
+}
+
+#[test]
+fn filtered_parallel_baseline_failure_preserves_lockfile_and_releases_coordination() {
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("workspace");
+    let home = temp.path().join("cargo-home");
+    fs::create_dir_all(&home).unwrap();
+    let names: Vec<String> = (0..12)
+        .map(|index| format!("paralleldep{index:02}"))
+        .collect();
+    let server = RegistryServer::with_crates(
+        names
+            .iter()
+            .map(|name| {
+                PublishedCrate::new(
+                    name,
+                    vec![
+                        PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+                        PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+                    ],
+                )
+            })
+            .collect(),
+        false,
+    )
+    .unwrap();
+    let dependencies: Vec<(&str, &str)> = names.iter().map(|name| (name.as_str(), "1")).collect();
+    create_workspace_with_dependencies(&root, &server, &dependencies).unwrap();
+    write_registry_config(&home, &server).unwrap();
+    let initial = Command::new("cargo")
+        .arg("generate-lockfile")
+        .current_dir(&root)
+        .env("CARGO_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(initial.status.success());
+    let before = fs::read(root.join("Cargo.lock")).unwrap();
+    let path = "/index/pa/ra/paralleldep06";
+    let original = server
+        .state
+        .responses
+        .lock()
+        .unwrap()
+        .insert(
+            path.to_string(),
+            ResponseSpec {
+                status: "503 Service Unavailable",
+                content_type: "text/plain",
+                body: b"temporary outage".to_vec(),
+            },
+        )
+        .unwrap();
+    let run_update = || {
+        Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .args(["update", "-p", "paralleldep00"])
+            .current_dir(&root)
+            .env("CARGO_HOME", &home)
+            .env("COOLDOWN_CACHE_DIR", home.join("cooldown-cache"))
+            .env("COOLDOWN_BACKEND", "filtered")
+            .env("COOLDOWN_NOW", NOW)
+            .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
+            .env("COOLDOWN_HTTP_RETRIES", "0")
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
+            .output()
+            .unwrap()
+    };
+    let failed = run_update();
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("503"));
+    assert_eq!(before, fs::read(root.join("Cargo.lock")).unwrap());
+    assert!(!root.join("Cargo.lock.cooldown-hold").exists());
+    server
+        .state
+        .responses
+        .lock()
+        .unwrap()
+        .insert(path.to_string(), original);
+    let recovered = run_update();
+    assert!(
+        recovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    let lock = fs::read_to_string(root.join("Cargo.lock")).unwrap();
+    for name in names {
+        assert_eq!(
+            parse_lockfile_version(&lock, &name).as_deref(),
+            Some(OLD_VERSION)
+        );
+    }
+    assert!(!root.join("Cargo.lock.cooldown-hold").exists());
+}
+
+#[test]
+fn fallback_uses_filtered_when_no_age_exception_is_needed() {
+    for baseline in ["floor", "ignore"] {
+        for existing in [false, true] {
+            for targeted in [false, true] {
+                let mut expected = None;
+                for backend in ["legacy", "auto", "filtered"] {
+                    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+                    if existing {
+                        harness.generate_lockfile();
+                    }
+                    let args = if targeted {
+                        vec!["update", "-p", CRATE_NAME]
+                    } else {
+                        vec!["update"]
+                    };
+                    let output = harness.run_command(
+                        &args,
+                        &[
+                            ("COOLDOWN_BACKEND", backend),
+                            ("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", "fallback"),
+                            ("COOLDOWN_LOCKFILE_BASELINE", baseline),
+                            ("COOLDOWN_VERBOSE", "true"),
+                            ("COOLDOWN_FALLBACK_ACCEPT", "prompt"),
+                        ],
+                    );
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    assert!(
+                        output.status.success(),
+                        "{backend} {baseline} {existing} {targeted}: {stderr}"
+                    );
+                    let version = harness.locked_version();
+                    if let Some(expected) = &expected {
+                        assert_eq!(&version, expected);
+                    } else {
+                        expected = Some(version);
+                    }
+                    if backend != "legacy" {
+                        assert!(stderr.contains("backend=Filtered"), "{stderr}");
+                        assert!(stderr.contains("cargo_resolutions=1"), "{stderr}");
+                        assert!(!stderr.contains("retrying with legacy"), "{stderr}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fallback_retries_legacy_only_with_its_original_acceptance_rules() {
+    let harness = TestHarness::new_with_dependency_req(
+        RegistryMode::PubtimeOnly,
+        &format!("={FRESH_VERSION}"),
+    )
+    .unwrap();
+    let run = |backend, accept, dry_run| {
+        let args = if dry_run {
+            vec!["update", "--dry-run"]
+        } else {
+            vec!["update"]
+        };
+        harness.run_command(
+            &args,
+            &[
+                ("COOLDOWN_BACKEND", backend),
+                ("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", "fallback"),
+                ("COOLDOWN_FALLBACK_ACCEPT", accept),
+                ("COOLDOWN_VERBOSE", "true"),
+            ],
+        )
+    };
+    let forced = run("filtered", "auto", false);
+    assert!(!forced.status.success());
+    assert!(
+        String::from_utf8_lossy(&forced.stderr).contains("fallback requires legacy"),
+        "{}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert!(!harness.workspace_dir.join("Cargo.lock").exists());
+    let prompt = run("auto", "prompt", false);
+    let stderr = String::from_utf8_lossy(&prompt.stderr);
+    assert!(!prompt.status.success());
+    assert!(stderr.contains("retrying with legacy"), "{stderr}");
+    assert!(stderr.contains("COOLDOWN_FALLBACK_ACCEPT=auto"), "{stderr}");
+    assert!(!harness.workspace_dir.join("Cargo.lock").exists());
+    assert!(
+        !harness
+            .workspace_dir
+            .join("Cargo.lock.cooldown-hold")
+            .exists()
+    );
+    let dry = run("auto", "auto", true);
+    assert!(
+        dry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    assert!(!harness.workspace_dir.join("Cargo.lock").exists());
+    let accepted = run("auto", "auto", false);
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    assert_eq!(harness.locked_version(), FRESH_VERSION);
+    let stderr = String::from_utf8_lossy(&accepted.stderr);
+    assert_eq!(
+        stderr
+            .matches("created isolated cooldown workspace")
+            .count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.contains("same isolated workspace"), "{stderr}");
+    assert!(
+        !harness
+            .workspace_dir
+            .join("Cargo.lock.cooldown-hold")
+            .exists()
+    );
+}
+
+#[test]
+fn fallback_retry_keeps_existing_lockfile_until_accepted() {
+    let mut harness =
+        TestHarness::new_with_dependency_req(RegistryMode::PubtimeOnly, &format!("={OLD_VERSION}"))
+            .unwrap();
+    harness.generate_lockfile();
+    let original = fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap();
+    harness.set_dependency_requirement(&format!("={FRESH_VERSION}"));
+    for (accept, dry_run) in [("prompt", false), ("auto", true), ("auto", false)] {
+        let mut args = vec!["update", "--package", CRATE_NAME];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let output = harness.run_command(
+            &args,
+            &[
+                ("COOLDOWN_BACKEND", "auto"),
+                ("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", "fallback"),
+                ("COOLDOWN_FALLBACK_ACCEPT", accept),
+                ("COOLDOWN_VERBOSE", "true"),
+            ],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), accept == "auto", "{stderr}");
+        assert!(stderr.contains("same isolated workspace"), "{stderr}");
+        if dry_run || accept == "prompt" {
+            assert_eq!(
+                original,
+                fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap()
+            );
+        } else {
+            assert_eq!(harness.locked_version(), FRESH_VERSION);
+        }
+        assert!(
+            !harness
+                .workspace_dir
+                .join("Cargo.lock.cooldown-hold")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn fallback_filtered_network_error_never_relaxes_age_policy() {
+    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+    harness.generate_lockfile();
+    let before = fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap();
+    harness.server.state.responses.lock().unwrap().insert(
+        "/index/co/ol/cooldowndep".to_string(),
+        ResponseSpec {
+            status: "503 Service Unavailable",
+            content_type: "text/plain",
+            body: b"temporary outage".to_vec(),
+        },
+    );
+    let output = harness.run_command(
+        &["update"],
+        &[
+            ("COOLDOWN_BACKEND", "auto"),
+            ("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", "fallback"),
+            ("COOLDOWN_FALLBACK_ACCEPT", "auto"),
+            ("COOLDOWN_VERBOSE", "true"),
+            ("CARGO_NET_RETRY", "0"),
+            LOCKFILE_BASELINE_IGNORE,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("503"), "{stderr}");
+    assert!(!stderr.contains("retrying with legacy"), "{stderr}");
+    assert_eq!(
+        before,
+        fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap()
+    );
+    assert!(
+        !harness
+            .workspace_dir
+            .join("Cargo.lock.cooldown-hold")
+            .exists()
+    );
+}
+
+#[test]
+fn test_registry_waits_for_complete_request_headers() {
+    let server = RegistryServer::new(RegistryMode::PubtimeOnly).unwrap();
+    let mut client =
+        TcpStream::connect(server.base_url().strip_prefix("http://").unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    client
+        .write_all(b"GET /index/config.json HTTP/1.1\r\nHost: localhost\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(server.state.count_for("/index/config.json"), 0);
+    client.write_all(b"Connection: close\r\n\r\n").unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(server.state.count_for("/index/config.json"), 1);
+}
+
+#[test]
+fn filtered_honors_cargo_http_proxy_and_environment_precedence() {
+    for use_env in [false, true] {
+        let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+        let upstream = "http://cooldown.invalid";
+        {
+            let mut responses = harness.server.state.responses.lock().unwrap();
+            let proxied: Vec<_> = responses
+                .iter()
+                .map(|(path, response)| (format!("{upstream}{path}"), response.clone()))
+                .collect();
+            responses.extend(proxied);
+        }
+        let file_proxy = if use_env {
+            "http://127.0.0.1:9"
+        } else {
+            harness.server.base_url().strip_prefix("http://").unwrap()
+        };
+        fs::write(harness.workspace_dir.join(".cargo/config.toml"), format!(
+            "[registries.{REGISTRY_NAME}]\nindex = 'sparse+{upstream}/index/'\n[http]\nproxy = '{file_proxy}'\n"
+        )).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command
+            .arg("update")
+            .current_dir(&harness.workspace_dir)
+            .env("CARGO_HOME", &harness.cargo_home)
+            .env("COOLDOWN_BACKEND", "filtered")
+            .env("COOLDOWN_NOW", NOW)
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
+            .env("CARGO_NET_RETRY", "0");
+        for name in [
+            "CARGO_HTTP_PROXY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            command.env_remove(name);
+        }
+        if use_env {
+            command.env("CARGO_HTTP_PROXY", harness.server.base_url());
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "env={use_env}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(harness.locked_version(), OLD_VERSION);
+        assert!(
+            harness
+                .server
+                .state
+                .count_for(&format!("{upstream}/index/co/ol/cooldowndep"))
+                > 0
+        );
+    }
+}
+
+#[test]
+fn auto_retries_legacy_for_unconfigured_cross_registry_metadata() {
+    for backend in ["filtered", "auto"] {
+        let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+        {
+            let mut responses = harness.server.state.responses.lock().unwrap();
+            let response = responses.get_mut("/index/co/ol/cooldowndep").unwrap();
+            let body = String::from_utf8(response.body.clone()).unwrap();
+            let mut unrelated: serde_json::Value =
+                serde_json::from_str(body.lines().next().unwrap()).unwrap();
+            unrelated["vers"] = serde_json::json!("9.0.0");
+            unrelated["deps"] = serde_json::json!([{
+                "name": "foreign", "req": "1", "features": [], "optional": false,
+                "default_features": true, "target": null, "kind": "normal",
+                "registry": "sparse+http://unconfigured.invalid/index/"
+            }]);
+            response.body = format!("{body}\n{unrelated}\n").into_bytes();
+        }
+        let output = harness.run_command(
+            &["update"],
+            &[("COOLDOWN_BACKEND", backend), ("COOLDOWN_VERBOSE", "true")],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if backend == "auto" {
+            assert!(output.status.success(), "{stderr}");
+            assert_eq!(harness.locked_version(), OLD_VERSION);
+            assert!(stderr.contains("retrying with legacy"), "{stderr}");
+        } else {
+            assert!(!output.status.success());
+            assert!(
+                stderr.contains("cross-registry dependency is not configured; use legacy"),
+                "{stderr}"
+            );
+            assert!(!harness.workspace_dir.join("Cargo.lock").exists());
+        }
+        assert!(
+            !harness
+                .workspace_dir
+                .join("Cargo.lock.cooldown-hold")
+                .exists()
+        );
     }
 }

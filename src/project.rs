@@ -3,7 +3,6 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::Metadata;
@@ -59,7 +58,148 @@ impl ProjectContext {
             all: workspace.all,
             exclude: workspace.exclude.clone(),
         };
+        if let Some(project) = Self::discover_simple(&selection)? {
+            return Ok(project);
+        }
         Self::discover(&selection)
+    }
+
+    /// Avoid a Cargo process for explicit, path-free workspace layouts. Complex
+    /// membership, inherited target paths and external checkouts retain Cargo's
+    /// authoritative metadata discovery.
+    fn discover_simple(selection: &RuntimeSelection) -> Result<Option<Self>> {
+        let cwd = fs::canonicalize(env::current_dir()?)?;
+        let current_manifest = match &selection.manifest_path {
+            Some(path) => path.clone(),
+            None => match cwd
+                .ancestors()
+                .map(|dir| dir.join("Cargo.toml"))
+                .find(|path| path.is_file())
+            {
+                Some(path) => path,
+                None => return Ok(None),
+            },
+        };
+        let current_manifest = fs::canonicalize(current_manifest)?;
+        let current_dir = current_manifest
+            .parent()
+            .context("manifest has no parent")?;
+        let current: toml::Value = toml::from_str(&fs::read_to_string(&current_manifest)?)?;
+        if current
+            .get("package")
+            .and_then(|p| p.get("workspace"))
+            .is_some()
+        {
+            return Ok(None);
+        }
+        let mut workspace_root = current_dir.to_path_buf();
+        let mut root = current.clone();
+        for ancestor in current_dir.ancestors() {
+            let path = ancestor.join("Cargo.toml");
+            if !path.is_file() {
+                continue;
+            }
+            let manifest: toml::Value = toml::from_str(&fs::read_to_string(&path)?)?;
+            if manifest.get("workspace").is_some() {
+                workspace_root = ancestor.to_path_buf();
+                root = manifest;
+                break;
+            }
+        }
+        let cargo_config = cargo_config(&cwd)?;
+        if cargo_config.get("include").is_some()
+            || cargo_config
+                .get("build")
+                .and_then(|b| b.get("target-dir"))
+                .is_some()
+            || env::var_os("CARGO_BUILD_TARGET_DIR").is_some()
+        {
+            return Ok(None);
+        }
+        let kind = if root.get("workspace").is_some() {
+            ProjectKind::Workspace
+        } else {
+            ProjectKind::Crate
+        };
+        let mut manifests = Vec::new();
+        if root.get("package").is_some() {
+            manifests.push(workspace_root.join("Cargo.toml"));
+        }
+        if let Some(workspace) = root.get("workspace") {
+            if workspace.get("exclude").is_some() {
+                return Ok(None);
+            }
+            if let Some(members) = workspace.get("members") {
+                let Some(members) = members.as_array() else {
+                    return Ok(None);
+                };
+                for member in members {
+                    let Some(member) = member.as_str() else {
+                        return Ok(None);
+                    };
+                    if member.contains(['*', '?', '[', ']']) {
+                        return Ok(None);
+                    }
+                    let path = fs::canonicalize(workspace_root.join(member).join("Cargo.toml"))?;
+                    if !path.starts_with(&workspace_root) {
+                        return Ok(None);
+                    }
+                    manifests.push(path);
+                }
+            }
+        }
+        manifests.sort();
+        manifests.dedup();
+        let mut members = Vec::new();
+        for path in manifests {
+            let manifest: toml::Value = toml::from_str(&fs::read_to_string(&path)?)?;
+            if contains_path_key(&manifest) || contains_path_key(&root) {
+                return Ok(None);
+            }
+            let Some(name) = manifest
+                .get("package")
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+            else {
+                return Ok(None);
+            };
+            members.push(ProjectMember {
+                name: name.to_string(),
+                dir: path
+                    .parent()
+                    .context("manifest has no parent")?
+                    .to_path_buf(),
+                manifest_path: path,
+            });
+        }
+        if current_manifest != workspace_root.join("Cargo.toml")
+            && !members
+                .iter()
+                .any(|member| member.manifest_path == current_manifest)
+        {
+            return Ok(None);
+        }
+        let target_directory = match env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
+            Some(path) if path.is_absolute() => path,
+            Some(path) => cwd.join(path),
+            None => workspace_root.join("target"),
+        };
+        let target_directory = normalize_target_directory(&target_directory);
+        let active_member = determine_active_member(
+            selection,
+            &cwd,
+            &current_manifest,
+            &workspace_root,
+            &members,
+        );
+        Ok(Some(Self {
+            cwd,
+            kind,
+            workspace_root,
+            target_directory,
+            members,
+            active_member,
+        }))
     }
 
     /// Discover project context for `cargo cooldown init`.
@@ -81,25 +221,27 @@ impl ProjectContext {
     }
 
     fn discover(selection: &RuntimeSelection) -> Result<Self> {
-        let cwd = env::current_dir().context("failed to determine current directory")?;
-        let current_manifest = locate_project(selection.manifest_path.as_deref(), false)?;
-        let workspace_manifest = locate_project(selection.manifest_path.as_deref(), true)?;
-        let workspace_root = workspace_manifest
-            .parent()
-            .map(Path::to_path_buf)
-            .with_context(|| {
-                format!(
-                    "workspace manifest does not have a parent directory: {}",
-                    workspace_manifest.display()
-                )
-            })?;
+        let cwd = fs::canonicalize(env::current_dir()?)
+            .context("failed to determine current directory")?;
+        let current_manifest = match &selection.manifest_path {
+            Some(path) => path.clone(),
+            None => cwd
+                .ancestors()
+                .map(|dir| dir.join("Cargo.toml"))
+                .find(|path| path.is_file())
+                .context("could not find Cargo.toml")?,
+        };
+        let current_manifest =
+            fs::canonicalize(current_manifest).context("invalid manifest path")?;
         let metadata = read_project_metadata(selection.manifest_path.as_deref())?;
+        let workspace_root = fs::canonicalize(&metadata.workspace_root)?;
+        let workspace_manifest = workspace_root.join("Cargo.toml");
         let kind = if manifest_declares_workspace(&workspace_manifest)? {
             ProjectKind::Workspace
         } else {
             ProjectKind::Crate
         };
-        let members = workspace_members(&metadata);
+        let members = workspace_members(&metadata)?;
         let active_member = determine_active_member(
             selection,
             &cwd,
@@ -112,7 +254,7 @@ impl ProjectContext {
             cwd,
             kind,
             workspace_root,
-            target_directory: metadata.target_directory.clone().into_std_path_buf(),
+            target_directory: normalize_target_directory(metadata.target_directory.as_std_path()),
             members,
             active_member,
         })
@@ -132,6 +274,16 @@ impl ProjectContext {
     }
 }
 
+fn contains_path_key(value: &toml::Value) -> bool {
+    match value {
+        toml::Value::Table(table) => {
+            table.contains_key("path") || table.values().any(contains_path_key)
+        }
+        toml::Value::Array(values) => values.iter().any(contains_path_key),
+        _ => false,
+    }
+}
+
 fn same_existing_path(left: &Path, right: &Path) -> Result<bool> {
     let left = fs::canonicalize(left)
         .with_context(|| format!("failed to canonicalize {}", left.display()))?;
@@ -140,38 +292,13 @@ fn same_existing_path(left: &Path, right: &Path) -> Result<bool> {
     Ok(left == right)
 }
 
-fn locate_project(manifest_path: Option<&Path>, workspace: bool) -> Result<PathBuf> {
-    let mut command = Command::new("cargo");
-    command.arg("locate-project");
-    if workspace {
-        command.arg("--workspace");
-    }
-    command.args(["--message-format", "plain"]);
-    if let Some(path) = manifest_path {
-        command.arg("--manifest-path").arg(path);
-    }
-
-    let output = command
-        .output()
-        .context("failed to run `cargo locate-project`")?;
-    if !output.status.success() {
-        bail!(
-            "`cargo locate-project{}` failed: {}",
-            if workspace { " --workspace" } else { "" },
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let manifest = String::from_utf8(output.stdout)
-        .context("`cargo locate-project` returned non-utf8 output")?;
-    Ok(PathBuf::from(manifest.trim()))
-}
-
 fn read_project_metadata(manifest_path: Option<&Path>) -> Result<Metadata> {
+    crate::backend::record_cargo_invocation();
     let mut command = cargo_metadata::MetadataCommand::new();
     if let Some(path) = manifest_path {
         command.manifest_path(path);
     }
+    crate::backend::configure_metadata(&mut command);
     command.no_deps();
     command
         .exec()
@@ -186,21 +313,39 @@ fn manifest_declares_workspace(path: &Path) -> Result<bool> {
     Ok(manifest.get("workspace").is_some())
 }
 
-fn workspace_members(metadata: &Metadata) -> Vec<ProjectMember> {
+// Resolve Cargo's path aliases even when the target directory does not exist.
+// Leave inaccessible target paths to Cargo; discovery itself does not need them.
+fn normalize_target_directory(path: &Path) -> PathBuf {
+    for ancestor in path.ancestors() {
+        match fs::canonicalize(ancestor) {
+            Ok(resolved) => {
+                if let Ok(suffix) = path.strip_prefix(ancestor) {
+                    return resolved.join(suffix);
+                }
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => break,
+        }
+    }
+    path.to_path_buf()
+}
+
+fn workspace_members(metadata: &Metadata) -> Result<Vec<ProjectMember>> {
     metadata
         .workspace_packages()
         .iter()
         .map(|package| {
-            let manifest_path = package.manifest_path.clone().into_std_path_buf();
+            let manifest_path = fs::canonicalize(&package.manifest_path)?;
             let dir = manifest_path
                 .parent()
                 .map(Path::to_path_buf)
                 .expect("workspace package manifest should have a parent directory");
-            ProjectMember {
+            Ok(ProjectMember {
                 name: package.name.to_string(),
                 manifest_path,
                 dir,
-            }
+            })
         })
         .collect()
 }
@@ -358,6 +503,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn target_normalization_preserves_unresolvable_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("loop");
+        std::os::unix::fs::symlink("loop", &target).unwrap();
+        assert_eq!(normalize_target_directory(&target), target);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn same_existing_path_matches_symlinked_root() {
         let temp_dir = tempfile::tempdir().unwrap();
         let real_root = temp_dir.path().join("workspace");
@@ -366,5 +520,94 @@ mod tests {
         std::os::unix::fs::symlink(&real_root, &link_root).unwrap();
 
         assert!(same_existing_path(&link_root, &real_root).unwrap());
+    }
+}
+
+pub(crate) fn cargo_config(cwd: &Path) -> Result<toml::Table> {
+    let mut dirs: Vec<PathBuf> = cwd.ancestors().map(|p| p.join(".cargo")).collect();
+    dirs.reverse();
+    if let Some(home) = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|p| p.join(".cargo")))
+    {
+        dirs.insert(0, home);
+    }
+    let mut merged = toml::Table::new();
+    for dir in dirs {
+        let path = if dir.join("config").exists() {
+            dir.join("config")
+        } else {
+            dir.join("config.toml")
+        };
+        if path.exists() {
+            let table: toml::Table = toml::from_str(&fs::read_to_string(path)?)?;
+            merge_tables(&mut merged, table);
+        }
+    }
+    Ok(merged)
+}
+
+fn merge_tables(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        if let (Some(existing), Some(table)) = (
+            base.get_mut(&key).and_then(|v| v.as_table_mut()),
+            value.as_table(),
+        ) {
+            merge_tables(existing, table.clone());
+        } else {
+            base.insert(key, value);
+        }
+    }
+}
+
+#[cfg(test)]
+mod simple_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_workspace_discovery_matches_cargo_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(
+            temp.path().join("Cargo.toml"),
+            "[workspace]\nmembers=['one','two']\nresolver='2'\n",
+        )
+        .unwrap();
+        for name in ["one", "two"] {
+            let dir = temp.path().join(name);
+            fs::create_dir_all(dir.join("src")).unwrap();
+            fs::write(dir.join("src/lib.rs"), "").unwrap();
+            fs::write(
+                dir.join("Cargo.toml"),
+                format!("[package]\nname='{name}'\nversion='0.1.0'\nedition='2024'\n"),
+            )
+            .unwrap();
+        }
+        let manifests = vec![temp.path().join("one/Cargo.toml")];
+        #[cfg(unix)]
+        let links = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        let manifests = {
+            let alias = links.path().join("workspace-link");
+            std::os::unix::fs::symlink(temp.path(), &alias).unwrap();
+            let mut manifests = manifests;
+            manifests.push(alias.join("one/Cargo.toml"));
+            manifests
+        };
+        for manifest in manifests {
+            let selection = RuntimeSelection {
+                manifest_path: Some(manifest),
+                ..RuntimeSelection::default()
+            };
+            let Some(simple) = ProjectContext::discover_simple(&selection).unwrap() else {
+                // A user-level target-dir config legitimately requires Cargo discovery.
+                return;
+            };
+            let cargo = ProjectContext::discover(&selection).unwrap();
+            assert_eq!(simple.workspace_root, cargo.workspace_root);
+            assert_eq!(simple.target_directory, cargo.target_directory);
+            assert_eq!(simple.active_member, cargo.active_member);
+            assert_eq!(simple.members, cargo.members);
+            assert_eq!(cargo.active_member.as_ref().unwrap().name, "one");
+        }
     }
 }

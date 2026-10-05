@@ -15,3 +15,8 @@ target
 
 # Punchcard - https://github.com/dertin/punchcard
 .punchcard/
+# Python benchmark bytecode
+__pycache__/
+
+# Local benchmark runs, profiles and working notes
+/benchmarks/

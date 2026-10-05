@@ -10,8 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal, Write as _};
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -21,6 +20,7 @@ use semver::{Comparator, Op, Version, VersionReq};
 use tracing::{debug, trace};
 
 use crate::config::{Config, FallbackAccept, IncompatiblePublishAgePolicy};
+use crate::isolation::IsolatedWorkspace;
 use crate::lockfile::LockfileSnapshot;
 use crate::metadata::{read_metadata, read_metadata_locked};
 use crate::registry::{RegistryStore, ensure_timeline_available};
@@ -54,25 +54,6 @@ macro_rules! timed_debug {
     }};
 }
 
-/// Capture the user-visible `Cargo.lock` before cooldown mutates anything.
-///
-/// The snapshot stores the file contents and an index of registry package
-/// versions. Later phases use it to restore the exact starting state on failure
-/// and, under the default `floor` baseline, to avoid downgrading versions that
-/// were already locked before this command started.
-pub fn capture_initial_lockfile(config: &Config, manifest: &Manifest) -> Result<LockfileSnapshot> {
-    let mut registry_store = RegistryStore::new(config)?;
-    let lockfile_path = workspace_lockfile_path(manifest)?;
-    // Capture the user-visible starting lockfile before any Cargo command is allowed
-    // to generate or rewrite it during this cooldown run.
-    LockfileSnapshot::capture(&lockfile_path, &mut registry_store)
-}
-
-/// Restore a lockfile snapshot into the active workspace.
-pub fn restore_lockfile_snapshot(snapshot: &LockfileSnapshot, manifest: &Manifest) -> Result<()> {
-    snapshot.restore(&workspace_lockfile_path(manifest)?)
-}
-
 /// Run the full cooldown resolver from an already captured baseline.
 ///
 /// This is the main execution loop. It receives the immutable command context,
@@ -83,27 +64,27 @@ pub fn restore_lockfile_snapshot(snapshot: &LockfileSnapshot, manifest: &Manifes
 /// restores the initial lockfile before returning an error.
 pub fn run_pinning_flow_with_snapshot(
     config: &Config,
-    manifest: &Manifest,
+    isolated: &IsolatedWorkspace,
     workspace: &Workspace,
     features: &Features,
     initial_lockfile: LockfileSnapshot,
     success_message: &str,
+    registry_store: &mut RegistryStore,
 ) -> Result<()> {
-    let mut registry_store = RegistryStore::new(config)?;
-    let lockfile_path = workspace_lockfile_path(manifest)?;
+    let manifest = isolated.manifest();
+    let lockfile_path = isolated.lockfile_path();
     let mut ui = UserOutput::new(config.verbose);
     let result = (|| {
         // Missing lockfiles are created only after the initial snapshot exists, so the
         // default baseline always compares against the pre-run lockfile state.
         ui.set_phase("Preparing cooldown scan...");
-        ensure_lockfile(manifest, &lockfile_path)?;
+        ensure_lockfile(manifest, lockfile_path)?;
         let now = config.now_override.unwrap_or_else(Utc::now);
         let mut fallback_skips: HashMap<String, String> = HashMap::new();
         let mut constraint_edges: HashMap<String, HashSet<String>> = HashMap::new();
         let mut inspection_cache: HashMap<ReleaseInspectionKey, ReleaseInspection> = HashMap::new();
         ui.set_phase("Capturing cooldown baseline...");
-        let cooldown_start_lockfile =
-            LockfileSnapshot::capture(&lockfile_path, &mut registry_store)?;
+        let cooldown_start_lockfile = LockfileSnapshot::capture(lockfile_path, registry_store)?;
         let mut pass = 0usize;
         let mut next_metadata = None;
 
@@ -125,6 +106,8 @@ pub fn run_pinning_flow_with_snapshot(
                 timed_debug!("cargo metadata", { read_metadata(manifest, features) })?
             };
             if pass == 1 {
+                // Baseline capture can precede Cargo's first index download.
+                registry_store.refresh_registry_contexts();
                 ui.set_phase("Scanning dependency graph...");
             }
             let snapshot = timed_debug!("snapshot from metadata", {
@@ -138,7 +121,7 @@ pub fn run_pinning_flow_with_snapshot(
                     &snapshot,
                     config,
                     &initial_lockfile,
-                    &mut registry_store,
+                    registry_store,
                     &mut inspection_cache,
                     &fallback_skips,
                     now,
@@ -191,12 +174,12 @@ pub fn run_pinning_flow_with_snapshot(
                             workspace,
                             features,
                             config,
-                            lockfile_path: &lockfile_path,
+                            lockfile_path,
                             initial_lockfile: &initial_lockfile,
                             requirement_origins,
                             now,
                         },
-                        &mut registry_store,
+                        registry_store,
                         &fallback_fresh_entries,
                         &constraint_edges,
                     )?
@@ -204,8 +187,7 @@ pub fn run_pinning_flow_with_snapshot(
                     continue 'outer;
                 }
                 ui.finish_progress();
-                let final_lockfile =
-                    LockfileSnapshot::capture(&lockfile_path, &mut registry_store)?;
+                let final_lockfile = LockfileSnapshot::capture(lockfile_path, registry_store)?;
                 emit_final_run_summary(&mut FinalRunSummaryCtx {
                     ui: &ui,
                     config,
@@ -213,7 +195,7 @@ pub fn run_pinning_flow_with_snapshot(
                     cooldown_start_lockfile: &cooldown_start_lockfile,
                     final_lockfile: &final_lockfile,
                     crate_states,
-                    registry_store: &mut registry_store,
+                    registry_store,
                     inspection_cache: &mut inspection_cache,
                     fallback_skips: &fallback_skips,
                     now,
@@ -245,14 +227,14 @@ pub fn run_pinning_flow_with_snapshot(
                     workspace,
                     features,
                     config,
-                    lockfile_path: &lockfile_path,
+                    lockfile_path,
                     initial_lockfile: &initial_lockfile,
                     crate_states,
                     version_requirements,
                     requirement_origins,
                     now,
                 },
-                &mut registry_store,
+                registry_store,
                 &fresh_entries,
             )? {
                 next_metadata = Some(metadata);
@@ -291,7 +273,7 @@ pub fn run_pinning_flow_with_snapshot(
     ui.finish_progress();
 
     if let Err(err) = result {
-        if let Err(restore_err) = initial_lockfile.restore(&lockfile_path) {
+        if let Err(restore_err) = initial_lockfile.restore(lockfile_path) {
             return Err(restore_err.context(format!("original cooldown error: {err:#}")));
         }
         return Err(err);
@@ -1066,7 +1048,7 @@ fn ensure_lockfile(manifest: &Manifest, lockfile_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let mut command = Command::new("cargo");
+    let mut command = crate::backend::own_cargo();
     command.arg("generate-lockfile");
     if let Some(path) = &manifest.manifest_path {
         command.arg("--manifest-path").arg(path);
@@ -1077,38 +1059,6 @@ fn ensure_lockfile(manifest: &Manifest, lockfile_path: &Path) -> Result<()> {
         bail!("failed to generate Cargo.lock via `cargo generate-lockfile`");
     }
     Ok(())
-}
-
-fn workspace_lockfile_path(manifest: &Manifest) -> Result<PathBuf> {
-    // Workspace members share the root Cargo.lock, so we ask Cargo for the
-    // effective workspace manifest instead of guessing from --manifest-path.
-    let mut command = Command::new("cargo");
-    command.args(["locate-project", "--workspace", "--message-format", "plain"]);
-    if let Some(path) = &manifest.manifest_path {
-        command.arg("--manifest-path").arg(path);
-    }
-
-    let output = command
-        .output()
-        .context("failed to run `cargo locate-project --workspace`")?;
-    if !output.status.success() {
-        bail!(
-            "failed to locate workspace manifest via `cargo locate-project --workspace`: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let manifest_path = String::from_utf8(output.stdout)
-        .context("`cargo locate-project --workspace` returned non-utf8 output")?;
-    let manifest_path = manifest_path.trim();
-    let workspace_manifest = PathBuf::from(manifest_path);
-    let workspace_root = workspace_manifest.parent().with_context(|| {
-        format!(
-            "`cargo locate-project --workspace` returned a manifest without a parent directory: {}",
-            workspace_manifest.display()
-        )
-    })?;
-    Ok(workspace_root.join("Cargo.lock"))
 }
 
 fn record_fallback_skip(
@@ -4757,6 +4707,7 @@ dependencies = [
     #[test]
     fn config_fixture_remains_constructible_for_executor_tests() {
         let config = Config {
+            backend: crate::backend::Backend::Legacy,
             min_publish_age_seconds: 60,
             registry_min_publish_age: Default::default(),
             incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,

@@ -161,6 +161,11 @@ impl RegistryStore {
         })
     }
 
+    /// Forget locations and API settings that Cargo may have refreshed on disk.
+    pub fn refresh_registry_contexts(&mut self) {
+        self.registries.clear();
+    }
+
     /// Resolve a Cargo metadata source ID into the effective registry context.
     ///
     /// Cargo may report git-index, sparse, mirrored, or replacement registry URLs.
@@ -365,15 +370,16 @@ pub fn is_registry_source(source: &str) -> bool {
     source.starts_with("registry+") || source.starts_with("sparse+")
 }
 
-fn resolve_registry_context(
+pub(crate) fn resolve_registry_context(
     source_id: &str,
     skip_registries: &[String],
 ) -> Result<RegistryContext> {
     let config_root = cargo_config_root();
     let is_crates_io = is_crates_io_source_id(source_id);
     let (index_root, effective_index_url) = if is_crates_io {
-        let index_url = IndexUrl::crates_io(config_root.clone(), None, None)?;
-        IndexLocation::new(index_url).into_parts()?
+        let version = crate::backend::cargo_version()?.to_string();
+        let index_url = IndexUrl::crates_io(config_root.clone(), None, Some(&version))?;
+        index_location(index_url)?
     } else {
         resolve_non_crates_io_index_location(source_id)?
     };
@@ -411,8 +417,14 @@ fn resolve_registry_context(
     })
 }
 
+fn index_location(url: IndexUrl<'_>) -> Result<(TamePathBuf, String)> {
+    let mut location = IndexLocation::new(url);
+    location.cargo_version = Some(crate::backend::cargo_version()?);
+    Ok(location.into_parts()?)
+}
+
 fn resolve_non_crates_io_index_location(source_id: &str) -> Result<(TamePathBuf, String)> {
-    let primary = IndexLocation::new(IndexUrl::from(source_id)).into_parts()?;
+    let primary = index_location(IndexUrl::from(source_id))?;
     let Some(url) = source_id.strip_prefix("registry+") else {
         return Ok(primary);
     };
@@ -420,7 +432,7 @@ fn resolve_non_crates_io_index_location(source_id: &str) -> Result<(TamePathBuf,
     // Cargo can represent a sparse registry in metadata as `registry+URL`.
     // Prefer the sparse cache if that is the cache Cargo actually populated.
     let sparse_source = format!("sparse+{url}");
-    let sparse = IndexLocation::new(IndexUrl::from(sparse_source.as_str())).into_parts()?;
+    let sparse = index_location(IndexUrl::from(sparse_source.as_str()))?;
 
     match (
         index_location_exists(&primary.0),
@@ -454,6 +466,46 @@ fn load_index_krate(context: &RegistryContext, crate_name: &str) -> Result<Optio
     };
 
     Ok(Some(krate))
+}
+
+pub(crate) fn cached_sparse_config(context: &RegistryContext) -> Result<Option<String>> {
+    match std::fs::read_to_string(context.index_root.join("config.json")) {
+        Ok(body) => Ok(Some(body)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Read Cargo's JSON entries without reserializing or dropping index fields.
+/// The caller holds Cargo's package-cache lock for a consistent snapshot.
+pub(crate) fn cached_sparse_crate(
+    context: &RegistryContext,
+    crate_name: &str,
+    lock: &FileLock,
+) -> Result<Option<String>> {
+    let cache = IndexCache::at_path(context.index_root.clone());
+    let Some(contents) = cache.read_cache_file(crate_name.try_into()?, lock)? else {
+        return Ok(None);
+    };
+    cached_index_lines(&contents).map(Some)
+}
+
+fn cached_index_lines(contents: &[u8]) -> Result<String> {
+    let entry = tame_index::index::cache::ValidCacheEntry::read(contents)?;
+    let mut fields = entry.version_entries.split(|byte| *byte == 0);
+    let mut body = String::with_capacity(entry.version_entries.len());
+    loop {
+        let version = fields.next().context("unterminated Cargo index cache")?;
+        if version.is_empty() {
+            anyhow::ensure!(fields.next().is_none(), "invalid Cargo index cache entry");
+            break;
+        }
+        let json = fields.next().context("missing Cargo index cache JSON")?;
+        anyhow::ensure!(!json.is_empty(), "empty Cargo index cache JSON");
+        body.push_str(std::str::from_utf8(json)?);
+        body.push('\n');
+    }
+    Ok(body)
 }
 
 fn index_krate_to_timeline(crate_name: &str, krate: &IndexKrate) -> Result<ReleaseTimeline> {
@@ -947,6 +999,7 @@ mod tests {
             index_root: TamePathBuf::new(),
         };
         let config = Config {
+            backend: crate::backend::Backend::Legacy,
             min_publish_age_seconds: 14 * 24 * 60 * 60,
             registry_min_publish_age: RegistryMinPublishAgeConfig {
                 crates_io_seconds: Some(5 * 24 * 60 * 60),
@@ -1001,6 +1054,7 @@ mod tests {
             vec![index_override, name_override],
         ] {
             let config = Config {
+                backend: crate::backend::Backend::Legacy,
                 min_publish_age_seconds: 14 * 24 * 60 * 60,
                 registry_min_publish_age: RegistryMinPublishAgeConfig {
                     crates_io_seconds: None,
@@ -1039,6 +1093,7 @@ mod tests {
             index_root: TamePathBuf::new(),
         };
         let config = Config {
+            backend: crate::backend::Backend::Legacy,
             min_publish_age_seconds: 0,
             registry_min_publish_age: RegistryMinPublishAgeConfig {
                 crates_io_seconds: None,
@@ -1190,5 +1245,35 @@ mod tests {
             timeline.releases[0].published_at,
             Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap())
         );
+    }
+
+    #[test]
+    fn cached_index_lines_preserve_unknown_fields_and_publish_times() {
+        let line = r#"{"name":"demo","vers":"1.0.0","pubtime":"2026-01-01T00:00:00Z","future-field":{"value":true}}"#;
+        let mut cache = vec![tame_index::index::cache::CURRENT_CACHE_VERSION];
+        cache.extend_from_slice(&tame_index::index::cache::INDEX_V_MAX.to_le_bytes());
+        cache.extend_from_slice(b"etag: test\0");
+        cache.extend_from_slice(b"1.0.0\0");
+        cache.extend_from_slice(line.as_bytes());
+        cache.push(0);
+        assert_eq!(cached_index_lines(&cache).unwrap(), format!("{line}\n"));
+    }
+
+    #[test]
+    fn cached_index_lines_reject_truncated_or_invalid_entries() {
+        let mut cache = vec![tame_index::index::cache::CURRENT_CACHE_VERSION];
+        cache.extend_from_slice(&tame_index::index::cache::INDEX_V_MAX.to_le_bytes());
+        cache.extend_from_slice(b"etag: test\0");
+        for tail in [
+            &b"1.0.0\0{}"[..],
+            &b"1.0.0\0"[..],
+            &b"1.0.0\0\0"[..],
+            &b"1.0.0\0\xff\0"[..],
+            &b"1.0.0\0{}\0\0extra\0"[..],
+        ] {
+            let mut invalid = cache.clone();
+            invalid.extend_from_slice(tail);
+            assert!(cached_index_lines(&invalid).is_err(), "{tail:?}");
+        }
     }
 }

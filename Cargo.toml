@@ -1,6 +1,6 @@
 [package]
 name = "cargo-cooldown"
-version = "0.3.5"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.91.1"
 description = "Cargo wrapper that enforces a cooldown window for freshly published registry crates for improved supply chain security."
@@ -36,11 +36,12 @@ clap = { version = "4.6.1", features = ["derive"] }
 clap-cargo = { version = "0.18.3", features = ["cargo_metadata"] }
 indicatif = "0.18.4"
 tempfile = "3"
+sha2 = "0.11"
+same-file = "1"
 
 [dev-dependencies]
 assert_fs = "1"
 flate2 = "1"
-sha2 = "0.11"
 tar = "0.4.45"
 
 [[bench]]
