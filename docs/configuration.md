@@ -56,6 +56,12 @@ cargo cooldown check --manifest-path member/Cargo.toml
 They do not apply to workspace-wide runs such as `--workspace`,
 `--package a --package b`, or `--exclude`.
 
+## Backend
+
+`[cooldown].backend` selects `auto` (default), `filtered`, `native`, or `legacy`.
+`COOLDOWN_BACKEND` overrides the file. See [backends](backends.md) for the support
+matrix, conservative native equivalence conditions, and cache lifecycle.
+
 ## Supported Keys
 
 `cooldown.toml` supports:

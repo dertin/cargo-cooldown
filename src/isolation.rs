@@ -81,6 +81,10 @@ impl IsolatedWorkspace {
         &self.manifest
     }
 
+    pub fn lockfile_path(&self) -> &Path {
+        &self.lockfile_path
+    }
+
     pub fn current_dir(&self) -> &Path {
         &self.current_dir
     }
@@ -133,6 +137,20 @@ impl IsolatedWorkspace {
             with_manifest.extend(rest.iter().cloned());
         }
         with_manifest
+    }
+
+    /// Reset a failed candidate while retaining the original coordination hold.
+    pub fn restore_initial_lockfile(&self) -> Result<()> {
+        self.real_lockfile.ensure_original_unchanged()?;
+        match &self.real_lockfile.original_contents {
+            Some(contents) => fs::write(&self.lockfile_path, contents)?,
+            None => match fs::remove_file(&self.lockfile_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            },
+        }
+        Ok(())
     }
 
     /// Publish the cooled temporary lockfile back to the real workspace.
@@ -701,6 +719,34 @@ mod tests {
             target_directory: root.join("target"),
             members: vec![],
             active_member: None,
+        }
+    }
+
+    #[test]
+    fn resetting_candidate_retains_coordination_and_exact_baseline() {
+        for original in [None, Some("version = 4\n# original\n")] {
+            let temp = tempfile::tempdir().unwrap();
+            let project = project_at(temp.path());
+            let real = temp.path().join("Cargo.lock");
+            if let Some(contents) = original {
+                fs::write(&real, contents).unwrap();
+            }
+            let isolated = IsolatedWorkspace::create(&project, &Manifest::default()).unwrap();
+            let marker = temp.path().join(LOCKFILE_MARKER_NAME);
+            let held = fs::read(&marker).unwrap();
+            fs::write(isolated.lockfile_path(), "partial candidate").unwrap();
+            isolated.restore_initial_lockfile().unwrap();
+            assert_eq!(fs::read(&marker).unwrap(), held);
+            assert_eq!(
+                fs::read_to_string(isolated.lockfile_path()).ok().as_deref(),
+                original
+            );
+            assert_eq!(fs::read_to_string(&real).ok().as_deref(), original);
+            fs::write(&real, "external writer").unwrap();
+            assert!(isolated.restore_initial_lockfile().is_err());
+            assert_eq!(fs::read_to_string(&real).unwrap(), "external writer");
+            drop(isolated);
+            assert!(!marker.exists());
         }
     }
 

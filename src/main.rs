@@ -6,12 +6,14 @@
 
 /// Parses and merges allow rules from `cooldown.toml`.
 mod allow_rules;
+mod backend;
 /// Provides a small JSON cache for registry API fallback responses.
 mod cache;
 /// Loads configuration from files and environment variables.
 mod config;
 /// Runs the cooldown lockfile rewrite and validation loop.
 mod executor;
+mod filtered;
 /// Implements the interactive `cargo cooldown init` setup wizard.
 mod init;
 /// Keeps speculative Cargo resolution away from the user-visible workspace.
@@ -33,7 +35,7 @@ mod ui;
 
 use std::ffi::OsString;
 use std::io::Write;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -44,7 +46,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::config::IncompatiblePublishAgePolicy;
 use crate::isolation::{CurrentDirGuard, IsolatedWorkspace};
+use crate::lockfile::LockfileSnapshot;
 use crate::project::ProjectContext;
+use crate::registry::RegistryStore;
 use crate::ui::PhaseStatus;
 
 #[derive(Debug, Parser)]
@@ -470,6 +474,7 @@ fn split_features(raw: &str) -> Vec<String> {
 }
 
 fn exit_with(code: i32) -> ! {
+    backend::report_counts();
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     std::process::exit(code);
@@ -498,7 +503,7 @@ fn run_initial_cargo_update(
     phase.set_message("Running cargo update...");
     let started = Instant::now();
     // Capture Cargo's output so the cooldown progress UI does not interleave with it.
-    let output = Command::new("cargo").args(forwarded_args).output()?;
+    let output = crate::backend::own_cargo_with_args(forwarded_args).output()?;
     debug!(
         target: "cargo_cooldown::timing",
         elapsed_ms = started.elapsed().as_millis(),
@@ -520,14 +525,17 @@ fn run_cooldown_guard_isolated(
     let isolated = IsolatedWorkspace::create(project, &cli.manifest)?;
     {
         let _cwd = CurrentDirGuard::enter(isolated.current_dir())?;
-        let initial_lockfile = executor::capture_initial_lockfile(config, isolated.manifest())?;
+        let mut registry_store = RegistryStore::new(config)?;
+        let initial_lockfile =
+            LockfileSnapshot::capture(isolated.lockfile_path(), &mut registry_store)?;
         executor::run_pinning_flow_with_snapshot(
             config,
-            isolated.manifest(),
+            &isolated,
             &cli.workspace,
             &cli.features,
             initial_lockfile,
             success_message,
+            &mut registry_store,
         )?;
     }
     isolated.publish_lockfile()
@@ -545,9 +553,19 @@ fn run_update_with_cooldown_isolation(
     forwarded_args: &[OsString],
     phase: &PhaseStatus,
 ) -> Result<IsolatedUpdateOutcome> {
-    let dry_run = is_dry_run_request(forwarded_args);
     phase.set_message("Preparing isolated workspace...");
     let isolated = IsolatedWorkspace::create(project, &cli.manifest)?;
+    run_update_in_isolation(config, cli, forwarded_args, phase, isolated)
+}
+
+fn run_update_in_isolation(
+    config: &config::Config,
+    cli: &Cli,
+    forwarded_args: &[OsString],
+    phase: &PhaseStatus,
+    isolated: IsolatedWorkspace,
+) -> Result<IsolatedUpdateOutcome> {
+    let dry_run = is_dry_run_request(forwarded_args);
     let cargo_update_args = if dry_run {
         without_dry_run_flag(forwarded_args)
     } else {
@@ -563,23 +581,28 @@ fn run_update_with_cooldown_isolation(
     {
         let _cwd = CurrentDirGuard::enter(isolated.current_dir())?;
         phase.set_message("Capturing lockfile baseline...");
-        let initial_lockfile = executor::capture_initial_lockfile(config, isolated.manifest())?;
+        let mut registry_store = RegistryStore::new(config)?;
+        let initial_lockfile =
+            LockfileSnapshot::capture(isolated.lockfile_path(), &mut registry_store)?;
         let status = run_initial_cargo_update(&temp_forwarded_args, phase)?;
         if !status.success() {
             return Ok(IsolatedUpdateOutcome::CargoFailed(
                 status.code().unwrap_or(1),
             ));
         }
-        let post_update_lockfile = executor::capture_initial_lockfile(config, isolated.manifest())?;
+        registry_store.refresh_registry_contexts();
+        let post_update_lockfile =
+            LockfileSnapshot::capture(isolated.lockfile_path(), &mut registry_store)?;
 
         if should_run_cooldown_guard(config) {
             match executor::run_pinning_flow_with_snapshot(
                 config,
-                isolated.manifest(),
+                &isolated,
                 &update_scan_workspace(),
                 &cli.features,
                 initial_lockfile,
                 success_message,
+                &mut registry_store,
             ) {
                 Ok(()) => {}
                 Err(err) => match config.incompatible_publish_age {
@@ -590,10 +613,7 @@ fn run_update_with_cooldown_isolation(
                     }
                     IncompatiblePublishAgePolicy::Fallback => {
                         warn!(error = %err, "cooldown guard failed after cargo update; continuing due to fallback policy");
-                        executor::restore_lockfile_snapshot(
-                            &post_update_lockfile,
-                            isolated.manifest(),
-                        )?;
+                        post_update_lockfile.restore(isolated.lockfile_path())?;
                     }
                     IncompatiblePublishAgePolicy::Deny => {
                         return Err(err);
@@ -620,11 +640,13 @@ fn run_update_with_cooldown_isolation(
 /// commands run cooldown first when it is enabled, then execute Cargo with the
 /// prepared lockfile.
 fn main() -> Result<()> {
+    let started = Instant::now();
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let cli = parse_cli(&raw_args);
 
     match &cli.command {
         CooldownCommand::Init => {
+            backend::initialize_cargo()?;
             if init_uses_runtime_selectors(&cli) {
                 eprintln!(
                     "`cargo cooldown init` only works from the current project root and does not accept Cargo selection flags."
@@ -641,6 +663,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         command => {
+            backend::initialize_cargo()?;
             let cargo_args = command
                 .cargo_args(&cli.forwarded_cargo_args)
                 .expect("non-wrapper command should provide Cargo args");
@@ -651,13 +674,39 @@ fn main() -> Result<()> {
             }
 
             if is_cargo_help_request(&forwarded_args) {
-                let status = Command::new("cargo").args(&forwarded_args).status()?;
+                let status = crate::backend::own_cargo_with_args(&forwarded_args).status()?;
                 exit_with(status.code().unwrap_or(1));
             }
 
             let project = ProjectContext::discover_for_runtime(&cli.manifest, &cli.workspace)?;
             let config = config::Config::load(&project)?;
             init_logging(config.verbose);
+            backend::report_counts_on_exit(config.verbose);
+
+            let discovery_ms = started.elapsed().as_millis();
+            let selection_started = Instant::now();
+            let backend = backend::select(&config, &project, &forwarded_args)?;
+            if config.verbose {
+                eprintln!(
+                    "cooldown: discovery_ms={discovery_ms} selection_ms={} selected_backend={backend:?}",
+                    selection_started.elapsed().as_millis()
+                );
+            }
+            if matches!(
+                backend,
+                backend::Backend::Filtered | backend::Backend::Native
+            ) {
+                match filtered::run(&config, &project, &cli, &forwarded_args, backend) {
+                    Ok(code) => exit_with(code),
+                    Err(err)
+                        if config.backend == backend::Backend::Auto
+                            && err.is::<filtered::Unsupported>() =>
+                    {
+                        debug!(reason = %err, "retrying with legacy backend");
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
 
             if is_update_command(&cargo_args) {
                 let phase = PhaseStatus::new(config.verbose);
@@ -698,7 +747,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            let status = Command::new("cargo").args(&forwarded_args).status()?;
+            let status = crate::backend::own_cargo_with_args(&forwarded_args).status()?;
             exit_with(status.code().unwrap_or(1));
         }
     }

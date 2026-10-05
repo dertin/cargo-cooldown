@@ -1,11 +1,44 @@
 # cargo-cooldown
 
 `cargo-cooldown` is a Cargo wrapper that delays adoption of freshly published
-registry crate versions. It lets Cargo resolve the graph, then replaces fresh
-versions with the newest older compatible versions that Cargo still accepts.
+registry crate versions. Its filtered backend removes fresh releases from a
+process-owned sparse index before Cargo resolves, then validates and atomically
+publishes the lockfile. The legacy resolver remains available for compatibility.
 
 Use it when you want dependency updates, but do not want `Cargo.lock` to pick
 up releases that were published too recently.
+
+## Engine selection
+
+```toml
+[cooldown]
+backend = "auto" # auto | filtered | native | legacy
+```
+
+`COOLDOWN_BACKEND` overrides the file setting. Use `filtered` to run the
+independent engine on Cargo without native cooldown. `auto` chooses native Cargo
+1.100+ only when policy equivalence is established, then filtered, then legacy.
+Forcing an unsupported engine returns a diagnostic rather than weakening policy.
+
+See [engine support and guarantees](docs/backends.md).
+
+## Performance reference
+
+This local Linux test of 0.4.1 is an approximate reference, not an exact benchmark
+or a guarantee for other workloads. All modes use Cargo 1.100 beta and the same
+seven-day policy, without additional exceptions. It compares full and targeted
+updates without an existing lockfile, with 1, 24 and 128 direct dependencies plus
+transitives, single packages and workspaces, and warm and cold caches. Ratios give
+each scenario equal weight; lower is faster. We will work on a better measurement
+environment to obtain more reliable results.
+
+| Mode | Warm cache | Cold cache | Overall |
+| --- | ---: | ---: | ---: |
+| Cargo native | 1.00× | 1.00× | 1.00× |
+| `auto` | 1.33× | 1.35× | 1.34× |
+| `filtered` | 1.67× | 1.60× | 1.63× |
+| `native` | 1.36× | 1.32× | 1.34× |
+| `legacy` | 5.65× | 5.85× | 5.75× |
 
 ## Quick Start
 
@@ -57,8 +90,8 @@ Update dependencies under cooldown:
 cargo cooldown update
 ```
 
-`update` is the `Cargo.lock` refresh command: Cargo resolves the newest graph
-first, then cooldown cools the updated `Cargo.lock` before it is kept.
+`update` refreshes `Cargo.lock` under the selected cooldown policy, including
+targeted updates with `-p`.
 
 `cargo cooldown init` is cargo-cooldown's setup wizard. To create a new Cargo
 package, use Cargo's own command:

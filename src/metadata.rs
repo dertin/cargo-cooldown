@@ -29,10 +29,13 @@ fn read_metadata_with_locking(
     locked: bool,
 ) -> Result<Metadata> {
     let mut command = manifest.metadata();
+    crate::backend::configure_metadata(&mut command);
     features.forward_metadata(&mut command);
     if locked {
         command.other_options(vec!["--locked".to_string()]);
     }
+    command.env("CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE", "allow");
+    crate::backend::record_cargo_invocation();
     let metadata = command.exec()?;
     Ok(metadata)
 }

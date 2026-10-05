@@ -102,6 +102,7 @@ impl LockfileBaselineMode {
 /// Effective runtime configuration after files and environment are merged.
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub backend: crate::backend::Backend,
     pub min_publish_age_seconds: u64,
     pub registry_min_publish_age: RegistryMinPublishAgeConfig,
     pub incompatible_publish_age: IncompatiblePublishAgePolicy,
@@ -276,6 +277,7 @@ struct CooldownFile {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CooldownFileSection {
+    backend: Option<String>,
     #[serde(rename = "incompatible-publish-age")]
     incompatible_publish_age: Option<String>,
     #[serde(rename = "fallback-accept")]
@@ -303,6 +305,7 @@ struct NamedRegistryFileSection {
 
 #[derive(Debug, Default)]
 struct MergedConfig {
+    backend: Option<crate::backend::Backend>,
     min_publish_age_seconds: Option<u64>,
     registry_min_publish_age: RegistryMinPublishAgeConfig,
     incompatible_publish_age: Option<IncompatiblePublishAgePolicy>,
@@ -322,6 +325,15 @@ impl MergedConfig {
         let Some(file) = read_file_config(path)? else {
             return Ok(());
         };
+
+        if let Some(value) = file
+            .data
+            .cooldown
+            .as_ref()
+            .and_then(|section| section.backend.as_deref())
+        {
+            self.backend = Some(crate::backend::Backend::parse(value)?);
+        }
 
         let compat_global_seconds = file
             .data
@@ -472,6 +484,9 @@ impl MergedConfig {
     }
 
     fn apply_env(&mut self) -> Result<()> {
+        if let Ok(value) = env::var("COOLDOWN_BACKEND") {
+            self.backend = Some(crate::backend::Backend::parse(&value)?);
+        }
         let compat_global_seconds = env_u64("COOLDOWN_MINUTES")?
             .map(minutes_to_seconds)
             .transpose()?;
@@ -574,6 +589,7 @@ impl MergedConfig {
 
     fn finish(self) -> Config {
         Config {
+            backend: self.backend.unwrap_or_default(),
             min_publish_age_seconds: self.min_publish_age_seconds.unwrap_or(0),
             registry_min_publish_age: self.registry_min_publish_age,
             incompatible_publish_age: self
@@ -922,6 +938,24 @@ mod tests {
                 dir: path.to_path_buf(),
             }),
         }
+    }
+
+    #[test]
+    fn backend_file_and_environment_precedence() {
+        let root = TempDir::new().unwrap();
+        let path = root.path().join("cooldown.toml");
+        fs::write(&path, "[cooldown]\nbackend='filtered'\n").unwrap();
+        let mut merged = MergedConfig::default();
+        merged.apply_file(&path).unwrap();
+        assert_eq!(merged.finish().backend, crate::backend::Backend::Filtered);
+        with_env_var("COOLDOWN_BACKEND", Some("legacy"), || {
+            let mut merged = MergedConfig::default();
+            merged.apply_file(&path).unwrap();
+            merged.apply_env().unwrap();
+            assert_eq!(merged.finish().backend, crate::backend::Backend::Legacy);
+        });
+        fs::write(&path, "[cooldown]\nbackend='typo'\n").unwrap();
+        assert!(MergedConfig::default().apply_file(&path).is_err());
     }
 
     #[test]

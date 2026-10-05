@@ -56,6 +56,24 @@ jobs:
         env:
           CARGO_TERM_COLOR: never
 
+  engine-toolchains:
+    name: Engine compatibility (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: ['1.91.1', '1.96.0', beta, nightly]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      # Native tests assert rejection before Cargo 1.100, and real resolution on
+      # supported channels. Filtered and legacy run on every toolchain.
+      - run: cargo test --locked --all-features
+        env:
+          CARGO_TERM_COLOR: never
+
   cooldown-self-check:
     name: Cargo cooldown self-check
     runs-on: ubuntu-latest
