@@ -669,10 +669,12 @@ impl Server {
 }
 impl Drop for Server {
     fn drop(&mut self) {
+        tracing::debug!("stopping sparse index workers");
         self.stop.store(true, Ordering::Relaxed);
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
+        tracing::debug!("sparse index workers stopped");
     }
 }
 // Poll cancellation without treating Cargo's pauses or split headers as EOF.
@@ -994,7 +996,12 @@ pub fn run(
     }
     let prepare_ms = preparation.elapsed().as_millis();
     let resolution = Instant::now();
+    tracing::debug!("starting sparse Cargo resolution");
     let output = command.output()?;
+    tracing::debug!(
+        success = output.status.success(),
+        "sparse Cargo resolution finished"
+    );
     if let Some(reason) = state
         .request_failure
         .lock()

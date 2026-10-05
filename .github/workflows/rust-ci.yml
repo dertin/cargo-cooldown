@@ -57,6 +57,7 @@ jobs:
         run: cargo test --locked --test integration auto_uses_legacy_for_missing_timestamps_and_forced_filtered_is_atomic -- --nocapture
         env:
           CARGO_TERM_COLOR: never
+          COOLDOWN_VERBOSE: 'true'
       - run: cargo test --locked --all-features
         env:
           CARGO_TERM_COLOR: never
