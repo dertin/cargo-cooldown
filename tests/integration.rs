@@ -3176,13 +3176,24 @@ impl ServerState {
 }
 
 fn handle_stream(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Result<()> {
+    stream.set_nonblocking(false)?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
-    let bytes = stream.read(&mut buffer)?;
-    if bytes == 0 {
-        return Ok(());
+    while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+        let bytes = stream.read(&mut buffer)?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        request.extend_from_slice(&buffer[..bytes]);
+        if request.len() > 8192 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP headers too large",
+            ));
+        }
     }
-
-    let request = String::from_utf8_lossy(&buffer[..bytes]);
+    let request = String::from_utf8_lossy(&request);
     let mut parts = request
         .lines()
         .next()
@@ -5205,6 +5216,26 @@ fn fallback_filtered_network_error_never_relaxes_age_policy() {
             .join("Cargo.lock.cooldown-hold")
             .exists()
     );
+}
+
+#[test]
+fn test_registry_waits_for_complete_request_headers() {
+    let server = RegistryServer::new(RegistryMode::PubtimeOnly).unwrap();
+    let mut client =
+        TcpStream::connect(server.base_url().strip_prefix("http://").unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    client
+        .write_all(b"GET /index/config.json HTTP/1.1\r\nHost: localhost\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(server.state.count_for("/index/config.json"), 0);
+    client.write_all(b"Connection: close\r\n\r\n").unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert_eq!(server.state.count_for("/index/config.json"), 1);
 }
 
 #[test]
