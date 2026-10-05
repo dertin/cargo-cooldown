@@ -71,6 +71,7 @@ matrix, conservative native equivalence conditions, and cache lifecycle.
 - `[registries.<name>].min-publish-age`
 - `[registries.<name>].index`
 - `[cooldown].incompatible-publish-age`
+- `[cooldown].backend`
 - `[cooldown].fallback-accept`
 - `[cooldown].lockfile-baseline`
 - `now`
@@ -87,6 +88,7 @@ Environment variables:
 - `CARGO_REGISTRY_MIN_PUBLISH_AGE`
 - `CARGO_REGISTRIES_<name>_MIN_PUBLISH_AGE`
 - `COOLDOWN_INCOMPATIBLE_PUBLISH_AGE`
+- `COOLDOWN_BACKEND`
 - `COOLDOWN_FALLBACK_ACCEPT`
 - `COOLDOWN_LOCKFILE_BASELINE`
 - `COOLDOWN_NOW`

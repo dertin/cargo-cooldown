@@ -67,9 +67,11 @@ The HTTP server binds only to 127.0.0.1. It uses a stable port derived from the
 workspace and CARGO_HOME, falling back to a new owned port if occupied. It is not
 a persistent daemon. Eight owned workers reuse inbound/outbound connections;
 normal completion and errors stop and join the workers. Cargo's loopback requests
-bypass proxies; upstream HTTP uses the normal reqwest proxy/TLS configuration.
-Upstream failures are distinguished from a real missing crate: an HTTP 503 or
-invalid index aborts publication even if Cargo could backtrack to an older graph.
+bypass proxies. Upstream HTTP honors `CARGO_HTTP_PROXY`, then Cargo's `[http].proxy`;
+without either, reqwest uses its default proxy environment and TLS configuration.
+An empty Cargo proxy disables upstream proxying. Upstream HTTP failures other than
+404, or an invalid index, abort publication even if Cargo could backtrack to an
+older graph.
 
 Original index documents are stored under `COOLDOWN_CACHE_DIR/sparse-originals-v1`
 (or the platform cargo-cooldown cache). Cache records include their upstream URL,
@@ -90,6 +92,7 @@ ungraceful process termination can still leave the existing coordination marker;
 confirm no cooldown process remains before removing it. No server survives the
 owning process, and the visible original lockfile remains intact until publication.
 
-`COOLDOWN_VERBOSE=true` reports discovery, selection, isolation, preparation,
-resolution, validation and publication timings, resolution count, upstream requests
-and decoded response-body bytes. TLS/header bytes are not counted as response-body bytes.
+`COOLDOWN_VERBOSE=true` reports discovery and selection timings and Cargo invocation
+counts. Filtered/native runs also report isolation, preparation, resolution,
+validation and publication timings, resolution count, upstream requests and decoded
+response-body bytes. TLS/header bytes are not counted as response-body bytes.

@@ -105,6 +105,37 @@ pub fn native_config_compatible(project: &ProjectContext) -> Result<bool> {
     Ok(!config.to_string().contains("min-publish-age"))
 }
 
+fn cargo_http_proxy(project: &ProjectContext) -> Result<Option<String>> {
+    match std::env::var("CARGO_HTTP_PROXY") {
+        Ok(proxy) => return Ok(Some(proxy)),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(err) => return Err(err).context("invalid CARGO_HTTP_PROXY"),
+    }
+    let config = crate::project::cargo_config(&project.cwd)?;
+    config
+        .get("http")
+        .and_then(|http| http.get("proxy"))
+        .map(|proxy| {
+            proxy
+                .as_str()
+                .map(str::to_owned)
+                .context("http.proxy must be a string")
+        })
+        .transpose()
+}
+
+fn http_client(proxy: Option<&str>) -> Result<Client> {
+    let mut builder = Client::builder().timeout(Duration::from_secs(15));
+    if let Some(proxy) = proxy {
+        builder = builder.no_proxy();
+        if !proxy.is_empty() {
+            let proxy = reqwest::Proxy::all(proxy)?.no_proxy(reqwest::NoProxy::from_env());
+            builder = builder.proxy(proxy);
+        }
+    }
+    Ok(builder.build()?)
+}
+
 struct Registry {
     source: String,
     context: RegistryContext,
@@ -234,6 +265,7 @@ struct State {
     now: DateTime<Utc>,
     per_crate: HashMap<String, u64>,
     client: Mutex<Option<Client>>,
+    http_proxy: Option<String>,
     cache: PathBuf,
     crates: Mutex<HashMap<(usize, String), CrateCell>>,
     originals: Mutex<HashMap<(usize, String), String>>,
@@ -252,7 +284,7 @@ impl State {
         if let Some(client) = client.as_ref() {
             return Ok(client.clone());
         }
-        let initialized = Client::builder().timeout(Duration::from_secs(15)).build()?;
+        let initialized = http_client(self.http_proxy.as_deref())?;
         *client = Some(initialized.clone());
         Ok(initialized)
     }
@@ -392,11 +424,13 @@ impl State {
                 "index returned a different crate"
             );
             for dependency in &entry.deps {
-                if let Some(source) = &dependency.registry {
-                    ensure!(
-                        self.registries.iter().any(|r| source_matches(source, r)),
-                        "cross-registry dependency is not configured; use legacy"
-                    );
+                if let Some(source) = &dependency.registry
+                    && !self.registries.iter().any(|r| source_matches(source, r))
+                {
+                    return Err(Unsupported(
+                        "cross-registry dependency is not configured".to_string(),
+                    )
+                    .into());
                 }
             }
             let baseline = self.registries[registry]
@@ -641,7 +675,37 @@ impl Drop for Server {
         }
     }
 }
+// Poll cancellation without treating Cargo's pauses or split headers as EOF.
+fn read_http_line(
+    reader: &mut BufReader<TcpStream>,
+    line: &mut String,
+    stop: &AtomicBool,
+    deadline: Instant,
+) -> Result<usize> {
+    use std::io::Read;
+    while !stop.load(Ordering::Relaxed) {
+        ensure!(Instant::now() < deadline, "HTTP request timed out");
+        ensure!(line.len() < 8192, "HTTP line too large");
+        let remaining = (8192 - line.len()) as u64;
+        match reader.by_ref().take(remaining).read_line(line) {
+            Ok(0) if line.is_empty() => return Ok(0),
+            Ok(_) if line.ends_with('\n') => return Ok(line.len()),
+            Ok(_) => bail!("incomplete HTTP line"),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                ) => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(0)
+}
+
 fn serve(stream: TcpStream, state: &State, stop: &AtomicBool) -> Result<()> {
+    stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     stream.set_nodelay(true)?;
@@ -649,18 +713,21 @@ fn serve(stream: TcpStream, state: &State, stop: &AtomicBool) -> Result<()> {
     // Cargo can reuse each connection for independent index requests.
     while !stop.load(Ordering::Relaxed) {
         let mut first = String::new();
-        use std::io::Read;
-        if reader.by_ref().take(8192).read_line(&mut first)? == 0 {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        if read_http_line(&mut reader, &mut first, stop, deadline)? == 0 {
             break;
         }
         let mut header_bytes = first.len();
         let mut previous_etag = None;
         loop {
             let mut header = String::new();
-            let read = reader.by_ref().take(8192).read_line(&mut header)?;
+            let read = read_http_line(&mut reader, &mut header, stop, deadline)?;
             header_bytes += read;
             ensure!(header_bytes <= 8192, "HTTP headers too large");
-            if read == 0 || header == "\r\n" {
+            if read == 0 {
+                return Ok(());
+            }
+            if header == "\r\n" {
                 break;
             }
             if let Some((name, value)) = header.split_once(':')
@@ -798,10 +865,11 @@ pub fn run(
                 .join("cargo-cooldown")
         })
         .join("sparse-originals-v1");
+    let http_proxy = cargo_http_proxy(project)?;
     let client = if backend == Backend::Native {
         None
     } else {
-        Some(Client::builder().timeout(Duration::from_secs(15)).build()?)
+        Some(http_client(http_proxy.as_deref())?)
     };
     let state = Arc::new(State {
         config: config.clone(),
@@ -810,6 +878,7 @@ pub fn run(
         now: config.now_override.unwrap_or_else(Utc::now),
         per_crate: config.allow_rules.per_crate_min_publish_age_seconds(),
         client: Mutex::new(client),
+        http_proxy,
         cache,
         originals: Mutex::new(HashMap::new()),
         crates: Mutex::new(HashMap::new()),
@@ -992,4 +1061,61 @@ pub fn run(
         return Ok(status.code().unwrap_or(1));
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_line_survives_idle_and_partial_read_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let reader = thread::spawn(move || {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let stop = AtomicBool::new(false);
+            read_http_line(
+                &mut reader,
+                &mut line,
+                &stop,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            line
+        });
+        thread::sleep(Duration::from_millis(150));
+        client.write_all(b"GET /config").unwrap();
+        thread::sleep(Duration::from_millis(150));
+        client.write_all(b".json HTTP/1.1\r\n").unwrap();
+        assert_eq!(reader.join().unwrap(), "GET /config.json HTTP/1.1\r\n");
+    }
+
+    #[test]
+    fn http_line_wait_stops_on_cancellation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = Arc::clone(&stop);
+        let reader = thread::spawn(move || {
+            read_http_line(
+                &mut BufReader::new(stream),
+                &mut String::new(),
+                &reader_stop,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap()
+        });
+        thread::sleep(Duration::from_millis(100));
+        stop.store(true, Ordering::Relaxed);
+        assert_eq!(reader.join().unwrap(), 0);
+    }
 }

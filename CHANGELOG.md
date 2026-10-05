@@ -24,6 +24,10 @@
   and metadata calls, including directory overrides and hard-linked proxies.
 - Normalize workspace and member paths consistently across filesystem aliases,
   including macOS temporary directories and Windows short paths.
+- Honor Cargo's HTTP proxy configuration for filtered upstream requests, and retry
+  legacy automatically for unsupported cross-registry metadata.
+- Keep loopback connections alive across delayed or fragmented Cargo requests
+  while retaining bounded requests and cancellation on shutdown.
 - Add differential regression tests and toolchain CI.
 
 ## 0.3.5 - 2026-09-10

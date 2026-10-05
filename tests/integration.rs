@@ -4378,6 +4378,32 @@ fn rustup_directory_override_survives_isolation_and_metadata() {
     }
 }
 
+fn native_test_supported(version: &semver::Version) -> bool {
+    version.major > 1
+        || version.major == 1
+            && (version.minor > 100
+                || version.minor == 100
+                    && (version.pre.is_empty() || version.pre.as_str().starts_with("beta")))
+}
+
+#[test]
+fn native_test_gate_includes_stabilized_channels_and_later_versions() {
+    for (version, expected) in [
+        ("1.99.0", false),
+        ("1.100.0-nightly", false),
+        ("1.100.0-beta.1", true),
+        ("1.100.0", true),
+        ("1.101.0-nightly", true),
+        ("2.0.0", true),
+    ] {
+        assert_eq!(
+            native_test_supported(&semver::Version::parse(version).unwrap()),
+            expected,
+            "{version}"
+        );
+    }
+}
+
 #[test]
 fn native_uses_selected_cargo_and_enforces_age_when_supported() {
     let version = Command::new("cargo").arg("--version").output().unwrap();
@@ -4399,7 +4425,7 @@ fn native_uses_selected_cargo_and_enforces_age_when_supported() {
         )
         .output()
         .unwrap();
-    if parsed.minor < 100 {
+    if !native_test_supported(&parsed) {
         assert!(!output.status.success());
         assert!(String::from_utf8_lossy(&output.stderr).contains("Cargo >= 1.100"));
     } else {
@@ -4706,7 +4732,7 @@ fn native_rechecks_baseline_after_waiting_for_another_writer() {
     let version = Command::new("cargo").arg("--version").output().unwrap();
     let version = String::from_utf8(version.stdout).unwrap();
     let parsed = semver::Version::parse(version.split_whitespace().nth(1).unwrap()).unwrap();
-    if parsed.minor < 100 {
+    if !native_test_supported(&parsed) {
         return;
     }
     for backend in ["native", "auto"] {
@@ -4774,7 +4800,7 @@ fn native_cached_index_keeps_missing_timestamp_rejection() {
     let version = Command::new("cargo").arg("--version").output().unwrap();
     let version = String::from_utf8(version.stdout).unwrap();
     let parsed = semver::Version::parse(version.split_whitespace().nth(1).unwrap()).unwrap();
-    if parsed.minor < 100 {
+    if !native_test_supported(&parsed) {
         return;
     }
     let harness = TestHarness::new(RegistryMode::MissingPubtimeWithApi).unwrap();
@@ -5179,4 +5205,111 @@ fn fallback_filtered_network_error_never_relaxes_age_policy() {
             .join("Cargo.lock.cooldown-hold")
             .exists()
     );
+}
+
+#[test]
+fn filtered_honors_cargo_http_proxy_and_environment_precedence() {
+    for use_env in [false, true] {
+        let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+        let upstream = "http://cooldown.invalid";
+        {
+            let mut responses = harness.server.state.responses.lock().unwrap();
+            let proxied: Vec<_> = responses
+                .iter()
+                .map(|(path, response)| (format!("{upstream}{path}"), response.clone()))
+                .collect();
+            responses.extend(proxied);
+        }
+        let file_proxy = if use_env {
+            "http://127.0.0.1:9"
+        } else {
+            harness.server.base_url().strip_prefix("http://").unwrap()
+        };
+        fs::write(harness.workspace_dir.join(".cargo/config.toml"), format!(
+            "[registries.{REGISTRY_NAME}]\nindex = 'sparse+{upstream}/index/'\n[http]\nproxy = '{file_proxy}'\n"
+        )).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command
+            .arg("update")
+            .current_dir(&harness.workspace_dir)
+            .env("CARGO_HOME", &harness.cargo_home)
+            .env("COOLDOWN_BACKEND", "filtered")
+            .env("COOLDOWN_NOW", NOW)
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
+            .env("CARGO_NET_RETRY", "0");
+        for name in [
+            "CARGO_HTTP_PROXY",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "no_proxy",
+        ] {
+            command.env_remove(name);
+        }
+        if use_env {
+            command.env("CARGO_HTTP_PROXY", harness.server.base_url());
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "env={use_env}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(harness.locked_version(), OLD_VERSION);
+        assert!(
+            harness
+                .server
+                .state
+                .count_for(&format!("{upstream}/index/co/ol/cooldowndep"))
+                > 0
+        );
+    }
+}
+
+#[test]
+fn auto_retries_legacy_for_unconfigured_cross_registry_metadata() {
+    for backend in ["filtered", "auto"] {
+        let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+        {
+            let mut responses = harness.server.state.responses.lock().unwrap();
+            let response = responses.get_mut("/index/co/ol/cooldowndep").unwrap();
+            let body = String::from_utf8(response.body.clone()).unwrap();
+            let mut unrelated: serde_json::Value =
+                serde_json::from_str(body.lines().next().unwrap()).unwrap();
+            unrelated["vers"] = serde_json::json!("9.0.0");
+            unrelated["deps"] = serde_json::json!([{
+                "name": "foreign", "req": "1", "features": [], "optional": false,
+                "default_features": true, "target": null, "kind": "normal",
+                "registry": "sparse+http://unconfigured.invalid/index/"
+            }]);
+            response.body = format!("{body}\n{unrelated}\n").into_bytes();
+        }
+        let output = harness.run_command(
+            &["update"],
+            &[("COOLDOWN_BACKEND", backend), ("COOLDOWN_VERBOSE", "true")],
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if backend == "auto" {
+            assert!(output.status.success(), "{stderr}");
+            assert_eq!(harness.locked_version(), OLD_VERSION);
+            assert!(stderr.contains("retrying with legacy"), "{stderr}");
+        } else {
+            assert!(!output.status.success());
+            assert!(
+                stderr.contains("cross-registry dependency is not configured; use legacy"),
+                "{stderr}"
+            );
+            assert!(!harness.workspace_dir.join("Cargo.lock").exists());
+        }
+        assert!(
+            !harness
+                .workspace_dir
+                .join("Cargo.lock.cooldown-hold")
+                .exists()
+        );
+    }
 }
