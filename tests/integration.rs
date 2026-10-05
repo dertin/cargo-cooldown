@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1251,7 +1251,7 @@ fn assert_cooldown_update_with_existing_fresh_lockfile_version(
     for (key, value) in extra_env {
         command.env(key, value);
     }
-    let output = command.output().expect("cargo-cooldown should run");
+    let output = cooldown_output(&mut command);
 
     let final_lockfile =
         fs::read_to_string(workspace_dir.join("Cargo.lock")).expect("lockfile should exist");
@@ -1877,6 +1877,38 @@ fn deny_policy_rejects_resolver_constrained_versions_outside_selected_scope() {
     assert!(stderr.contains("scopedfresh 1.0.1"), "{stderr}");
 }
 
+// Bound fixture commands so a platform-specific hang reports its captured
+// diagnostics instead of leaving the entire CI job waiting indefinitely.
+fn cooldown_output(command: &mut Command) -> Output {
+    let stdout = tempfile::NamedTempFile::new().unwrap();
+    let stderr = tempfile::NamedTempFile::new().unwrap();
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(stdout.reopen().unwrap())
+        .stderr(stderr.reopen().unwrap())
+        .spawn()
+        .expect("cargo-cooldown should run");
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Output {
+                status,
+                stdout: fs::read(stdout.path()).unwrap(),
+                stderr: fs::read(stderr.path()).unwrap(),
+            };
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "cargo-cooldown exceeded 60 seconds: {}",
+                fs::read_to_string(stderr.path()).unwrap()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 struct TestHarness {
     _temp_dir: TempDir,
     temp_root: PathBuf,
@@ -1989,7 +2021,7 @@ impl TestHarness {
             command.env(key, value);
         }
 
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn runner_dir(&self) -> PathBuf {
@@ -2167,7 +2199,7 @@ impl CoordinatedBundleHarness {
             command.env(key, value);
         }
 
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn locked_version(&self, crate_name: &str) -> String {
@@ -2669,7 +2701,7 @@ impl DependencyChainHarness {
             command.env(key, value);
         }
 
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn lockfile_contents(&self) -> String {
@@ -2775,7 +2807,7 @@ impl MultiPassBenchmarkHarness {
             command.env(key, value);
         }
 
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn lockfile_contents(&self) -> String {
@@ -2946,13 +2978,13 @@ impl ScopedConflictHarness {
             }
         }
 
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn run_cooldown_requiring_prompt(&self) -> Output {
         let mut command = self.cooldown_command();
         command.env("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", "fallback");
-        command.output().expect("cargo-cooldown should run")
+        cooldown_output(&mut command)
     }
 
     fn cooldown_command(&self) -> Command {
