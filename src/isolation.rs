@@ -232,6 +232,11 @@ impl LockfileHoldGuard {
                 source_lockfile.display()
             )
         })?;
+        if self.original_contents.as_deref() == Some(final_contents.as_slice()) {
+            self.ensure_original_unchanged()?;
+            self.finish_commit();
+            return Ok(());
+        }
         let parent = self
             .lockfile_path
             .parent()
@@ -252,17 +257,34 @@ impl LockfileHoldGuard {
                 .set_permissions(fs::metadata(&self.lockfile_path)?.permissions())?;
         }
         pending.as_file().sync_all()?;
-        // Stage first, then check immediately before the atomic replacement.
-        self.ensure_original_unchanged()?;
-        pending
-            .persist(&self.lockfile_path)
-            .context("failed to atomically publish Cargo.lock")?;
+        // Windows readers may temporarily deny replacement. Keep the pending
+        // file and recheck the original before every bounded atomic retry.
+        let mut retries = 0;
+        loop {
+            self.ensure_original_unchanged()?;
+            match pending.persist(&self.lockfile_path) {
+                Ok(_) => break,
+                Err(err)
+                    if cfg!(windows)
+                        && retries < 100
+                        && matches!(err.error.raw_os_error(), Some(5 | 32 | 33)) =>
+                {
+                    pending = err.file;
+                    retries += 1;
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(err) => return Err(err).context("failed to atomically publish Cargo.lock"),
+            }
+        }
+        self.finish_commit();
+        Ok(())
+    }
+
+    fn finish_commit(&mut self) {
         self.committed = true;
         if let Err(err) = fs::remove_file(&self.marker_path) {
-            warn!(error = %err, "published Cargo.lock but could not remove coordination marker");
+            warn!(error = %err, "completed cooldown but could not remove coordination marker");
         }
-
-        Ok(())
     }
 
     fn ensure_original_unchanged(&self) -> Result<()> {
@@ -969,6 +991,64 @@ mod tests {
             fs::read_to_string(destination.join("target/fixture.txt")).unwrap(),
             "keep"
         );
+    }
+
+    #[test]
+    fn unchanged_lockfile_keeps_the_original_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let lockfile = temp.path().join("Cargo.lock");
+        let candidate = temp.path().join("candidate");
+        let alias = temp.path().join("original-file");
+        fs::write(&lockfile, "version = 4\n").unwrap();
+        fs::copy(&lockfile, &candidate).unwrap();
+        fs::hard_link(&lockfile, &alias).unwrap();
+        let mut hold = LockfileHoldGuard::hold(&lockfile).unwrap();
+        hold.commit_from(&candidate).unwrap();
+        assert!(same_file::is_same_file(&lockfile, &alias).unwrap());
+        assert!(!hold.marker_path.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn publication_waits_for_windows_reader_and_rechecks_external_changes() {
+        use std::os::windows::fs::OpenOptionsExt;
+        for external_change in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let lockfile = temp.path().join("Cargo.lock");
+            let candidate = temp.path().join("candidate");
+            fs::write(&lockfile, "version = 4\n").unwrap();
+            fs::write(&candidate, "version = 4\n# candidate\n").unwrap();
+            let mut hold = LockfileHoldGuard::hold(&lockfile).unwrap();
+            // Allow reads/writes but prevent deletion while the reader is open.
+            let reader = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(3)
+                .open(&lockfile)
+                .unwrap();
+            let path = lockfile.clone();
+            let release = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(80));
+                if external_change {
+                    fs::write(path, "version = 4\n# external\n").unwrap();
+                }
+                drop(reader);
+            });
+            let result = hold.commit_from(&candidate);
+            release.join().unwrap();
+            if external_change {
+                assert!(result.unwrap_err().to_string().contains("changed while"));
+                assert_eq!(
+                    fs::read_to_string(&lockfile).unwrap(),
+                    "version = 4\n# external\n"
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    fs::read_to_string(&lockfile).unwrap(),
+                    "version = 4\n# candidate\n"
+                );
+            }
+        }
     }
 
     #[test]

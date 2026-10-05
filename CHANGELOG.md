@@ -25,9 +25,12 @@
 - Normalize workspace and member paths consistently across filesystem aliases,
   including macOS temporary directories and Windows short paths.
 - Honor Cargo's HTTP proxy configuration for filtered upstream requests, and retry
-  legacy automatically for unsupported cross-registry metadata.
+  legacy automatically in `auto` mode for unsupported cross-registry metadata.
 - Keep loopback connections alive across delayed or fragmented Cargo requests
   while retaining bounded requests and cancellation on shutdown.
+- Share one listening socket across server workers to ensure Windows shutdown
+  completes. Keep unchanged lockfiles in place and retry temporary Windows
+  publication conflicts without overwriting external changes.
 - Add differential regression tests and toolchain CI.
 
 ## 0.3.5 - 2026-09-10
