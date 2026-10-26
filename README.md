@@ -41,6 +41,24 @@ See [engine support and guarantees](docs/backends.md).
 
 ## Performance reference
 
+For the optimized native-prefilter path, a separate local Linux comparison on
+two large dependency graphs measured **about 5% and 16% more elapsed time than
+native Cargo with network access**. Offline, both measured **about 0.60 seconds
+of additional overhead**: 1.07 s for the wrapper versus 0.47 s natively
+(approximately **+129%**). Short native operations make the percentage look much
+larger even when the absolute overhead is below a second.
+
+These are full-process medians from six runs per graph and mode, using release
+binaries, Cargo **1.100.0-beta.3**, warm caches and equivalent policies: seven
+days for crates.io, an exempt additional registry, `deny`, and wrapper baseline
+`ignore`. Each run started from the same lockfile; resulting dependency versions,
+sources and checksums matched. Network variability was substantial. These
+observations are **not an expected range or a performance guarantee**: overhead
+depends on the graph, cache, network, policy and selected backend. Incompatible
+policies retain other resolution paths and may cost more.
+
+The broader comparison below covers different scenarios and backend paths:
+
 This local Linux test of 0.4.1 is an approximate reference, not an exact benchmark
 or a guarantee for other workloads. All modes use Cargo 1.100 beta and the same
 seven-day policy, without additional exceptions. It compares full and targeted
