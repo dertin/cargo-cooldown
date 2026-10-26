@@ -65,6 +65,14 @@ pub fn support(project: &ProjectContext, args: &[OsString]) -> Result<()> {
         );
     }
     let cargo_config = crate::project::cargo_config(&project.cwd)?;
+    // Our upstream client does not implement Cargo's custom CA loading. Keep
+    // those requests on Cargo's transport instead of silently ignoring trust.
+    let custom_ca = cargo_config
+        .get("http")
+        .is_some_and(|http| http.get("cainfo").is_some() || http.get("proxy-cainfo").is_some())
+        || std::env::var_os("CARGO_HTTP_CAINFO").is_some()
+        || std::env::var_os("CARGO_HTTP_PROXY_CAINFO").is_some();
+    ensure!(!custom_ca, "custom Cargo CA configuration requires legacy");
     ensure!(
         cargo_config.get("source").is_none(),
         "source replacement, Git indexes and vendor require legacy"

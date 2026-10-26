@@ -25,6 +25,10 @@ original sources.
 Offline/frozen/locked invocations, precise updates, custom Cargo `--config`/`-Z`,
 source replacement/vendor, Git indexes/dependencies, private-registry credential
 configuration, and guard commands with existing lockfiles retain legacy handling.
+Custom CA bundles (`http.cainfo`, `http.proxy-cainfo`, `CARGO_HTTP_CAINFO`, or
+`CARGO_HTTP_PROXY_CAINFO`) also select legacy in auto mode, leaving certificate
+loading to Cargo. Forced filtered resolution rejects them before changing the
+lockfile; native is also ineligible because its validation can use our HTTP client.
 An index without required `pubtime` data also uses legacy in auto mode. Forcing
 filtered reports missing timestamps rather than inventing dates. Cross-registry
 index dependencies must name configured registries.

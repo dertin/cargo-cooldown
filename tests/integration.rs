@@ -4281,6 +4281,67 @@ fn filtered_generate_lockfile_retains_cooled_result() {
 }
 
 #[test]
+fn custom_cargo_ca_configuration_selects_legacy_before_resolution() {
+    for (key, env_key) in [
+        ("cainfo", "CARGO_HTTP_CAINFO"),
+        ("proxy-cainfo", "CARGO_HTTP_PROXY_CAINFO"),
+    ] {
+        for use_env in [false, true] {
+            let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+            harness.generate_lockfile();
+            let lockfile = harness.workspace_dir.join("Cargo.lock");
+            let original = fs::read(&lockfile).unwrap();
+            // The HTTP fixture needs no TLS certificate. This tests routing,
+            // leaving certificate loading and validation to Cargo in legacy.
+            let ca_path = harness.cargo_home.join("custom-ca.pem");
+            fs::write(&ca_path, "test CA configuration\n").unwrap();
+            if !use_env {
+                let path = harness.cargo_home.join("config.toml");
+                let mut contents = fs::read_to_string(&path).unwrap();
+                let encoded = toml::Value::String(ca_path.to_str().unwrap().to_owned());
+                contents.push_str(&format!("\n[http]\n{key}={encoded}\n"));
+                fs::write(path, contents).unwrap();
+            }
+            harness.server.reset_counts();
+            for backend in ["filtered", "auto"] {
+                let mut env = vec![
+                    ("COOLDOWN_BACKEND", backend),
+                    ("COOLDOWN_VERBOSE", "true"),
+                    LOCKFILE_BASELINE_IGNORE,
+                ];
+                if use_env {
+                    env.push((env_key, ca_path.to_str().unwrap()));
+                }
+                let output = harness.run_command(&["update"], &env);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if backend == "filtered" {
+                    assert!(!output.status.success(), "{key}/{use_env}: {stderr}");
+                    assert!(
+                        stderr.contains("custom Cargo CA configuration requires legacy"),
+                        "{stderr}"
+                    );
+                    assert_eq!(fs::read(&lockfile).unwrap(), original);
+                    assert_eq!(
+                        harness.server.state.count_for("/index/co/ol/cooldowndep"),
+                        0
+                    );
+                } else {
+                    assert!(output.status.success(), "{key}/{use_env}: {stderr}");
+                    assert!(stderr.contains("selected_backend=Legacy"), "{stderr}");
+                    assert_eq!(harness.locked_version(), OLD_VERSION);
+                }
+                assert!(
+                    !harness
+                        .workspace_dir
+                        .join("Cargo.lock.cooldown-hold")
+                        .exists()
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn filtered_and_legacy_neutralize_coexisting_native_policy() {
     for backend in ["filtered", "legacy"] {
         let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
