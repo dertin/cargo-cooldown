@@ -4,6 +4,7 @@
 
 - Select legacy before resolution when Cargo uses custom CA bundles; reject
   forced filtered resolution instead of ignoring the configured certificate trust.
+  Configurations using `include` also retain Cargo's legacy handling.
 - Add `auto`, `filtered`, `native`, and `legacy` backends and `COOLDOWN_BACKEND`.
 - Resolve supported sparse graphs once through a process-owned loopback index;
   retain index entries, source identities, checksum validation, baseline rules,

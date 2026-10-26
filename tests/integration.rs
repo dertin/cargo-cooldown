@@ -4286,7 +4286,7 @@ fn custom_cargo_ca_configuration_selects_legacy_before_resolution() {
         ("cainfo", "CARGO_HTTP_CAINFO"),
         ("proxy-cainfo", "CARGO_HTTP_PROXY_CAINFO"),
     ] {
-        for use_env in [false, true] {
+        for source in ["file", "env", "include"] {
             let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
             harness.generate_lockfile();
             let lockfile = harness.workspace_dir.join("Cargo.lock");
@@ -4295,11 +4295,17 @@ fn custom_cargo_ca_configuration_selects_legacy_before_resolution() {
             // leaving certificate loading and validation to Cargo in legacy.
             let ca_path = harness.cargo_home.join("custom-ca.pem");
             fs::write(&ca_path, "test CA configuration\n").unwrap();
-            if !use_env {
+            if source != "env" {
                 let path = harness.cargo_home.join("config.toml");
                 let mut contents = fs::read_to_string(&path).unwrap();
                 let encoded = toml::Value::String(ca_path.to_str().unwrap().to_owned());
-                contents.push_str(&format!("\n[http]\n{key}={encoded}\n"));
+                let ca_config = format!("\n[http]\n{key}={encoded}\n");
+                if source == "include" {
+                    fs::write(harness.cargo_home.join("ca.toml"), ca_config).unwrap();
+                    contents = format!("include = [\"ca.toml\"]\n{contents}");
+                } else {
+                    contents.push_str(&ca_config);
+                }
                 fs::write(path, contents).unwrap();
             }
             harness.server.reset_counts();
@@ -4309,15 +4315,19 @@ fn custom_cargo_ca_configuration_selects_legacy_before_resolution() {
                     ("COOLDOWN_VERBOSE", "true"),
                     LOCKFILE_BASELINE_IGNORE,
                 ];
-                if use_env {
+                if source == "env" {
                     env.push((env_key, ca_path.to_str().unwrap()));
                 }
                 let output = harness.run_command(&["update"], &env);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if backend == "filtered" {
-                    assert!(!output.status.success(), "{key}/{use_env}: {stderr}");
+                    assert!(!output.status.success(), "{key}/{source}: {stderr}");
                     assert!(
-                        stderr.contains("custom Cargo CA configuration requires legacy"),
+                        stderr.contains(if source == "include" {
+                            "Cargo configuration includes require legacy"
+                        } else {
+                            "custom Cargo CA configuration requires legacy"
+                        }),
                         "{stderr}"
                     );
                     assert_eq!(fs::read(&lockfile).unwrap(), original);
@@ -4326,7 +4336,7 @@ fn custom_cargo_ca_configuration_selects_legacy_before_resolution() {
                         0
                     );
                 } else {
-                    assert!(output.status.success(), "{key}/{use_env}: {stderr}");
+                    assert!(output.status.success(), "{key}/{source}: {stderr}");
                     assert!(stderr.contains("selected_backend=Legacy"), "{stderr}");
                     assert_eq!(harness.locked_version(), OLD_VERSION);
                 }

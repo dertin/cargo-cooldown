@@ -65,6 +65,10 @@ pub fn support(project: &ProjectContext, args: &[OsString]) -> Result<()> {
         );
     }
     let cargo_config = crate::project::cargo_config(&project.cwd)?;
+    ensure!(
+        cargo_config.get("include").is_none(),
+        "Cargo configuration includes require legacy"
+    );
     // Our upstream client does not implement Cargo's custom CA loading. Keep
     // those requests on Cargo's transport instead of silently ignoring trust.
     let custom_ca = cargo_config
