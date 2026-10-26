@@ -599,6 +599,7 @@ fn run_update_in_isolation(
                 "cooldown timing: native update prefilter"
             );
             if output.status.success() {
+                phase.finish();
                 output.status
             } else {
                 debug!("native prefilter failed; retrying original cooldown policy");

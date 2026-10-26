@@ -240,7 +240,7 @@ pub fn native_update_prefilter(
         return Ok(None);
     }
     let mut registries = vec![(
-        "registry.min-publish-age".to_string(),
+        "registries.crates-io.min-publish-age".to_string(),
         "registry+https://github.com/rust-lang/crates.io-index".to_string(),
     )];
     if let Some(entries) = table.get("registries").and_then(|value| value.as_table()) {
