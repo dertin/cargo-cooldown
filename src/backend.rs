@@ -202,6 +202,102 @@ pub fn native_available() -> Result<bool> {
                     && (version.pre.is_empty() || version.pre.as_str().starts_with("beta"))))
 }
 
+/// A conservative first pass, not a replacement for the wrapper's policy guard.
+/// Cargo may discard only versions younger than every applicable package rule.
+pub fn native_update_prefilter(
+    config: &Config,
+    args: &[OsString],
+    has_baseline: bool,
+) -> Result<Option<Command>> {
+    if config.backend != Backend::Auto
+        || config.now_override.is_some()
+        || !config.allow_rules.allow.exact.is_empty()
+        || config.incompatible_publish_age == IncompatiblePublishAgePolicy::Allow
+        || (has_baseline && config.lockfile_baseline.uses_initial_lockfile_floor())
+        || args.first().is_none_or(|arg| arg != "update")
+    {
+        return Ok(None);
+    }
+    // Preserve targeted updates, explicit Cargo overrides and frozen operations.
+    // Their selected graph or configuration is not described by this policy.
+    if args.iter().skip(1).any(|arg| {
+        let arg = arg.to_string_lossy();
+        !matches!(arg.as_ref(), "--verbose" | "-v" | "--quiet" | "-q")
+    }) {
+        return Ok(None);
+    }
+    if !native_available()? {
+        return Ok(None);
+    }
+    let table = crate::project::cargo_config(&std::env::current_dir()?)?;
+    if table.get("include").is_some()
+        || table.get("source").is_some()
+        || std::env::vars_os().any(|(key, _)| {
+            let key = key.to_string_lossy();
+            key.starts_with("CARGO_REGISTRIES_") && key.ends_with("_INDEX")
+        })
+    {
+        return Ok(None);
+    }
+    let mut registries = vec![(
+        "registry.min-publish-age".to_string(),
+        "registry+https://github.com/rust-lang/crates.io-index".to_string(),
+    )];
+    if let Some(entries) = table.get("registries").and_then(|value| value.as_table()) {
+        for (name, entry) in entries {
+            if name == "crates-io" {
+                continue;
+            }
+            let Some(index) = entry.get("index").and_then(|value| value.as_str()) else {
+                return Ok(None);
+            };
+            let name = toml::Value::String(name.clone());
+            registries.push((
+                format!("registries.{name}.min-publish-age"),
+                index.to_string(),
+            ));
+        }
+    }
+    let package_minimum = config
+        .allow_rules
+        .per_crate_min_publish_age_seconds()
+        .values()
+        .copied()
+        .min();
+    let mut overrides = Vec::new();
+    let mut filters_any_registry = false;
+    for (key, source) in registries {
+        let context = crate::registry::resolve_registry_context(&source, &config.skip_registries)?;
+        let mut seconds = config.min_publish_age_seconds_for(&context, "")?;
+        if context.skipped {
+            seconds = 0;
+        }
+        if let Some(package_minimum) = package_minimum {
+            seconds = seconds.min(package_minimum);
+        }
+        filters_any_registry |= seconds > 0;
+        overrides.push(format!("{key}=\"{seconds} seconds\""));
+    }
+    if !filters_any_registry {
+        return Ok(None);
+    }
+    let mut command = cargo();
+    command.args(args);
+    // Unknown registries must remain unrestricted. Known registries receive the
+    // effective wrapper policy, overriding any coexisting native configuration.
+    command.args([
+        "--config",
+        "registry.global-min-publish-age=\"0\"",
+        "--config",
+        "resolver.incompatible-publish-age=\"deny\"",
+    ]);
+    for value in overrides {
+        command.args(["--config", &value]);
+    }
+    command.env("CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE", "deny");
+    Ok(Some(command))
+}
+
 pub fn select(config: &Config, project: &ProjectContext, args: &[OsString]) -> Result<Backend> {
     if config.backend == Backend::Legacy {
         return Ok(Backend::Legacy);

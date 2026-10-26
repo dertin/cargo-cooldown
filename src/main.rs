@@ -584,7 +584,30 @@ fn run_update_in_isolation(
         let mut registry_store = RegistryStore::new(config)?;
         let initial_lockfile =
             LockfileSnapshot::capture(isolated.lockfile_path(), &mut registry_store)?;
-        let status = run_initial_cargo_update(&temp_forwarded_args, phase)?;
+        let prefilter = backend::native_update_prefilter(
+            config,
+            &temp_forwarded_args,
+            isolated.lockfile_path().exists(),
+        )?;
+        let status = if let Some(mut command) = prefilter {
+            phase.set_message("Running native cooldown prefilter...");
+            let started = Instant::now();
+            let output = command.output()?;
+            debug!(
+                target: "cargo_cooldown::timing",
+                elapsed_ms = started.elapsed().as_millis(),
+                "cooldown timing: native update prefilter"
+            );
+            if output.status.success() {
+                output.status
+            } else {
+                debug!("native prefilter failed; retrying original cooldown policy");
+                initial_lockfile.restore(isolated.lockfile_path())?;
+                run_initial_cargo_update(&temp_forwarded_args, phase)?
+            }
+        } else {
+            run_initial_cargo_update(&temp_forwarded_args, phase)?
+        };
         if !status.success() {
             return Ok(IsolatedUpdateOutcome::CargoFailed(
                 status.code().unwrap_or(1),
@@ -595,11 +618,15 @@ fn run_update_in_isolation(
             LockfileSnapshot::capture(isolated.lockfile_path(), &mut registry_store)?;
 
         if should_run_cooldown_guard(config) {
+            // `update` resolves the whole lockfile, including inactive optional
+            // dependencies. Apply the configured policy to that same graph.
+            let mut update_features = cli.features.clone();
+            update_features.all_features = true;
             match executor::run_pinning_flow_with_snapshot(
                 config,
                 &isolated,
                 &update_scan_workspace(),
-                &cli.features,
+                &update_features,
                 initial_lockfile,
                 success_message,
                 &mut registry_store,

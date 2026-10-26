@@ -57,13 +57,41 @@ both Cargo and its compiler/metadata subprocesses. Pre-stabilization
 1.100 nightlies are conservatively excluded; beta/stable 1.100 and later minors
 are eligible.
 
+## Native prefilter with the legacy guard
+
+On Cargo 1.100+, `auto` can also accelerate a full `update` that needs legacy,
+including private registries and custom CA bundles. This is a native prefilter
+inside the existing isolated workspace, followed by the full legacy policy guard;
+it does not make forced `native` accept unsupported policies.
+
+The prefilter uses each registry's effective cooldown, capped by the shortest
+package allowance. The guard then enforces longer package/registry windows.
+Skipped registries and zero-age overrides remain exempt. Cargo handles registry
+authentication and TLS. Exact-version allowances, simulated time, existing
+`floor` baselines, targeted/precise updates, Cargo overrides, source replacements,
+configuration includes and environment-supplied index URLs retain the original
+resolver. A zero package allowance can eliminate useful prefiltering entirely.
+An existing lockfile is eligible with `lockfile-baseline = "ignore"`.
+
+If the native attempt fails, its candidate is discarded and the initial lockfile
+is restored before running the original resolver in the same isolation. The
+configured `deny`/`fallback` policy and fallback acceptance still govern the guard
+and publication. A native success never bypasses that guard. Forced `legacy`
+disables the optimization, including on new Cargo versions.
+
+For `update`, the legacy guard inspects all workspace features because the
+lockfile includes inactive optional dependencies too. Configured allowances,
+baseline floors and fallback behavior still apply; `deny` no longer overlooks
+fresh optional dependencies just because their features are inactive. Guards for
+build/check/test continue to use the requested feature selection.
+
 Cargo's stabilization is recorded in [Cargo PR #17335](https://github.com/rust-lang/cargo/pull/17335).
 The filtered engine uses Cargo's documented
 [source replacement](https://doc.rust-lang.org/cargo/reference/source-replacement.html)
 mechanism; replacement entries retain the upstream checksum and dependency data.
 
 The wrapper neutralizes `resolver.incompatible-publish-age` through the Cargo
-child environment in filtered/legacy so native file configuration cannot discard
+child environment outside the explicit native prefilter/delegation so file configuration cannot discard
 versions allowed by wrapper exceptions. Explicit command-line Cargo overrides
 remain a legacy compatibility case.
 

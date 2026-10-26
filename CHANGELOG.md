@@ -2,6 +2,11 @@
 
 ## 0.4.1 - Unreleased
 
+- Accelerate eligible `auto` updates on Cargo 1.100+ with a conservative native
+  prefilter before the legacy guard, preserving package/registry allowances,
+  configured fallback acceptance and atomic publication.
+- Apply the legacy update guard to inactive optional dependencies too, while
+  retaining configured exemptions and fallback behavior.
 - Select legacy before resolution when Cargo uses custom CA bundles; reject
   forced filtered resolution instead of ignoring the configured certificate trust.
   Configurations using `include` also retain Cargo's legacy handling.

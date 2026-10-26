@@ -5455,3 +5455,257 @@ fn auto_retries_legacy_for_unconfigured_cross_registry_metadata() {
         );
     }
 }
+
+// The fixture is public HTTP; a configured credential provider exercises legacy
+// routing while Cargo remains responsible for the registry transport.
+fn prefilter_command(cargo_home: &Path, workspace_dir: &Path) -> Command {
+    let path = cargo_home.join("config.toml");
+    let config = fs::read_to_string(&path).unwrap();
+    if !config.contains("credential-provider") {
+        fs::write(
+            path,
+            format!("{config}credential-provider = \"cargo:token\"\n"),
+        )
+        .unwrap();
+    }
+    let cutoff = chrono::DateTime::parse_from_rfc3339("2026-03-15T00:00:00Z").unwrap();
+    let seconds = (chrono::Utc::now() - cutoff.with_timezone(&chrono::Utc)).num_seconds();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+    command
+        .arg("update")
+        .current_dir(workspace_dir)
+        .env("CARGO_HOME", cargo_home)
+        .env("COOLDOWN_BACKEND", "auto")
+        .env("COOLDOWN_VERBOSE", "true")
+        .env("COOLDOWN_LOCKFILE_BASELINE", "ignore")
+        .env_remove("COOLDOWN_NOW")
+        .env(
+            "CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE",
+            format!("{seconds} seconds"),
+        );
+    command
+}
+
+#[test]
+fn prefilter_preserves_package_and_registry_exceptions() {
+    let version = Command::new("cargo").arg("--version").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let supported = native_test_supported(
+        &semver::Version::parse(version.split_whitespace().nth(1).unwrap()).unwrap(),
+    );
+    let cutoff = chrono::DateTime::parse_from_rfc3339("2026-04-03T00:00:00Z").unwrap();
+    let relaxed = (chrono::Utc::now() - cutoff.with_timezone(&chrono::Utc)).num_seconds();
+    for (policy, expected, prefilter) in [
+        (String::new(), OLD_VERSION, true),
+        (
+            format!(
+                "[[allow.package]]\ncrates=[\"{CRATE_NAME}\",\"other\"]\nmin-publish-age=\"{relaxed} seconds\"\n"
+            ),
+            FRESH_VERSION,
+            true,
+        ),
+        (
+            format!("[allow.global]\nminutes={}\n", relaxed / 60),
+            FRESH_VERSION,
+            true,
+        ),
+        (
+            format!("[[allow.package]]\ncrate=\"{CRATE_NAME}\"\nminutes=0\n"),
+            FRESH_VERSION,
+            false,
+        ),
+        (
+            format!("[[allow.exact]]\ncrate=\"{CRATE_NAME}\"\nversion=\"{FRESH_VERSION}\"\n"),
+            FRESH_VERSION,
+            false,
+        ),
+        (
+            format!("[registries.{REGISTRY_NAME}]\nmin-publish-age=\"0\"\n"),
+            FRESH_VERSION,
+            true,
+        ),
+        (
+            format!("skip_registries=[\"{REGISTRY_NAME}\"]\n"),
+            FRESH_VERSION,
+            true,
+        ),
+    ] {
+        let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+        fs::write(harness.workspace_dir.join("cooldown.toml"), &policy).unwrap();
+        let mut command = prefilter_command(&harness.cargo_home, &harness.workspace_dir);
+        let cargo_config = harness.cargo_home.join("config.toml");
+        let contents = fs::read_to_string(&cargo_config).unwrap();
+        fs::write(cargo_config, format!("{contents}min-publish-age=\"36500 days\"\n[registry]\nmin-publish-age=\"36500 days\"\nglobal-min-publish-age=\"36500 days\"\n")).unwrap();
+        let output = cooldown_output(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{policy}: {stderr}");
+        assert_eq!(harness.locked_version(), expected, "{policy}");
+        assert_eq!(
+            stderr.contains("cooldown timing: native update prefilter"),
+            supported && prefilter,
+            "{policy}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("retrying original cooldown policy"),
+            "{stderr}"
+        );
+        assert!(
+            !harness
+                .workspace_dir
+                .join("Cargo.lock.cooldown-hold")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn prefilter_retry_retains_deny_fallback_acceptance_and_atomicity() {
+    let version = Command::new("cargo").arg("--version").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let supported = native_test_supported(
+        &semver::Version::parse(version.split_whitespace().nth(1).unwrap()).unwrap(),
+    );
+    for (policy, accept, dry_run, success) in [
+        ("deny", "auto", false, false),
+        ("fallback", "prompt", false, false),
+        ("fallback", "auto", false, true),
+        ("fallback", "auto", true, true),
+    ] {
+        let mut harness = TestHarness::new_with_dependency_req(
+            RegistryMode::PubtimeOnly,
+            &format!("={OLD_VERSION}"),
+        )
+        .unwrap();
+        harness.generate_lockfile();
+        let original = fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap();
+        harness.set_dependency_requirement(&format!("={FRESH_VERSION}"));
+        let mut command = prefilter_command(&harness.cargo_home, &harness.workspace_dir);
+        command
+            .env("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", policy)
+            .env("COOLDOWN_FALLBACK_ACCEPT", accept);
+        if dry_run {
+            command.arg("--dry-run");
+        }
+        let output = cooldown_output(&mut command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.success(),
+            success,
+            "{policy}/{accept}/{dry_run}: {stderr}"
+        );
+        assert_eq!(
+            stderr.contains("native prefilter failed; retrying original cooldown policy"),
+            supported,
+            "{stderr}"
+        );
+        if !success || dry_run {
+            assert_eq!(
+                fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap(),
+                original
+            );
+        } else {
+            assert_eq!(harness.locked_version(), FRESH_VERSION);
+            assert!(
+                stderr.contains("Warning cooldown finished with fresh versions remaining"),
+                "{stderr}"
+            );
+        }
+        assert!(
+            !harness
+                .workspace_dir
+                .join("Cargo.lock.cooldown-hold")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn prefilter_keeps_existing_floor_on_original_resolver() {
+    let mut harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+    harness.generate_lockfile();
+    let original = fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap();
+    let mut command = prefilter_command(&harness.cargo_home, &harness.workspace_dir);
+    command.env("COOLDOWN_LOCKFILE_BASELINE", "floor");
+    let output = cooldown_output(&mut command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("native update prefilter"), "{stderr}");
+    assert_eq!(
+        fs::read(harness.workspace_dir.join("Cargo.lock")).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn prefilter_guard_covers_inactive_optional_dependencies_without_removing_exceptions() {
+    for (policy, allowed, expected) in [
+        ("deny", false, OLD_VERSION),
+        ("fallback", false, OLD_VERSION),
+        ("deny", true, FRESH_VERSION),
+    ] {
+        let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+        let manifest = harness.workspace_dir.join("Cargo.toml");
+        let contents = fs::read_to_string(&manifest).unwrap().replace(
+            "registry = \"cool-reg\"",
+            "registry = \"cool-reg\", optional = true",
+        );
+        fs::write(manifest, contents).unwrap();
+        if allowed {
+            fs::write(
+                harness.workspace_dir.join("cooldown.toml"),
+                format!("[[allow.exact]]\ncrate=\"{CRATE_NAME}\"\nversion=\"{FRESH_VERSION}\"\n"),
+            )
+            .unwrap();
+        }
+        let output = harness.run_command(
+            &["update"],
+            &[
+                LOCKFILE_BASELINE_IGNORE,
+                ("COOLDOWN_INCOMPATIBLE_PUBLISH_AGE", policy),
+                ("COOLDOWN_FALLBACK_ACCEPT", "prompt"),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(harness.locked_version(), expected);
+    }
+}
+
+#[test]
+fn prefilter_lower_bound_still_runs_the_stricter_package_guard() {
+    let harness = FeatureCoverageHarness::new(
+        ["relaxed", "normal"].iter().map(|name| PublishedCrate::new(name, vec![
+            PackageVersion::new(OLD_VERSION, Some(OLD_PUBTIME), false),
+            PackageVersion::new(FRESH_VERSION, Some(FRESH_PUBTIME), false),
+        ])).collect(),
+        root_package_files("[dependencies]\nrelaxed={version=\"1\", registry=\"cool-reg\"}\nnormal={version=\"1\", registry=\"cool-reg\"}\n"),
+    ).unwrap();
+    let cutoff = chrono::DateTime::parse_from_rfc3339("2026-04-03T00:00:00Z").unwrap();
+    let relaxed = (chrono::Utc::now() - cutoff.with_timezone(&chrono::Utc)).num_seconds();
+    fs::write(
+        harness.workspace_dir.join("cooldown.toml"),
+        format!("[[allow.package]]\ncrate=\"relaxed\"\nmin-publish-age=\"{relaxed} seconds\"\n"),
+    )
+    .unwrap();
+    let output = cooldown_output(&mut prefilter_command(
+        &harness.cargo_home,
+        &harness.workspace_dir,
+    ));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lock = harness.lockfile_contents();
+    assert_eq!(
+        parse_lockfile_version(&lock, "relaxed").as_deref(),
+        Some(FRESH_VERSION)
+    );
+    assert_eq!(
+        parse_lockfile_version(&lock, "normal").as_deref(),
+        Some(OLD_VERSION)
+    );
+}
