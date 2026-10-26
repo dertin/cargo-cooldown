@@ -50,6 +50,9 @@ impl IsolatedWorkspace {
             &workspace_root,
             &project.target_directory,
         )?;
+        // Cargo canonicalizes workspace members. Use the same root for rewritten
+        // dependencies and the isolated cwd, including macOS's /var TMPDIR alias.
+        let workspace_root = canonicalize_existing(&workspace_root)?;
         map_path_dependencies(project, &workspace_root)?;
 
         let current_dir = map_current_dir(project, &workspace_root)?;

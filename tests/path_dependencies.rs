@@ -1,4 +1,4 @@
-//! Real Cargo coverage for external local checkouts on Unix and Windows.
+//! Real Cargo coverage for workspace paths and external local checkouts.
 use std::{fs, path::Path, process::Command};
 
 fn crate_at(path: &Path, name: &str, extra: &str) {
@@ -9,6 +9,120 @@ fn crate_at(path: &Path, name: &str, extra: &str) {
     )
     .unwrap();
     fs::write(path.join("src/lib.rs"), "").unwrap();
+}
+
+// Reproduce macOS's /var -> /private/var TMPDIR alias on every Unix runner.
+#[cfg(unix)]
+#[test]
+fn workspace_path_dependencies_with_symlinked_tmpdir() {
+    let temp = tempfile::tempdir().unwrap();
+    let real_tmp = temp.path().join("real-tmp");
+    let alias_tmp = temp.path().join("alias-tmp");
+    fs::create_dir(&real_tmp).unwrap();
+    std::os::unix::fs::symlink(&real_tmp, &alias_tmp).unwrap();
+    assert_ne!(alias_tmp, fs::canonicalize(&alias_tmp).unwrap());
+    let cargo_home = temp.path().join("cargo-home");
+    fs::create_dir(&cargo_home).unwrap();
+    fs::write(
+        cargo_home.join("cooldown.toml"),
+        "[cooldown]\nincompatible-publish-age='deny'\nlockfile-baseline='floor'\n\
+         [registry]\nglobal-min-publish-age='3 days'\n",
+    )
+    .unwrap();
+
+    for backend in ["auto", "legacy", "filtered"] {
+        for existing_lock in [false, true] {
+            // Guard commands with a baseline intentionally require legacy.
+            if backend == "filtered" && existing_lock {
+                continue;
+            }
+            for command in ["check", "test"] {
+                for from_member in [false, true] {
+                    let root = temp
+                        .path()
+                        .join(format!("{backend}-{existing_lock}-{command}-{from_member}"));
+                    crate_at(&root.join("crates/foo"), "foo", "");
+                    crate_at(
+                        &root.join("crates/bar"),
+                        "bar",
+                        "[dependencies]\nfoo.workspace=true\n",
+                    );
+                    fs::write(
+                        root.join("Cargo.toml"),
+                        "[workspace]\nmembers=['crates/foo','crates/bar']\nresolver='2'\n\
+                         [workspace.dependencies]\nfoo={path='crates/foo'}\n",
+                    )
+                    .unwrap();
+                    fs::write(
+                        root.join("crates/foo/src/lib.rs"),
+                        "pub fn answer() -> i32 { 1 }",
+                    )
+                    .unwrap();
+                    fs::write(
+                        root.join("crates/bar/src/lib.rs"),
+                        "#[test]\nfn uses_foo() { assert_eq!(foo::answer(), 1); }\n",
+                    )
+                    .unwrap();
+                    let manifests = [
+                        root.join("Cargo.toml"),
+                        root.join("crates/foo/Cargo.toml"),
+                        root.join("crates/bar/Cargo.toml"),
+                    ];
+                    let originals = manifests.each_ref().map(|path| fs::read(path).unwrap());
+                    let mut plain = Command::new("cargo");
+                    plain.current_dir(&root).env("CARGO_HOME", &cargo_home);
+                    let generated = plain
+                        .args(["generate-lockfile", "--offline"])
+                        .output()
+                        .unwrap();
+                    assert!(
+                        generated.status.success(),
+                        "{}",
+                        String::from_utf8_lossy(&generated.stderr)
+                    );
+                    let baseline = fs::read(root.join("Cargo.lock")).unwrap();
+                    if !existing_lock {
+                        fs::remove_file(root.join("Cargo.lock")).unwrap();
+                    }
+                    let cwd = if from_member {
+                        root.join("crates/bar")
+                    } else {
+                        root.clone()
+                    };
+                    let mut cooldown = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+                    cooldown.args([command, "-p", "bar"]);
+                    if from_member {
+                        cooldown.args(["--manifest-path", "Cargo.toml"]);
+                    }
+                    let output = cooldown
+                        .current_dir(cwd)
+                        .env("TMPDIR", &alias_tmp)
+                        .env("CARGO_HOME", &cargo_home)
+                        .env("CARGO_TARGET_DIR", root.join("target"))
+                        .env("COOLDOWN_BACKEND", backend)
+                        .output()
+                        .unwrap();
+                    assert!(
+                        output.status.success(),
+                        "{backend}/{existing_lock}/{command}/{from_member}: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    if command == "test" {
+                        assert!(
+                            String::from_utf8_lossy(&output.stdout)
+                                .contains("test uses_foo ... ok")
+                        );
+                    }
+                    assert_eq!(fs::read(root.join("Cargo.lock")).unwrap(), baseline);
+                    assert!(!root.join("Cargo.lock.cooldown-hold").exists());
+                    for (manifest, original) in manifests.iter().zip(originals) {
+                        assert_eq!(fs::read(manifest).unwrap(), original);
+                    }
+                    assert_eq!(fs::read_dir(&real_tmp).unwrap().count(), 0);
+                }
+            }
+        }
+    }
 }
 
 #[test]

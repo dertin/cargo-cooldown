@@ -40,7 +40,7 @@ jobs:
         run: cargo install cargo-audit --locked
 
       - name: Audit dependencies
-        run: cargo audit
+        run: cargo audit --deny warnings
 
   regression-tests:
     name: Regression tests (${{ matrix.os }})
