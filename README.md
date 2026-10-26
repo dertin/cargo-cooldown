@@ -1,5 +1,22 @@
 # cargo-cooldown
 
+> [!IMPORTANT]
+> **Experimental cooldown policies; native performance parity is not a goal.**
+> Rust **1.100.0** adds [native Cargo cooldown configuration](https://doc.rust-lang.org/beta/cargo/reference/config.html#registriesnamemin-publish-age).
+> This project's goal is to explore more flexible, experimental cooldown policies
+> for Rust dependencies: per-package windows, exact-version exceptions and
+> configurable fallback when Cargo cannot resolve a fully cooled dependency graph.
+> These options deliberately allow users to trade stricter age requirements for
+> compatibility; strict rejection remains configurable.
+>
+> `cargo-cooldown` operates through Cargo's CLI and adds policy processing,
+> workspace isolation and validation around resolution. It can use native
+> filtering where compatible, but this extra work has a cost. The performance
+> objective is to minimize that overhead while preserving the configured policy,
+> not to promise native speed or an imperceptible difference on every workload.
+> If Cargo's native policy covers your needs, prefer it for its simpler execution
+> path and lower overhead. See the [support boundaries](docs/backends.md).
+
 `cargo-cooldown` is a Cargo wrapper that delays adoption of freshly published
 registry crate versions. Its filtered backend removes fresh releases from a
 process-owned sparse index before Cargo resolves, then validates and atomically
