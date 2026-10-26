@@ -4329,13 +4329,21 @@ fn rustup_directory_override_survives_isolation_and_metadata() {
     fs::create_dir_all(&bin).unwrap();
     let rustup_proxy = bin.join(&rustup_name);
     fs::copy(rustup, &rustup_proxy).unwrap();
-    // Rustup proxies can be hard links, including on Windows.
-    for name in ["cargo", "rustc", "rustdoc"] {
-        fs::hard_link(
-            &rustup_proxy,
-            bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)),
-        )
-        .unwrap();
+    // Exercise hard-linked Cargo detection, including on Windows.
+    fs::hard_link(
+        &rustup_proxy,
+        bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .unwrap();
+    // Homebrew's rustup is a script tied to that tool name, so it cannot serve
+    // as rustc/rustdoc merely by renaming it. Preserve each installed proxy.
+    for name in ["rustc", "rustdoc"] {
+        let executable = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+        let source = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join(&executable))
+            .find(|path| path.is_file())
+            .expect("test toolchain must provide compiler proxies");
+        fs::copy(source, bin.join(executable)).unwrap();
     }
     let linked = Command::new(&rustup_proxy)
         .args(["toolchain", "link", "selected"])
