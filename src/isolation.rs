@@ -85,6 +85,16 @@ impl IsolatedWorkspace {
             .position(|arg| arg == "--")
             .unwrap_or(args.len());
         let mut result = args[..boundary].to_vec();
+        let has_manifest = result.iter().any(|arg| {
+            arg == "--manifest-path"
+                || arg
+                    .to_str()
+                    .is_some_and(|arg| arg.starts_with("--manifest-path="))
+        });
+        if !has_manifest && let Some(path) = &self.manifest.manifest_path {
+            result.push(OsString::from("--manifest-path"));
+            result.push(path.clone().into_os_string());
+        }
         result.push(OsString::from("--config"));
         result.push(OsString::from(lockfile_config(&self.lockfile_path)?));
         result.extend_from_slice(&args[boundary..]);

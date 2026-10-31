@@ -377,10 +377,28 @@ fn external_paths_work_from_root_and_member_including_transitives_and_absolute_p
                 .replace("0.1.0", "0.2.0");
             fs::write(&manifest, &updated).unwrap();
             for command in ["check", "update"] {
+                let manifest_arg = app.join("Cargo.toml");
+                let manifest_arg = if absolute {
+                    manifest_arg.clone()
+                } else {
+                    manifest_arg
+                        .strip_prefix(temp.path())
+                        .unwrap()
+                        .to_path_buf()
+                };
                 let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
                     .args([command, "--manifest-path"])
-                    .arg(app.join("Cargo.toml"))
+                    .arg(manifest_arg)
                     .current_dir(temp.path())
+                    .env("CARGO_HOME", temp.path().join("cargo-home"))
+                    .env(
+                        "COOLDOWN_BACKEND",
+                        if command == "check" {
+                            "filtered"
+                        } else {
+                            "legacy"
+                        },
+                    )
                     .env("CARGO_TARGET_DIR", temp.path().join("target"))
                     .output()
                     .unwrap();
