@@ -81,7 +81,9 @@ environment to obtain more reliable results.
 Building cargo-cooldown requires Rust 1.97 or newer. The selected Cargo used
 to run it must also be 1.97 or newer, including for prebuilt binaries.
 Custom Cargo `resolver.lockfile-path` settings are currently rejected to avoid
-publishing to the wrong lockfile.
+publishing to the wrong lockfile. Invoke Cargo commands directly rather than
+through user-configured Cargo aliases, which can change the command or its
+lockfile options after the cooldown guard.
 
 Install:
 

@@ -144,15 +144,20 @@ fn old_selected_cargo_is_rejected_before_touching_lockfile() {
     std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
     let lock = temp.path().join("Cargo.lock");
     std::fs::write(&lock, "original lockfile\n").unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
-        .arg("update")
-        .current_dir(temp.path())
-        .env("PATH", bin)
-        .env("RUSTUP_TOOLCHAIN", "test")
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("requires Cargo 1.97"));
+    for subcommand in ["update", "init"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .arg(subcommand)
+            .current_dir(temp.path())
+            .env("PATH", &bin)
+            .env("RUSTUP_TOOLCHAIN", "test")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{subcommand}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("requires Cargo 1.97"),
+            "{subcommand}"
+        );
+    }
     assert_eq!(
         std::fs::read_to_string(lock).unwrap(),
         "original lockfile\n"
@@ -263,4 +268,123 @@ fn symlinked_cargo_config_resolves_includes_from_link_directory() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!project.join("Cargo.lock").exists());
+}
+
+#[test]
+fn cargo_aliases_cannot_bypass_lockfile_coordination() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(project.join(".cargo")).unwrap();
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::create_dir_all(project.join("alternate")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(project.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("cooldown.toml"),
+        "[registry]\nglobal-min-publish-age='7 days'\n",
+    )
+    .unwrap();
+    let config = project.join(".cargo/config.toml");
+    let included = project.join(".cargo/extra.toml");
+    let alias = "[alias]\nrogue = ['generate-lockfile', '--config', 'resolver.lockfile-path=\"alternate/Cargo.lock\"']\n";
+    for case in ["direct", "include", "environment", "cli"] {
+        let config_body = if case == "direct" {
+            alias
+        } else if case == "include" {
+            "include=['extra.toml']\n"
+        } else {
+            ""
+        };
+        std::fs::write(&config, config_body).unwrap();
+        std::fs::write(&included, alias).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"));
+        command
+            .arg("rogue")
+            .current_dir(&project)
+            .env("CARGO_HOME", &home)
+            .env_remove("CARGO_ALIAS_ROGUE");
+        if case == "environment" {
+            command.env(
+                "CARGO_ALIAS_ROGUE",
+                "generate-lockfile --config resolver.lockfile-path=\"alternate/Cargo.lock\"",
+            );
+        }
+        if case == "cli" {
+            command.args(["--config", "alias.rogue=['generate-lockfile']"]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("alias"),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!project.join("Cargo.lock").exists(), "{case}");
+        assert!(!project.join("alternate/Cargo.lock").exists(), "{case}");
+    }
+    std::fs::write(&config, alias).unwrap();
+    for args in [["rogue", "--help"], ["help", "rogue"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .args(args)
+            .current_dir(&project)
+            .env("CARGO_HOME", &home)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("alias"));
+    }
+}
+
+#[test]
+fn cargo_config_path_can_contain_equals() {
+    let temp = tempdir().unwrap();
+    let project = temp.path().join("project");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(project.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname='app'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    std::fs::write(project.join("config=test.toml"), "[term]\ncolor='never'\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .args(["update", "--config", "config=test.toml", "--offline"])
+        .current_dir(&project)
+        .env("CARGO_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(project.join("Cargo.lock").exists());
+
+    std::fs::write(
+        project.join("config=test.toml"),
+        "[resolver]\nlockfile-path='alternate/Cargo.lock'\n",
+    )
+    .unwrap();
+    let before = std::fs::read(project.join("Cargo.lock")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+        .args(["update", "--config", "config=test.toml", "--offline"])
+        .current_dir(&project)
+        .env("CARGO_HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("lockfile-path"));
+    assert_eq!(std::fs::read(project.join("Cargo.lock")).unwrap(), before);
 }

@@ -11,6 +11,19 @@ pub fn ensure_default_lockfile(cwd: &Path, args: &[OsString]) -> Result<()> {
         std::env::var_os("CARGO_RESOLVER_LOCKFILE_PATH").is_none(),
         "custom Cargo resolver.lockfile-path is not supported; unset CARGO_RESOLVER_LOCKFILE_PATH"
     );
+    let command = match args.first().and_then(|arg| arg.to_str()) {
+        Some("help") => args.get(1).and_then(|arg| arg.to_str()).unwrap_or("help"),
+        Some(command) => command,
+        None => "",
+    };
+    let alias_env = format!(
+        "CARGO_ALIAS_{}",
+        command.to_ascii_uppercase().replace('-', "_")
+    );
+    ensure!(
+        std::env::var_os(alias_env).is_none(),
+        "Cargo alias `{command}` is not supported by cargo-cooldown; invoke its underlying command explicitly"
+    );
     let mut files = Vec::new();
     if let Some(home) = std::env::var_os("CARGO_HOME")
         .map(PathBuf::from)
@@ -28,7 +41,7 @@ pub fn ensure_default_lockfile(cwd: &Path, args: &[OsString]) -> Result<()> {
             dir.join("config.toml")
         };
         if path.exists() {
-            check_file(&path, &mut seen)?;
+            check_file(&path, &mut seen, command)?;
         }
     }
     let mut iter = args.iter().take_while(|arg| *arg != "--");
@@ -53,19 +66,19 @@ pub fn ensure_default_lockfile(cwd: &Path, args: &[OsString]) -> Result<()> {
         };
         if let Some(value) = value {
             let value = value.to_str().context("Cargo --config must be UTF-8")?;
-            if value.contains('=') {
+            if cwd.join(value).is_file() || !value.contains('=') {
+                check_file(&cwd.join(value), &mut seen, command)?;
+            } else {
                 let table: toml::Table =
                     toml::from_str(value).context("invalid Cargo --config override")?;
-                check_table(&table, cwd, &mut seen)?;
-            } else {
-                check_file(&cwd.join(value), &mut seen)?;
+                check_table(&table, cwd, &mut seen, command)?;
             }
         }
     }
     Ok(())
 }
 
-fn check_file(path: &Path, seen: &mut HashSet<PathBuf>) -> Result<()> {
+fn check_file(path: &Path, seen: &mut HashSet<PathBuf>, command: &str) -> Result<()> {
     let identity = fs::canonicalize(path)
         .with_context(|| format!("cannot inspect Cargo configuration {}", path.display()))?;
     ensure!(
@@ -82,18 +95,33 @@ fn check_file(path: &Path, seen: &mut HashSet<PathBuf>) -> Result<()> {
         &table,
         path.parent().context("Cargo configuration has no parent")?,
         seen,
+        command,
     );
     seen.remove(&identity);
     result
 }
 
-fn check_table(table: &toml::Table, base: &Path, seen: &mut HashSet<PathBuf>) -> Result<()> {
+fn check_table(
+    table: &toml::Table,
+    base: &Path,
+    seen: &mut HashSet<PathBuf>,
+    command: &str,
+) -> Result<()> {
     if table
         .get("resolver")
         .and_then(|value| value.get("lockfile-path"))
         .is_some()
     {
         bail!("custom Cargo resolver.lockfile-path is not supported by cargo-cooldown");
+    }
+    if table
+        .get("alias")
+        .and_then(|value| value.get(command))
+        .is_some()
+    {
+        bail!(
+            "Cargo alias `{command}` is not supported by cargo-cooldown; invoke its underlying command explicitly"
+        );
     }
     if let Some(includes) = table.get("include") {
         let includes = includes
@@ -121,7 +149,7 @@ fn check_table(table: &toml::Table, base: &Path, seen: &mut HashSet<PathBuf>) ->
             if optional && !path.exists() {
                 continue;
             }
-            check_file(&path, seen)?;
+            check_file(&path, seen, command)?;
         }
     }
     Ok(())

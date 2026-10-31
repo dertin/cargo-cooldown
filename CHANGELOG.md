@@ -5,7 +5,8 @@
 - Require Rust and the selected Cargo 1.97 or newer. Resolve against a temporary
   lockfile instead of copying the workspace, avoiding unrelated directory costs
   and races such as `node_modules` (#29). Reject custom Cargo lockfile paths until
-  they can be published safely.
+  they can be published safely, and reject user-configured Cargo aliases because
+  their expansion can bypass the guard.
 - Accelerate eligible `auto` updates on Cargo 1.100+ with a conservative native
   prefilter before the legacy guard, preserving package/registry allowances,
   configured fallback acceptance and atomic publication.

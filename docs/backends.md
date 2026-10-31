@@ -61,7 +61,7 @@ are eligible.
 
 On Cargo 1.100+, `auto` can also accelerate a full `update` that needs legacy,
 including private registries and custom CA bundles. This is a native prefilter
-against the existing temporary lockfile, followed by the full legacy policy guard;
+using the temporary lockfile path, followed by the full legacy policy guard;
 it does not make forced `native` accept unsupported policies.
 
 The prefilter uses each registry's effective cooldown, capped by the shortest

@@ -80,7 +80,9 @@ At the beginning of one `cargo-cooldown` execution, the resolver:
 No workspace files are copied. Custom `resolver.lockfile-path` settings from the
 Cargo environment, configuration files (including `include`), or `--config` are
 rejected before resolution: publication to a user-selected lockfile is not yet
-supported. The temporary override is passed only to speculative Cargo commands.
+supported. User-configured Cargo aliases are also rejected; call their underlying
+Cargo commands directly so expansion cannot bypass the guard. The temporary
+override is passed only to speculative Cargo commands.
 
 The real root lockfile remains in place while cooldown works. An atomic marker
 file named `Cargo.lock.cooldown-hold` serializes concurrent cooldown processes;
@@ -181,8 +183,9 @@ That means `cargo cooldown update` has this exact shape:
 
 ## 2. Graph scan and release-age inspection
 
-On each outer pass, `cargo-cooldown` runs `cargo metadata` against the temporary lockfile in the original workspace and rebuilds the derived cooldown state from Cargo's current
-resolved graph.
+On each outer pass, `cargo-cooldown` reads or reuses Cargo metadata for the
+temporary lockfile in the original workspace and rebuilds the derived cooldown
+state from Cargo's current resolved graph.
 
 For each registry package in the selected dependency closure:
 

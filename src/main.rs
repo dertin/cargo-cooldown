@@ -684,6 +684,7 @@ fn main() -> Result<()> {
                 exit_with(2);
             }
 
+            backend::ensure_minimum_cargo()?;
             let project = ProjectContext::discover_for_init()?;
             init::run(&project)?;
             Ok(())
@@ -704,6 +705,12 @@ fn main() -> Result<()> {
             }
 
             if is_cargo_help_request(&forwarded_args) {
+                if matches!(command, CooldownCommand::Cargo(_)) {
+                    cargo_lockfile_config::ensure_default_lockfile(
+                        &std::env::current_dir()?,
+                        &forwarded_args,
+                    )?;
+                }
                 let status = crate::backend::own_cargo_with_args(&forwarded_args).status()?;
                 exit_with(status.code().unwrap_or(1));
             }
