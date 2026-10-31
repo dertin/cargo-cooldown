@@ -535,7 +535,6 @@ mod tests {
             cwd: PathBuf::from(path),
             kind: ProjectKind::Workspace,
             workspace_root: PathBuf::from(path),
-            target_directory: PathBuf::from(path).join("target"),
             members,
             active_member: None,
         }

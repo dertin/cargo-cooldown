@@ -17,8 +17,8 @@ The authoritative automated suite lives in `./tests`.
 - batch solver coverage for independent, duplicate, optional, target-specific,
   and newly introduced transitive dependencies
 - isolation coverage that keeps `Cargo.lock` parseable for concurrent readers,
-  serializes cooldown processes with `Cargo.lock.cooldown-hold`, and maps
-  relative external `path` dependencies without symlinks
+  serializes cooldown processes with `Cargo.lock.cooldown-hold`, and preserves
+  relative external `path` dependencies without copying the workspace
 
 Issue regressions include targeted direct updates and a deterministic transitive
 `h2` fixture (0.4.16 versus 0.4.19, seven-day cooldown), member manifests,

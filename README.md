@@ -1,13 +1,89 @@
 # cargo-cooldown
 
+> [!IMPORTANT]
+> **Experimental cooldown policies; native performance parity is not a goal.**
+> Rust **1.100.0** adds [native Cargo cooldown configuration](https://doc.rust-lang.org/beta/cargo/reference/config.html#registriesnamemin-publish-age).
+> This project's goal is to explore more flexible, experimental cooldown policies
+> for Rust dependencies: per-package windows, exact-version exceptions and
+> configurable fallback when Cargo cannot resolve a fully cooled dependency graph.
+> These options deliberately allow users to trade stricter age requirements for
+> compatibility; strict rejection remains configurable.
+>
+> `cargo-cooldown` operates through Cargo's CLI and adds policy processing,
+> lockfile isolation and validation around resolution. It can use native
+> filtering where compatible, but this extra work has a cost. The performance
+> objective is to minimize that overhead while preserving the configured policy,
+> not to promise native speed or an imperceptible difference on every workload.
+> If Cargo's native policy covers your needs, prefer it for its simpler execution
+> path and lower overhead. See the [support boundaries](docs/backends.md).
+
 `cargo-cooldown` is a Cargo wrapper that delays adoption of freshly published
-registry crate versions. It lets Cargo resolve the graph, then replaces fresh
-versions with the newest older compatible versions that Cargo still accepts.
+registry crate versions. Its filtered backend removes fresh releases from a
+process-owned sparse index before Cargo resolves, then validates and atomically
+publishes the lockfile. The legacy resolver remains available for compatibility.
 
 Use it when you want dependency updates, but do not want `Cargo.lock` to pick
 up releases that were published too recently.
 
+## Engine selection
+
+```toml
+[cooldown]
+backend = "auto" # auto | filtered | native | legacy
+```
+
+`COOLDOWN_BACKEND` overrides the file setting. Use `filtered` to run the
+independent engine on Cargo without native cooldown. `auto` chooses native Cargo
+1.100+ only when policy equivalence is established, then filtered, then legacy.
+Forcing an unsupported engine returns a diagnostic rather than weakening policy.
+
+See [engine support and guarantees](docs/backends.md).
+
+## Performance reference
+
+Before switching to temporary lockfiles in 0.4.1, a local Linux comparison on
+two large dependency graphs measured **about 5% and 16% more elapsed time than
+native Cargo with network access**. Offline, both measured **about 0.60 seconds
+of additional overhead**: 1.07 s for the wrapper versus 0.47 s natively
+(approximately **+129%**). Short native operations make the percentage look much
+larger even when the absolute overhead is below a second.
+
+These are full-process medians from six runs per graph and mode, using release
+binaries, Cargo **1.100.0-beta.3**, warm caches and equivalent policies: seven
+days for crates.io, an exempt additional registry, `deny`, and wrapper baseline
+`ignore`. Each run started from the same lockfile; resulting dependency versions,
+sources and checksums matched. Network variability was substantial. These
+observations are **not an expected range or a performance guarantee**: overhead
+depends on the graph, cache, network, policy and selected backend. Incompatible
+policies retain other resolution paths and may cost more.
+
+The broader comparison below covers different scenarios and backend paths:
+
+This local Linux test of an earlier 0.4.1 development revision, before the
+temporary-lockfile change, is an approximate reference, not an exact benchmark
+or a guarantee for other workloads. All modes use Cargo 1.100 beta and the same
+seven-day policy, without additional exceptions. It compares full and targeted
+updates without an existing lockfile, with 1, 24 and 128 direct dependencies plus
+transitives, single packages and workspaces, and warm and cold caches. Ratios give
+each scenario equal weight; lower is faster. We will work on a better measurement
+environment to obtain more reliable results.
+
+| Mode | Warm cache | Cold cache | Overall |
+| --- | ---: | ---: | ---: |
+| Cargo native | 1.00× | 1.00× | 1.00× |
+| `auto` | 1.33× | 1.35× | 1.34× |
+| `filtered` | 1.67× | 1.60× | 1.63× |
+| `native` | 1.36× | 1.32× | 1.34× |
+| `legacy` | 5.65× | 5.85× | 5.75× |
+
 ## Quick Start
+
+Building cargo-cooldown requires Rust 1.97 or newer. The selected Cargo used
+to run it must also be 1.97 or newer, including for prebuilt binaries.
+Custom Cargo `resolver.lockfile-path` settings are currently rejected to avoid
+publishing to the wrong lockfile. Invoke Cargo commands directly rather than
+through user-configured Cargo aliases, which can change the command or its
+lockfile options after the cooldown guard.
 
 Install:
 
@@ -57,8 +133,8 @@ Update dependencies under cooldown:
 cargo cooldown update
 ```
 
-`update` is the `Cargo.lock` refresh command: Cargo resolves the newest graph
-first, then cooldown cools the updated `Cargo.lock` before it is kept.
+`update` refreshes `Cargo.lock` under the selected cooldown policy, including
+targeted updates with `-p`.
 
 `cargo cooldown init` is cargo-cooldown's setup wizard. To create a new Cargo
 package, use Cargo's own command:
