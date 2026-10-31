@@ -103,6 +103,9 @@ a persistent daemon. Eight owned workers reuse inbound/outbound connections;
 normal completion and errors stop and join the workers. Cargo's loopback requests
 bypass proxies. Upstream HTTP honors `CARGO_HTTP_PROXY`, then Cargo's `[http].proxy`;
 without either, reqwest uses its default proxy environment and TLS configuration.
+Workers check for shutdown before each upstream attempt, avoiding further retries
+after they observe it. An in-flight request can still take up to its 15-second
+timeout to finish.
 An empty Cargo proxy disables upstream proxying. Upstream HTTP failures other than
 404, or an invalid index, abort publication even if Cargo could backtrack to an
 older graph.

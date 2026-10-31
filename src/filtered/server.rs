@@ -32,7 +32,7 @@ impl Server {
         // Share the nonblocking listener itself; no duplicated OS sockets are
         // needed for threads owned by this process.
         let listener = Arc::new(listener);
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&state.stopping);
         let mut server = Self {
             address,
             stop,
@@ -189,6 +189,142 @@ fn serve(stream: TcpStream, state: &State, stop: &AtomicBool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_does_not_retry_an_inflight_request() {
+        use std::sync::{Mutex, mpsc};
+
+        use crate::allow_rules::AllowRules;
+        use crate::backend::Backend;
+        use crate::config::{
+            Config, FallbackAccept, IncompatiblePublishAgePolicy, LockfileBaselineMode,
+        };
+        use crate::filtered::{Lockfile, Registry};
+        use crate::project::ProjectKind;
+        use crate::registry::resolve_registry_context;
+
+        let temp = tempfile::tempdir().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let url = format!("sparse+http://{}/", upstream.local_addr().unwrap());
+        let (received_tx, received_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        let upstream_finished = Arc::clone(&finished);
+        let upstream_worker = thread::spawn(move || {
+            let mut requests = 0;
+            while !upstream_finished.load(Ordering::Relaxed) {
+                match upstream.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        {
+                            let mut reader = BufReader::new(&mut stream);
+                            loop {
+                                let mut line = String::new();
+                                assert!(reader.read_line(&mut line).unwrap() > 0);
+                                if line == "\r\n" {
+                                    break;
+                                }
+                            }
+                        }
+                        if requests == 0 || requests == 3 {
+                            received_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        }
+                        requests += 1;
+                        let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(err) => panic!("upstream accept failed: {err}"),
+                }
+            }
+        });
+        let project = ProjectContext {
+            cwd: temp.path().to_path_buf(),
+            kind: ProjectKind::Crate,
+            workspace_root: temp.path().to_path_buf(),
+            members: Vec::new(),
+            active_member: None,
+        };
+        let config = Config {
+            backend: Backend::Filtered,
+            min_publish_age_seconds: 60,
+            registry_min_publish_age: Default::default(),
+            incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,
+            fallback_accept: FallbackAccept::Prompt,
+            lockfile_baseline: LockfileBaselineMode::Ignore,
+            now_override: None,
+            ttl_seconds: 60,
+            cache_dir: None,
+            http_retries: 2,
+            verbose: false,
+            skip_registries: Vec::new(),
+            allow_rules: AllowRules::default(),
+        };
+        let state = Arc::new(State {
+            config,
+            registries: vec![Registry {
+                source: url.clone(),
+                context: resolve_registry_context(&url, &[]).unwrap(),
+                upstream: url.strip_prefix("sparse+").unwrap().to_string(),
+                baseline_versions: Default::default(),
+            }],
+            baseline: Lockfile::default(),
+            now: chrono::Utc::now(),
+            per_crate: Default::default(),
+            client: Mutex::new(Some(
+                reqwest::blocking::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap(),
+            )),
+            http_proxy: None,
+            cache: temp.path().join("cache"),
+            crates: Mutex::new(Default::default()),
+            originals: Mutex::new(Default::default()),
+            requests: Default::default(),
+            bytes: Default::default(),
+            unsupported: Mutex::new(None),
+            request_failure: Mutex::new(None),
+            excluded_versions: AtomicBool::new(false),
+            stopping: Arc::new(AtomicBool::new(false)),
+        });
+        // Normal requests still get the configured retries while the server is running.
+        let retry_state = Arc::clone(&state);
+        let retry = thread::spawn(move || retry_state.fetch_original(0, "config.json"));
+        received_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        release_tx.send(()).unwrap();
+        assert!(retry.join().unwrap().is_err());
+        assert_eq!(state.requests.load(Ordering::Relaxed), 3);
+
+        let server = Server::start(Arc::clone(&state), &project).unwrap();
+        let mut client = TcpStream::connect(server.address).unwrap();
+        client
+            .write_all(b"GET /0/config.json HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        received_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let stopping = Arc::clone(&state.stopping);
+        let (joined_tx, joined_rx) = mpsc::channel();
+        let shutdown = thread::spawn(move || {
+            drop(server);
+            joined_tx.send(()).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !stopping.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "shutdown did not start");
+            thread::yield_now();
+        }
+        release_tx.send(()).unwrap();
+        joined_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        shutdown.join().unwrap();
+        finished.store(true, Ordering::Relaxed);
+        upstream_worker.join().unwrap();
+        assert_eq!(state.requests.load(Ordering::Relaxed), 4);
+    }
 
     #[test]
     fn http_line_survives_idle_and_partial_read_timeouts() {

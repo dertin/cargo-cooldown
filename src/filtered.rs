@@ -301,6 +301,7 @@ struct State {
     unsupported: Mutex<Option<String>>,
     request_failure: Mutex<Option<String>>,
     excluded_versions: AtomicBool,
+    stopping: Arc<AtomicBool>,
 }
 impl State {
     fn http_client(&self) -> Result<Client> {
@@ -352,6 +353,10 @@ impl State {
         }
         let mut attempt = 0;
         let response = loop {
+            ensure!(
+                !self.stopping.load(Ordering::Relaxed),
+                "filtered index server is stopping"
+            );
             self.requests.fetch_add(1, Ordering::Relaxed);
             let response = request
                 .try_clone()
@@ -745,6 +750,7 @@ pub fn run(
         unsupported: Mutex::new(None),
         request_failure: Mutex::new(None),
         excluded_versions: AtomicBool::new(false),
+        stopping: Arc::new(AtomicBool::new(false)),
     });
     if backend == Backend::Filtered {
         command.env("CARGO_HTTP_PROXY", "");
