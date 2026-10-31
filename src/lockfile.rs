@@ -219,6 +219,7 @@ mod tests {
 
     fn config_fixture() -> Config {
         Config {
+            backend: crate::backend::Backend::Legacy,
             min_publish_age_seconds: 60,
             registry_min_publish_age: Default::default(),
             incompatible_publish_age: IncompatiblePublishAgePolicy::Deny,

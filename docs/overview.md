@@ -33,9 +33,9 @@ Cargo consumes them.
 For guard-style commands:
 
 1. acquire `Cargo.lock.cooldown-hold` and capture the original lockfile
-2. copy the workspace while keeping the real `Cargo.lock` readable
+2. create a temporary `Cargo.lock` while keeping the real lockfile readable
 3. snapshot the temp copy of the current `Cargo.lock`
-4. read Cargo metadata in the temp workspace
+4. read Cargo metadata against the temporary lockfile
 5. inspect reachable registry packages
 6. replace fresh versions with older compatible versions when possible
 7. ask Cargo to validate the resulting lockfile
@@ -50,7 +50,7 @@ The practical effect by command is:
 | `cargo cooldown build` | Runs the pre-command guard before Cargo compiles dependencies and runs dependency build scripts. |
 | `cargo cooldown test` | Runs the pre-command guard before Cargo compiles test/dev-dependency graphs and runs tests. |
 | `cargo cooldown run` | Runs the pre-command guard before Cargo builds and then executes the selected binary. |
-| `cargo cooldown update` | Refreshes the lockfile in an isolated workspace, then cools the updated graph before publishing the final `Cargo.lock`. |
+| `cargo cooldown update` | Refreshes a temporary lockfile, then cools the updated graph before publishing the final `Cargo.lock`. |
 
 The current implementation applies the same pre-command guard to any forwarded
 Cargo subcommand except `update` when cooldown is enabled. The documented
@@ -61,9 +61,9 @@ pass.
 For `cargo cooldown update`:
 
 1. acquire `Cargo.lock.cooldown-hold` and capture the original lockfile
-2. copy the workspace while keeping the real `Cargo.lock` readable
+2. create a temporary `Cargo.lock` while keeping the real lockfile readable
 3. snapshot the temp copy of the current `Cargo.lock`
-4. run `cargo update` in the temp workspace
+4. run `cargo update` against the temporary lockfile
 5. cool the updated temp lockfile
 6. publish the final temp `Cargo.lock` back to the real workspace
 7. restore the original lockfile if `incompatible-publish-age = "deny"` fails
