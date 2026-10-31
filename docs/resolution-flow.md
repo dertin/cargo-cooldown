@@ -86,9 +86,10 @@ override is passed only to speculative Cargo commands.
 
 The real root lockfile remains in place while cooldown works. An atomic marker
 file named `Cargo.lock.cooldown-hold` serializes concurrent cooldown processes;
-the second process waits with a visible message and bounded backoff, then
-captures the newly published baseline before creating its temporary lockfile. Before
-publication, cooldown verifies that the original lockfile bytes are unchanged,
+the second process waits without a time limit, using a bounded delay between
+attempts, then captures the newly published baseline before creating its
+temporary lockfile. Before publication, cooldown verifies that the original
+lockfile bytes are unchanged,
 stages and syncs the result in a sibling temporary file, rechecks the baseline,
 and replaces `Cargo.lock` atomically on Unix and Windows without first deleting
 the original. Detected external changes reject publication.
@@ -100,8 +101,10 @@ Avoid concurrent lockfile writers. This is resolution isolation, not a security
 sandbox: external local dependencies remain readable, and subsequent forwarded
 Cargo commands can execute build scripts in the usual way.
 
-If the process is killed abruptly, the marker can remain. Confirm that no
-`cargo-cooldown` process is running before removing that marker and retrying.
+If the holder is killed abruptly, the marker can remain and later processes
+will keep waiting. Stop the waiting command and confirm that no process still
+holds the marker before removing it and retrying. The marker is never removed
+automatically based on its age or PID.
 
 The baseline snapshot is taken before any Cargo command is allowed to rewrite
 the temp lockfile.

@@ -2,6 +2,9 @@
 
 ## 0.4.1 - Unreleased
 
+- Wait for an existing cooldown lock without a fixed timeout, allowing long
+  resolutions to finish before the next process continues (#30). Interrupted
+  runs may still require manual marker removal after confirming no holder remains.
 - Require Rust and the selected Cargo 1.97 or newer. Resolve against a temporary
   lockfile instead of copying the workspace, avoiding unrelated directory costs
   and races such as `node_modules` (#29). Reject custom Cargo lockfile paths until

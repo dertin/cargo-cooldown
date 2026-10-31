@@ -109,8 +109,9 @@ They do not apply to:
 
 Cooldown keeps the user-visible `Cargo.lock` intact while it works. Coordination
 uses the sibling `Cargo.lock.cooldown-hold` marker, so rust-analyzer can continue
-parsing the lockfile. If that marker remains after a crash, confirm no
-cooldown process is running, remove only the marker, and retry. A lockfile
+parsing the lockfile. A second cooldown process waits without a fixed timeout.
+If the marker remains after a crash, stop waiting, confirm no other cooldown
+process holds it, remove only the marker, and retry. A lockfile
 whose external changes are detected during cooldown is rejected. Plain Cargo
 does not honor the marker; avoid running simultaneous lockfile writers.
 

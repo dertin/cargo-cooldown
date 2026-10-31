@@ -19,7 +19,6 @@ use crate::project::ProjectContext;
 
 const LOCKFILE_MARKER_PREFIX: &str = "cargo-cooldown lockfile lock";
 const LOCKFILE_MARKER_NAME: &str = "Cargo.lock.cooldown-hold";
-const LOCK_ACQUIRE_ATTEMPTS: usize = 600;
 
 /// Temporary lockfile used for all speculative Cargo operations in one run.
 pub struct IsolatedWorkspace {
@@ -286,7 +285,17 @@ impl Drop for LockfileHoldGuard {
 }
 
 fn acquire_marker(marker_path: &Path, id: &str) -> Result<()> {
-    for attempt in 0..LOCK_ACQUIRE_ATTEMPTS {
+    acquire_marker_with_wait(marker_path, id, thread::sleep)
+}
+
+fn acquire_marker_with_wait(
+    marker_path: &Path,
+    id: &str,
+    mut wait: impl FnMut(Duration),
+) -> Result<()> {
+    let mut delay = Duration::from_millis(50);
+    let mut announced = false;
+    loop {
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -303,10 +312,15 @@ fn acquire_marker(marker_path: &Path, id: &str) -> Result<()> {
                 return Ok(());
             }
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {
-                if attempt == 0 {
+                if !announced {
                     eprintln!("Waiting for cargo-cooldown lock: {}", marker_path.display());
+                    eprintln!(
+                        "If a previous run was interrupted, stop waiting and remove the marker only after confirming no other cargo-cooldown process holds it."
+                    );
+                    announced = true;
                 }
-                thread::sleep(Duration::from_millis(50 + (attempt.min(15) as u64) * 10));
+                wait(delay);
+                delay = (delay + Duration::from_millis(10)).min(Duration::from_millis(200));
             }
             Err(err) => {
                 return Err(err).with_context(|| {
@@ -318,11 +332,6 @@ fn acquire_marker(marker_path: &Path, id: &str) -> Result<()> {
             }
         }
     }
-
-    bail!(
-        "timed out waiting for {}; another cargo-cooldown process may be interrupted; remove the marker only after confirming no cooldown process is running",
-        marker_path.display()
-    )
 }
 
 fn ensure_no_existing_lockfile_hold(lockfile_path: &Path) -> Result<()> {
@@ -654,14 +663,46 @@ mod tests {
         let temp_dir = tempfile::tempdir().expect("tempdir should build");
         let marker = temp_dir.path().join(LOCKFILE_MARKER_NAME);
         fs::write(&marker, "previous run").expect("marker should be writable");
-        let release_marker = marker.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(70));
-            fs::remove_file(release_marker).expect("previous marker should be removable");
+        let waiting_marker = marker.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            sender
+                .send(acquire_marker(&waiting_marker, "test"))
+                .unwrap();
         });
 
-        acquire_marker(&marker, "test").expect("acquisition should wait and succeed");
-        assert!(marker.exists());
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(350)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "previous run");
+        fs::remove_file(&marker).expect("previous marker should be removable");
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("waiter should acquire the released marker")
+            .expect("marker acquisition should succeed");
+        waiter.join().unwrap();
+        assert!(fs::read_to_string(&marker).unwrap().contains("test"));
         fs::remove_file(marker).expect("test marker should be removable");
+    }
+
+    #[test]
+    fn marker_acquisition_survives_the_old_retry_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join(LOCKFILE_MARKER_NAME);
+        fs::write(&marker, "previous run").unwrap();
+        let mut waits = 0;
+
+        acquire_marker_with_wait(&marker, "next run", |_| {
+            waits += 1;
+            if waits == 700 {
+                assert_eq!(fs::read_to_string(&marker).unwrap(), "previous run");
+                fs::remove_file(&marker).unwrap();
+            }
+        })
+        .unwrap();
+
+        assert_eq!(waits, 700);
+        assert!(fs::read_to_string(&marker).unwrap().contains("next run"));
     }
 }
