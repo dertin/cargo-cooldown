@@ -29,7 +29,6 @@ pub struct ProjectContext {
     pub cwd: PathBuf,
     pub kind: ProjectKind,
     pub workspace_root: PathBuf,
-    pub target_directory: PathBuf,
     pub members: Vec<ProjectMember>,
     pub active_member: Option<ProjectMember>,
 }
@@ -179,12 +178,6 @@ impl ProjectContext {
         {
             return Ok(None);
         }
-        let target_directory = match env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
-            Some(path) if path.is_absolute() => path,
-            Some(path) => cwd.join(path),
-            None => workspace_root.join("target"),
-        };
-        let target_directory = normalize_target_directory(&target_directory);
         let active_member = determine_active_member(
             selection,
             &cwd,
@@ -196,7 +189,6 @@ impl ProjectContext {
             cwd,
             kind,
             workspace_root,
-            target_directory,
             members,
             active_member,
         }))
@@ -254,7 +246,6 @@ impl ProjectContext {
             cwd,
             kind,
             workspace_root,
-            target_directory: normalize_target_directory(metadata.target_directory.as_std_path()),
             members,
             active_member,
         })
@@ -311,24 +302,6 @@ fn manifest_declares_workspace(path: &Path) -> Result<bool> {
     let manifest: toml::Value = toml::from_str(&contents)
         .with_context(|| format!("failed to parse project manifest {}", path.display()))?;
     Ok(manifest.get("workspace").is_some())
-}
-
-// Resolve Cargo's path aliases even when the target directory does not exist.
-// Leave inaccessible target paths to Cargo; discovery itself does not need them.
-fn normalize_target_directory(path: &Path) -> PathBuf {
-    for ancestor in path.ancestors() {
-        match fs::canonicalize(ancestor) {
-            Ok(resolved) => {
-                if let Ok(suffix) = path.strip_prefix(ancestor) {
-                    return resolved.join(suffix);
-                }
-                break;
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => break,
-        }
-    }
-    path.to_path_buf()
 }
 
 fn workspace_members(metadata: &Metadata) -> Result<Vec<ProjectMember>> {
@@ -489,7 +462,6 @@ mod tests {
             cwd: PathBuf::from("/tmp/workspace"),
             kind: ProjectKind::Workspace,
             workspace_root: PathBuf::from("/tmp/workspace"),
-            target_directory: PathBuf::from("/tmp/workspace/target"),
             members: Vec::new(),
             active_member: Some(ProjectMember {
                 name: "root".to_string(),
@@ -499,15 +471,6 @@ mod tests {
         };
 
         assert!(context.member_config_path().is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn target_normalization_preserves_unresolvable_paths() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("loop");
-        std::os::unix::fs::symlink("loop", &target).unwrap();
-        assert_eq!(normalize_target_directory(&target), target);
     }
 
     #[cfg(unix)]
@@ -604,7 +567,6 @@ mod simple_discovery_tests {
             };
             let cargo = ProjectContext::discover(&selection).unwrap();
             assert_eq!(simple.workspace_root, cargo.workspace_root);
-            assert_eq!(simple.target_directory, cargo.target_directory);
             assert_eq!(simple.active_member, cargo.active_member);
             assert_eq!(simple.members, cargo.members);
             assert_eq!(cargo.active_member.as_ref().unwrap().name, "one");

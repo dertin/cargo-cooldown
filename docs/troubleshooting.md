@@ -116,9 +116,6 @@ does not honor the marker; avoid running simultaneous lockfile writers.
 
 ## Relative `path` Dependencies
 
-Cooldown rewrites dependency paths only in the temporary manifests. Internal
-paths use the workspace copy; external paths use the original checkout's
-absolute location, preserving its nested dependencies and workspace settings.
-This requires no symlink privileges on Windows. External checkouts must remain
-available during resolution. Missing paths produce a diagnostic naming the
-declaring manifest and original path.
+Cooldown uses Cargo's original workspace and manifests with a temporary lockfile.
+Relative and external path dependencies must remain available during resolution.
+No workspace copy or symlink privileges are needed.

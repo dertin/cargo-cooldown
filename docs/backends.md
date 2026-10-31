@@ -39,8 +39,8 @@ With `incompatible-publish-age = "fallback"`, supported commands first try a
 fully compliant filtered resolution. Success needs no fallback acceptance. If
 resolution fails after versions were excluded by age, `auto` invokes legacy with
 the original policy and acceptance settings. For updates, it restores the initial
-lockfile in the same isolated workspace and retains lockfile coordination across
-the retry. Other unsupported cases recreate the isolated workspace.
+lockfile in the same temporary lockfile and retains lockfile coordination across
+the retry. Other unsupported cases create a new temporary lockfile.
 Forced `filtered` reports that legacy is required instead of switching engines.
 Network and validation failures abort without publishing; they do not trigger
 age relaxation. If legacy is needed, the extra filtered attempt adds work.
@@ -61,7 +61,7 @@ are eligible.
 
 On Cargo 1.100+, `auto` can also accelerate a full `update` that needs legacy,
 including private registries and custom CA bundles. This is a native prefilter
-inside the existing isolated workspace, followed by the full legacy policy guard;
+against the existing temporary lockfile, followed by the full legacy policy guard;
 it does not make forced `native` accept unsupported policies.
 
 The prefilter uses each registry's effective cooldown, capped by the shortest
@@ -117,7 +117,7 @@ still checks the current policy. Native validation reads Cargo's refreshed spars
 cache under its package-cache lock and applies the same timestamp and checksum
 checks; unavailable cache entries fall back to HTTP.
 
-The existing workspace isolation holds coordination before reading the baseline,
+The lockfile isolation holds coordination before reading the baseline,
 preserves external path mapping and lockfile permissions, and checks original bytes
 before atomic publication. Native eligibility is checked again against the baseline
 observed after coordination; a newly published baseline rejects forced native and

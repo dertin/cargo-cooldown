@@ -840,7 +840,7 @@ pub fn run(
     } else {
         vec![OsString::from("generate-lockfile")]
     };
-    let resolution_args = isolated.rewrite_cargo_args(&resolution_args);
+    let resolution_args = isolated.cargo_args(&resolution_args)?;
     let mut command = if backend == Backend::Native {
         crate::backend::cargo()
     } else {

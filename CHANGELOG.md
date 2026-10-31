@@ -2,6 +2,10 @@
 
 ## 0.4.1 - Unreleased
 
+- Require Rust and the selected Cargo 1.97 or newer. Resolve against a temporary
+  lockfile instead of copying the workspace, avoiding unrelated directory costs
+  and races such as `node_modules` (#29). Reject custom Cargo lockfile paths until
+  they can be published safely.
 - Accelerate eligible `auto` updates on Cargo 1.100+ with a conservative native
   prefilter before the legacy guard, preserving package/registry allowances,
   configured fallback acceptance and atomic publication.
@@ -13,7 +17,7 @@
 - Add `auto`, `filtered`, `native`, and `legacy` backends and `COOLDOWN_BACKEND`.
 - Resolve supported sparse graphs once through a process-owned loopback index;
   retain index entries, source identities, checksum validation, baseline rules,
-  atomic lockfile publication, and workspace isolation.
+  atomic lockfile publication, and lockfile isolation.
 - Cache original indexes with HTTP validators, recompute age each invocation,
   reuse connections, bound concurrency, and avoid Cargo discovery for simple
   explicit workspace layouts. Complex layouts retain Cargo metadata discovery.
@@ -23,7 +27,7 @@
   regenerating it with unfiltered Cargo after validation.
 - Try filtered resolution for fallback policies; retain legacy acceptance when
   a compliant filtered resolution cannot be produced after age filtering.
-- Reuse the isolated workspace and keep lockfile coordination when an automatic
+- Reuse the isolated lockfile and keep lockfile coordination when an automatic
   filtered update needs legacy fallback. Restore the original baseline before
   retrying and retain the configured fallback acceptance rules.
 - Reuse the known lockfile path and registry context throughout legacy updates
@@ -32,9 +36,8 @@
   and metadata calls, including directory overrides and hard-linked proxies.
 - Normalize workspace and member paths consistently across filesystem aliases,
   including macOS temporary directories and Windows short paths.
-- Canonicalize the isolated workspace root before mapping dependency paths and
-  Cargo's working directory, fixing macOS `/var` versus `/private/var` package
-  collisions for workspace path dependencies (#28).
+- Keep workspace path dependencies on their original paths, avoiding macOS
+  `/var` versus `/private/var` package collisions during isolation (#28).
 - Honor Cargo's HTTP proxy configuration for filtered upstream requests, and retry
   legacy automatically in `auto` mode for unsupported cross-registry metadata.
 - Keep loopback connections alive across delayed or fragmented Cargo requests

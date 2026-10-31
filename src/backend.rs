@@ -8,7 +8,7 @@ static CARGO_PROGRAM: OnceLock<PathBuf> = OnceLock::new();
 static CARGO_TOOLCHAIN: OnceLock<PathBuf> = OnceLock::new();
 static CARGO_VERSION: OnceLock<semver::Version> = OnceLock::new();
 
-/// Pin rustup directory overrides before entering a temporary workspace. An
+/// Pin rustup directory overrides for all Cargo subprocesses. An
 /// explicit RUSTUP_TOOLCHAIN already pins the launcher, including +toolchain.
 pub fn initialize_cargo() -> Result<()> {
     let executable = if cfg!(windows) { "cargo.exe" } else { "cargo" };
@@ -189,6 +189,18 @@ pub fn cargo_version() -> Result<semver::Version> {
     let version = semver::Version::parse(version)?;
     let _ = CARGO_VERSION.set(version.clone());
     Ok(version)
+}
+
+pub fn ensure_minimum_cargo() -> Result<()> {
+    let version = cargo_version()?;
+    // Pre-releases of 1.97 are not guaranteed to contain the stabilized feature.
+    anyhow::ensure!(
+        version.major > 1
+            || version.major == 1
+                && (version.minor > 97 || version.minor == 97 && version.pre.is_empty()),
+        "cargo-cooldown requires Cargo 1.97 or newer for safe lockfile isolation; selected Cargo is {version}"
+    );
+    Ok(())
 }
 
 pub fn native_available() -> Result<bool> {

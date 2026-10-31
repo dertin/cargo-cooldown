@@ -12,13 +12,13 @@ re-reading the same registry metadata inside one cooldown execution.
 flowchart TD
     Start([Start cargo-cooldown]) --> Config[Load cooldown.toml and embedded allow rules]
     Config --> Command{Requested command}
-    Command -->|update| IsolateUpdate[Copy workspace and coordinate with lock marker]
-    Command -->|other forwarded command with cooldown enabled| IsolateGuard[Copy workspace and coordinate with lock marker]
+    Command -->|update| IsolateUpdate[Create temporary lockfile and coordinate with lock marker]
+    Command -->|other forwarded command with cooldown enabled| IsolateGuard[Create temporary lockfile and coordinate with lock marker]
     Command -->|other forwarded command with cooldown disabled| DoneNoCooldown([Run Cargo without cooldown rewrites])
     IsolateUpdate --> Baseline[Snapshot temp Cargo.lock from initial real lockfile]
     IsolateGuard --> Baseline
     Baseline --> UpdateOrExisting{Update command?}
-    UpdateOrExisting -->|Yes| Update[Run cargo update inside temp workspace]
+    UpdateOrExisting -->|Yes| Update[Run cargo update with temporary lockfile]
     Update --> UpdatedLock[Temp Cargo.lock contains Cargo's updated graph]
     UpdateOrExisting -->|No| ExistingLock[Use temp copy of current Cargo.lock]
     UpdatedLock --> CooldownEnabled{Cooldown enabled?}
@@ -66,34 +66,26 @@ flowchart TD
 At the beginning of one `cargo-cooldown` execution, the resolver:
 
 1. loads config and embedded allow rules;
-2. acquires the auxiliary `Cargo.lock.cooldown-hold` marker and captures the
-   original lockfile before copying anything;
-3. copies the Cargo workspace to a temporary directory; the real `Cargo.lock`
-   remains readable throughout resolution;
-4. snapshots the temp `Cargo.lock` once as the initial baseline;
-5. if the requested command is `cargo cooldown update`, runs `cargo update`
-   inside the temp workspace;
+2. verifies that the selected Cargo is 1.97 or newer and that no custom
+   `resolver.lockfile-path` is configured;
+3. acquires the auxiliary `Cargo.lock.cooldown-hold` marker and captures the
+   original lockfile;
+4. creates a temporary `Cargo.lock` with the captured bytes, if one exists;
+5. runs Cargo commands against that temporary file using the stable
+   `resolver.lockfile-path` configuration, while keeping the original project
+   directory, manifests, Cargo configuration and path dependencies in place;
 6. fixes a single `now` timestamp for the whole run;
 7. creates one registry store that lives across every pin attempt in that run.
 
-Cargo's stable interface does not provide a stable alternate lockfile path for
-all of the commands cooldown needs. The stable implementation therefore isolates
-the whole workspace instead of asking Cargo to use another `Cargo.lock`.
-
-The workspace copy preserves workspace members and member manifests, so commands
-with multiple `Cargo.toml` files keep the same Cargo workspace shape. The copied
-workspace skips heavy generated directories such as `.git` and `target`.
-Only dependency paths in the copied manifests are rewritten. Workspace-local
-dependencies point into the copy; external dependencies point to their original
-absolute locations. This also handles patch, replacement, workspace-inherited,
-and target-specific dependency declarations. External checkouts keep their own
-relative dependencies and workspace inheritance. Their files are not copied or
-rewritten, and no external mapping symlink is created on Unix or Windows.
+No workspace files are copied. Custom `resolver.lockfile-path` settings from the
+Cargo environment, configuration files (including `include`), or `--config` are
+rejected before resolution: publication to a user-selected lockfile is not yet
+supported. The temporary override is passed only to speculative Cargo commands.
 
 The real root lockfile remains in place while cooldown works. An atomic marker
 file named `Cargo.lock.cooldown-hold` serializes concurrent cooldown processes;
 the second process waits with a visible message and bounded backoff, then
-captures the newly published baseline before copying. Before
+captures the newly published baseline before creating its temporary lockfile. Before
 publication, cooldown verifies that the original lockfile bytes are unchanged,
 stages and syncs the result in a sibling temporary file, rechecks the baseline,
 and replaces `Cargo.lock` atomically on Unix and Windows without first deleting
@@ -135,7 +127,7 @@ cargo-cooldown restores the real pre-run lockfile.
 
 If cooldown is disabled with `incompatible-publish-age = "allow"` or
 `[registry].global-min-publish-age = "0"`, `cargo cooldown update` still runs
-the update in the temporary workspace and then publishes Cargo's updated
+the update with a temporary lockfile and then publishes Cargo's updated
 lockfile without a cooldown pass. Other forwarded Cargo commands skip the
 isolation step when cooldown is disabled.
 
@@ -169,7 +161,7 @@ of silently leaving the real lockfile unchanged.
 That means `cargo cooldown update` has this exact shape:
 
 1. acquire `Cargo.lock.cooldown-hold` and capture the real root lockfile;
-2. copy the workspace to a temp directory;
+2. create a temporary lockfile from the captured baseline;
 3. read and snapshot the temp copy of the current `Cargo.lock`;
 4. run `cargo update`, letting Cargo write the newest graph it accepts to the
    temp `Cargo.lock`;
@@ -189,8 +181,7 @@ That means `cargo cooldown update` has this exact shape:
 
 ## 2. Graph scan and release-age inspection
 
-On each outer pass, `cargo-cooldown` runs `cargo metadata` in the active
-workspace copy and rebuilds the derived cooldown state from Cargo's current
+On each outer pass, `cargo-cooldown` runs `cargo metadata` against the temporary lockfile in the original workspace and rebuilds the derived cooldown state from Cargo's current
 resolved graph.
 
 For each registry package in the selected dependency closure:

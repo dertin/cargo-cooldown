@@ -10,7 +10,7 @@
 > compatibility; strict rejection remains configurable.
 >
 > `cargo-cooldown` operates through Cargo's CLI and adds policy processing,
-> workspace isolation and validation around resolution. It can use native
+> lockfile isolation and validation around resolution. It can use native
 > filtering where compatible, but this extra work has a cost. The performance
 > objective is to minimize that overhead while preserving the configured policy,
 > not to promise native speed or an imperceptible difference on every workload.
@@ -41,7 +41,7 @@ See [engine support and guarantees](docs/backends.md).
 
 ## Performance reference
 
-For the optimized native-prefilter path, a separate local Linux comparison on
+Before switching to temporary lockfiles in 0.4.1, a local Linux comparison on
 two large dependency graphs measured **about 5% and 16% more elapsed time than
 native Cargo with network access**. Offline, both measured **about 0.60 seconds
 of additional overhead**: 1.07 s for the wrapper versus 0.47 s natively
@@ -59,7 +59,8 @@ policies retain other resolution paths and may cost more.
 
 The broader comparison below covers different scenarios and backend paths:
 
-This local Linux test of 0.4.1 is an approximate reference, not an exact benchmark
+This local Linux test of an earlier 0.4.1 development revision, before the
+temporary-lockfile change, is an approximate reference, not an exact benchmark
 or a guarantee for other workloads. All modes use Cargo 1.100 beta and the same
 seven-day policy, without additional exceptions. It compares full and targeted
 updates without an existing lockfile, with 1, 24 and 128 direct dependencies plus
@@ -76,6 +77,11 @@ environment to obtain more reliable results.
 | `legacy` | 5.65× | 5.85× | 5.75× |
 
 ## Quick Start
+
+Building cargo-cooldown requires Rust 1.97 or newer. The selected Cargo used
+to run it must also be 1.97 or newer, including for prebuilt binaries.
+Custom Cargo `resolver.lockfile-path` settings are currently rejected to avoid
+publishing to the wrong lockfile.
 
 Install:
 

@@ -940,7 +940,27 @@ fn cooldown_update_repins_new_fresh_versions_against_pre_update_baseline() {
 
 #[cfg(unix)]
 #[test]
-fn cooldown_update_holds_real_lockfile_and_uses_temp_workspace() {
+fn update_does_not_read_unrelated_node_modules() {
+    use std::os::unix::fs::PermissionsExt;
+    let harness =
+        TestHarness::new_with_dependency_req(RegistryMode::PubtimeOnly, &format!("={OLD_VERSION}"))
+            .expect("harness should build");
+    let node_modules = harness.workspace_dir.join("node_modules");
+    fs::create_dir(&node_modules).unwrap();
+    fs::set_permissions(&node_modules, fs::Permissions::from_mode(0o000)).unwrap();
+    let output = harness.run_command(&["update"], &[("COOLDOWN_BACKEND", "legacy")]);
+    fs::set_permissions(&node_modules, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(harness.locked_version(), OLD_VERSION);
+}
+
+#[cfg(unix)]
+#[test]
+fn cooldown_update_holds_real_lockfile_and_uses_temporary_lockfile() {
     let mut harness =
         TestHarness::new_with_dependency_req(RegistryMode::PubtimeOnly, &format!("={OLD_VERSION}"))
             .expect("harness should build");
@@ -990,12 +1010,12 @@ fn cooldown_update_holds_real_lockfile_and_uses_temp_workspace() {
         "internal cargo update should see the real Cargo.lock held: {wrapper_log}"
     );
     assert!(
-        wrapper_log.contains("update-used-temp-workspace"),
-        "internal cargo update should run from the temp workspace: {wrapper_log}"
+        wrapper_log.contains("update-uses-temporary-lockfile"),
+        "internal cargo update should use the temporary lockfile: {wrapper_log}"
     );
     assert!(
-        wrapper_log.contains("update-rewrote-manifest-path"),
-        "internal cargo update should receive the temp manifest path: {wrapper_log}"
+        wrapper_log.contains("update-kept-original-manifest-path"),
+        "internal cargo update should receive the original manifest path: {wrapper_log}"
     );
     assert!(
         fs::read_dir(&harness.workspace_dir)
@@ -3616,19 +3636,21 @@ if [ "$1" = "update" ]; then
     printf 'update-missing-held-lockfile\n' >> "{log_path}"
     exit 97
   fi
-  if [ "$(pwd)" = "$COOLDOWN_EXPECT_HELD_WORKSPACE" ]; then
-    printf 'update-used-original-workspace\n' >> "{log_path}"
-    exit 98
-  else
-    printf 'update-used-temp-workspace\n' >> "{log_path}"
-  fi
   case "$*" in
-    *"$COOLDOWN_EXPECT_HELD_WORKSPACE"*)
-      printf 'update-kept-original-manifest-path\n' >> "{log_path}"
-      exit 99
+    *"resolver.lockfile-path="*)
+      printf 'update-uses-temporary-lockfile\n' >> "{log_path}"
       ;;
     *)
-      printf 'update-rewrote-manifest-path\n' >> "{log_path}"
+      printf 'update-missing-temporary-lockfile\n' >> "{log_path}"
+      exit 98
+      ;;
+  esac
+  case "$*" in
+    *"$COOLDOWN_EXPECT_HELD_WORKSPACE/Cargo.toml"*)
+      printf 'update-kept-original-manifest-path\n' >> "{log_path}"
+      ;;
+    *)
+      exit 99
       ;;
   esac
 fi
@@ -5232,9 +5254,7 @@ fn fallback_retries_legacy_only_with_its_original_acceptance_rules() {
     assert_eq!(harness.locked_version(), FRESH_VERSION);
     let stderr = String::from_utf8_lossy(&accepted.stderr);
     assert_eq!(
-        stderr
-            .matches("created isolated cooldown workspace")
-            .count(),
+        stderr.matches("created isolated cooldown lockfile").count(),
         1,
         "{stderr}"
     );

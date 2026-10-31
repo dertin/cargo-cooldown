@@ -68,7 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        toolchain: ['1.91.1', '1.96.0', beta, nightly]
+        toolchain: ['1.97.0', beta, nightly]
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@master

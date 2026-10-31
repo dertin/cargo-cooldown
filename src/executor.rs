@@ -103,7 +103,9 @@ pub fn run_pinning_flow_with_snapshot(
                 if pass == 1 {
                     ui.set_phase("Reading Cargo metadata...");
                 }
-                timed_debug!("cargo metadata", { read_metadata(manifest, features) })?
+                timed_debug!("cargo metadata", {
+                    read_metadata(manifest, features, lockfile_path)
+                })?
             };
             if pass == 1 {
                 // Baseline capture can precede Cargo's first index download.
@@ -1049,7 +1051,10 @@ fn ensure_lockfile(manifest: &Manifest, lockfile_path: &Path) -> Result<()> {
     }
 
     let mut command = crate::backend::own_cargo();
-    command.arg("generate-lockfile");
+    command
+        .arg("generate-lockfile")
+        .arg("--config")
+        .arg(crate::isolation::lockfile_config(lockfile_path)?);
     if let Some(path) = &manifest.manifest_path {
         command.arg("--manifest-path").arg(path);
     }
@@ -2988,7 +2993,7 @@ fn apply_lockfile_pin_assignment_detailed(
     })?;
 
     if let Err(unlocked_err) = timed_debug!("normalize batch lockfile via cargo metadata", {
-        read_metadata(manifest, features)
+        read_metadata(manifest, features, lockfile_path)
     }) {
         let error = unlocked_err.to_string();
         if !parse_batch_conflict_packages(&error).is_empty() {
@@ -3011,7 +3016,7 @@ fn apply_lockfile_pin_assignment_detailed(
     }
 
     let locked_metadata = match timed_debug!("batch validation cargo metadata --locked", {
-        read_metadata_locked(manifest, features)
+        read_metadata_locked(manifest, features, lockfile_path)
     }) {
         Ok(metadata) => metadata,
         Err(err) => {

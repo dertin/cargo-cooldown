@@ -2,7 +2,7 @@
 name = "cargo-cooldown"
 version = "0.4.1"
 edition = "2024"
-rust-version = "1.91.1"
+rust-version = "1.97"
 description = "Cargo wrapper that enforces a cooldown window for freshly published registry crates for improved supply chain security."
 keywords = ["cargo", "cooldown"]
 categories = ["development-tools::cargo-plugins"]

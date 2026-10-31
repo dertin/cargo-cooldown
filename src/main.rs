@@ -9,6 +9,7 @@ mod allow_rules;
 mod backend;
 /// Provides a small JSON cache for registry API fallback responses.
 mod cache;
+mod cargo_lockfile_config;
 /// Loads configuration from files and environment variables.
 mod config;
 /// Runs the cooldown lockfile rewrite and validation loop.
@@ -45,7 +46,7 @@ use tracing::{debug, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::IncompatiblePublishAgePolicy;
-use crate::isolation::{CurrentDirGuard, IsolatedWorkspace};
+use crate::isolation::IsolatedWorkspace;
 use crate::lockfile::LockfileSnapshot;
 use crate::project::ProjectContext;
 use crate::registry::RegistryStore;
@@ -524,7 +525,6 @@ fn run_cooldown_guard_isolated(
 ) -> Result<()> {
     let isolated = IsolatedWorkspace::create(project, &cli.manifest)?;
     {
-        let _cwd = CurrentDirGuard::enter(isolated.current_dir())?;
         let mut registry_store = RegistryStore::new(config)?;
         let initial_lockfile =
             LockfileSnapshot::capture(isolated.lockfile_path(), &mut registry_store)?;
@@ -553,7 +553,7 @@ fn run_update_with_cooldown_isolation(
     forwarded_args: &[OsString],
     phase: &PhaseStatus,
 ) -> Result<IsolatedUpdateOutcome> {
-    phase.set_message("Preparing isolated workspace...");
+    phase.set_message("Preparing isolated lockfile...");
     let isolated = IsolatedWorkspace::create(project, &cli.manifest)?;
     run_update_in_isolation(config, cli, forwarded_args, phase, isolated)
 }
@@ -571,7 +571,7 @@ fn run_update_in_isolation(
     } else {
         forwarded_args.to_vec()
     };
-    let temp_forwarded_args = isolated.rewrite_cargo_args(&cargo_update_args);
+    let temp_forwarded_args = isolated.cargo_args(&cargo_update_args)?;
     let success_message = if dry_run {
         "dry run complete; Cargo.lock unchanged"
     } else {
@@ -579,17 +579,19 @@ fn run_update_in_isolation(
     };
 
     {
-        let _cwd = CurrentDirGuard::enter(isolated.current_dir())?;
         phase.set_message("Capturing lockfile baseline...");
         let mut registry_store = RegistryStore::new(config)?;
         let initial_lockfile =
             LockfileSnapshot::capture(isolated.lockfile_path(), &mut registry_store)?;
         let prefilter = backend::native_update_prefilter(
             config,
-            &temp_forwarded_args,
+            &cargo_update_args,
             isolated.lockfile_path().exists(),
         )?;
         let status = if let Some(mut command) = prefilter {
+            command
+                .arg("--config")
+                .arg(crate::isolation::lockfile_config(isolated.lockfile_path())?);
             phase.set_message("Running native cooldown prefilter...");
             let started = Instant::now();
             let output = command.output()?;
@@ -706,6 +708,11 @@ fn main() -> Result<()> {
                 exit_with(status.code().unwrap_or(1));
             }
 
+            backend::ensure_minimum_cargo()?;
+            cargo_lockfile_config::ensure_default_lockfile(
+                &std::env::current_dir()?,
+                &forwarded_args,
+            )?;
             let project = ProjectContext::discover_for_runtime(&cli.manifest, &cli.workspace)?;
             let config = config::Config::load(&project)?;
             init_logging(config.verbose);
