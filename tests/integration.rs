@@ -4588,6 +4588,43 @@ fn native_uses_selected_cargo_and_enforces_age_when_supported() {
 }
 
 #[test]
+fn native_ignores_age_policy_text_in_unrelated_config_values() {
+    let version = Command::new("cargo").arg("--version").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let parsed = semver::Version::parse(version.split_whitespace().nth(1).unwrap()).unwrap();
+    if !native_test_supported(&parsed) {
+        return;
+    }
+
+    for backend in ["native", "auto"] {
+        let harness = TestHarness::new(RegistryMode::PubtimeOnly).unwrap();
+        let path = harness.cargo_home.join("config.toml");
+        let config = fs::read_to_string(&path).unwrap();
+        fs::write(
+            path,
+            format!("{config}\n[http]\nuser-agent='min-publish-age-client'\n"),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_cargo-cooldown"))
+            .arg("generate-lockfile")
+            .current_dir(&harness.workspace_dir)
+            .env("CARGO_HOME", &harness.cargo_home)
+            .env("COOLDOWN_BACKEND", backend)
+            .env("COOLDOWN_VERBOSE", "true")
+            .env_remove("COOLDOWN_NOW")
+            .env("CARGO_REGISTRY_GLOBAL_MIN_PUBLISH_AGE", MIN_PUBLISH_AGE)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{backend}: {stderr}");
+        assert!(
+            stderr.contains("selected_backend=Native"),
+            "{backend}: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn auto_uses_legacy_for_missing_timestamps_and_forced_filtered_is_atomic() {
     let harness = TestHarness::new(RegistryMode::MissingPubtimeWithApi).unwrap();
     let output = harness.run_command(&["update"], &[("COOLDOWN_BACKEND", "filtered")]);
