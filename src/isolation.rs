@@ -8,7 +8,7 @@ use std::fs;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use clap_cargo::Manifest;
@@ -295,6 +295,7 @@ fn acquire_marker_with_wait(
 ) -> Result<()> {
     let mut delay = Duration::from_millis(50);
     let mut announced = false;
+    let mut invalid_since = None;
     loop {
         match fs::OpenOptions::new()
             .write(true)
@@ -312,6 +313,43 @@ fn acquire_marker_with_wait(
                 return Ok(());
             }
             Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                match marker_holder(marker_path) {
+                    Ok(Some((pid, contents))) => {
+                        invalid_since = None;
+                        if process_missing(pid)
+                            && fs::read_to_string(marker_path).ok().as_deref() == Some(&contents)
+                        {
+                            bail!(
+                                "cooldown marker {} names process {pid}, which is not visible in the current process namespace. Confirm that no cargo-cooldown process holds the marker (including on another host or in another namespace), then remove the marker and retry.",
+                                marker_path.display()
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        if let Ok(handle) = same_file::Handle::from_path(marker_path) {
+                            if invalid_since
+                                .as_ref()
+                                .is_none_or(|(_, previous)| previous != &handle)
+                            {
+                                invalid_since = Some((Instant::now(), handle));
+                            }
+                            if let Some((since, previous)) = &invalid_since
+                                && since.elapsed() >= Duration::from_secs(5)
+                                && matches!(marker_holder(marker_path), Ok(None))
+                                && same_file::Handle::from_path(marker_path)
+                                    .is_ok_and(|current| current == *previous)
+                            {
+                                bail!(
+                                    "cooldown marker {} has no readable holder after 5 seconds. Confirm that no cargo-cooldown process holds the marker (including on another host or in another namespace), then remove the marker and retry.",
+                                    marker_path.display()
+                                );
+                            }
+                        } else {
+                            invalid_since = None;
+                        }
+                    }
+                    Err(_) => invalid_since = None,
+                }
                 if !announced {
                     eprintln!("Waiting for cargo-cooldown lock: {}", marker_path.display());
                     eprintln!(
@@ -332,6 +370,61 @@ fn acquire_marker_with_wait(
             }
         }
     }
+}
+
+fn marker_holder(marker_path: &Path) -> std::io::Result<Option<(u32, String)>> {
+    let bytes = fs::read(marker_path)?;
+    Ok((|| {
+        let contents = String::from_utf8(bytes).ok()?;
+        let id = contents
+            .strip_prefix(LOCKFILE_MARKER_PREFIX)?
+            .strip_prefix(' ')?;
+        let (pid, nanos) = id.trim_end_matches('\n').split_once('-')?;
+        let pid = pid.parse::<u32>().ok().filter(|pid| *pid != 0)?;
+        nanos.parse::<u128>().ok()?;
+        Some((pid, contents))
+    })())
+}
+
+#[cfg(unix)]
+fn process_missing(pid: u32) -> bool {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
+        return false;
+    };
+    process_missing_from_probe(rustix::process::test_kill_process(pid))
+}
+
+#[cfg(unix)]
+fn process_missing_from_probe(result: rustix::io::Result<()>) -> bool {
+    matches!(result, Err(rustix::io::Errno::SRCH))
+}
+
+#[cfg(windows)]
+fn process_missing(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
+    // SAFETY: The PID is a plain value and a successful handle is closed below.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return std::io::Error::last_os_error().raw_os_error()
+            == Some(ERROR_INVALID_PARAMETER as i32);
+    }
+    // SAFETY: The process handle is valid and the zero timeout does not block.
+    let terminated = unsafe { WaitForSingleObject(handle, 0) } == WAIT_OBJECT_0;
+    // SAFETY: OpenProcess returned this valid owned handle and it is closed once.
+    unsafe { CloseHandle(handle) };
+    terminated
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_missing(_pid: u32) -> bool {
+    false
 }
 
 fn ensure_no_existing_lockfile_hold(lockfile_path: &Path) -> Result<()> {
@@ -554,7 +647,19 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(fs::read_to_string(&lockfile).unwrap(), "version = 4\n");
-        fs::remove_file(temp.path().join(LOCKFILE_MARKER_NAME)).unwrap();
+        let marker = temp.path().join(LOCKFILE_MARKER_NAME);
+        let original_marker = fs::read_to_string(&marker).unwrap();
+        let error = acquire_marker_with_wait(&marker, "next", |_| {
+            panic!("a marker whose holder exited must not wait")
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("process {}", child.id()))
+        );
+        assert_eq!(fs::read_to_string(&marker).unwrap(), original_marker);
+        fs::remove_file(marker).unwrap();
         let guard = LockfileHoldGuard::hold(&lockfile).unwrap();
         drop(guard);
     }
@@ -704,5 +809,49 @@ mod tests {
 
         assert_eq!(waits, 700);
         assert!(fs::read_to_string(&marker).unwrap().contains("next run"));
+    }
+
+    #[test]
+    fn marker_with_live_holder_continues_waiting() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join(LOCKFILE_MARKER_NAME);
+        let contents = format!("{LOCKFILE_MARKER_PREFIX} {}-123\n", std::process::id());
+        fs::write(&marker, &contents).unwrap();
+        let mut waits = 0;
+        acquire_marker_with_wait(&marker, "next", |_| {
+            waits += 1;
+            assert_eq!(fs::read_to_string(&marker).unwrap(), contents);
+            fs::remove_file(&marker).unwrap();
+        })
+        .unwrap();
+        assert_eq!(waits, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_probe_only_treats_missing_process_as_absent() {
+        assert!(!process_missing_from_probe(Ok(())));
+        assert!(!process_missing_from_probe(Err(rustix::io::Errno::PERM)));
+        assert!(!process_missing_from_probe(Err(rustix::io::Errno::IO)));
+        assert!(process_missing_from_probe(Err(rustix::io::Errno::SRCH)));
+    }
+
+    #[test]
+    fn incomplete_marker_eventually_returns_recovery_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join(LOCKFILE_MARKER_NAME);
+        fs::write(&marker, "").unwrap();
+        let start = Instant::now();
+        let error = acquire_marker_with_wait(&marker, "next", |delay| {
+            assert!(
+                start.elapsed() < Duration::from_secs(8),
+                "marker wait did not end"
+            );
+            thread::sleep(delay);
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no readable holder"), "{error}");
+        assert_eq!(fs::read_to_string(marker).unwrap(), "");
     }
 }

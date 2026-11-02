@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.4.1 - Unreleased
+## 0.4.2 - 2026-11-01
+
+- Report a potentially stale coordination marker when its holder PID is not
+  visible or its contents remain unreadable, with manual recovery instructions
+  instead of waiting indefinitely (#31).
+
+## 0.4.1 - 2026-10-31
 
 - Wait for an existing cooldown lock without a fixed timeout, allowing long
   resolutions to finish before the next process continues (#30). Interrupted

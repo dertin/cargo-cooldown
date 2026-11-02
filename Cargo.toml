@@ -1,6 +1,6 @@
 [package]
 name = "cargo-cooldown"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.97"
 description = "Cargo wrapper that enforces a cooldown window for freshly published registry crates for improved supply chain security."
@@ -38,6 +38,12 @@ indicatif = "0.18.4"
 tempfile = "3"
 sha2 = "0.11"
 same-file = "1"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [dev-dependencies]
 assert_fs = "1"
