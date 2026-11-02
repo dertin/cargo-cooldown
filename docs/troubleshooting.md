@@ -109,14 +109,15 @@ They do not apply to:
 
 Cooldown keeps the user-visible `Cargo.lock` intact while it works. Coordination
 uses the sibling `Cargo.lock.cooldown-hold` marker, so rust-analyzer can continue
-parsing the lockfile. A second cooldown process waits without a fixed timeout.
+parsing the lockfile. A second cooldown process waits without a fixed timeout
+when the holder is visible or its status cannot be determined.
 If the marker names a process that is not visible locally, cooldown exits with
 a recovery message. Confirm no other cooldown process holds it, including on
 another host or in another process namespace, remove only the marker, and retry.
 A marker whose contents do not identify a holder also reports an error after
 five seconds. PID reuse, unreaped zombie processes, read errors, or an unavailable
-process check can still require stopping a waiting command and checking manually. A lockfile
-whose external changes are detected during cooldown is rejected. Plain Cargo
+process check can still require stopping a waiting command and checking manually.
+A lockfile whose external changes are detected during cooldown is rejected. Plain Cargo
 does not honor the marker; avoid running simultaneous lockfile writers.
 
 ## Relative `path` Dependencies

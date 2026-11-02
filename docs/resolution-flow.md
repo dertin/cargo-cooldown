@@ -86,8 +86,9 @@ override is passed only to speculative Cargo commands.
 
 The real root lockfile remains in place while cooldown works. An atomic marker
 file named `Cargo.lock.cooldown-hold` serializes concurrent cooldown processes;
-the second process waits without a time limit, using a bounded delay between
-attempts, then captures the newly published baseline before creating its
+the second process waits without a time limit while the holder is visible or
+its status cannot be determined, using a bounded delay between attempts, then
+captures the newly published baseline before creating its
 temporary lockfile. Before publication, cooldown verifies that the original
 lockfile bytes are unchanged,
 stages and syncs the result in a sibling temporary file, rechecks the baseline,
