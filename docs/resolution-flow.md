@@ -101,10 +101,15 @@ Avoid concurrent lockfile writers. This is resolution isolation, not a security
 sandbox: external local dependencies remain readable, and subsequent forwarded
 Cargo commands can execute build scripts in the usual way.
 
-If the holder is killed abruptly, the marker can remain and later processes
-will keep waiting. Stop the waiting command and confirm that no process still
-holds the marker before removing it and retrying. The marker is never removed
-automatically based on its age or PID.
+If the holder is killed abruptly, the marker can remain. If its PID is not
+visible in the current process namespace, cooldown reports an error instead of
+waiting. Confirm that no process still holds the marker, including on another
+host or in another process namespace, before removing it and retrying. A marker
+whose contents do not identify a holder also reports an error after five seconds,
+allowing time for its initial write. PID reuse, unreaped zombie processes,
+read errors, or an unavailable process check can still result in a wait
+requiring manual intervention. The marker is never removed automatically based
+on its age or PID.
 
 The baseline snapshot is taken before any Cargo command is allowed to rewrite
 the temp lockfile.
